@@ -1,0 +1,31 @@
+-- CreateTable
+CREATE TABLE `invoices` (
+    `id` CHAR(36) NOT NULL,
+    `invoiceNumber` VARCHAR(255) NOT NULL,
+    `orderId` CHAR(36) NOT NULL,
+    `shopId` CHAR(36) NOT NULL,
+    `customerId` CHAR(36) NOT NULL,
+    `subtotal` DECIMAL(12, 2) NOT NULL,
+    `taxAmount` DECIMAL(12, 2) NOT NULL,
+    `discountAmount` DECIMAL(12, 2) NOT NULL,
+    `grandTotal` DECIMAL(12, 2) NOT NULL,
+    `currency` VARCHAR(10) NOT NULL DEFAULT 'MMK',
+    `paymentMethod` VARCHAR(50) NOT NULL,
+    `paymentGatewayRef` VARCHAR(255) NULL,
+    `paymentSlipUrl` VARCHAR(255) NULL,
+    `status` ENUM('UNPAID', 'PENDING_VERIFICATION', 'PAID', 'REJECTED', 'VOID', 'REFUNDED') NOT NULL DEFAULT 'UNPAID',
+    `pdfUrl` VARCHAR(255) NULL,
+    `verifiedBy` CHAR(36) NULL,
+    `verifiedAt` DATETIME(3) NULL,
+    `rejectionReason` VARCHAR(191) NULL,
+    `createdAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    `updatedAt` DATETIME(3) NOT NULL,
+
+    UNIQUE INDEX `invoices_invoiceNumber_key`(`invoiceNumber`),
+    UNIQUE INDEX `invoices_orderId_key`(`orderId`),
+    INDEX `invoices_orderId_idx`(`orderId`),
+    INDEX `invoices_shopId_idx`(`shopId`),
+    INDEX `invoices_customerId_idx`(`customerId`),
+    INDEX `invoices_status_idx`(`status`),
+    PRIMARY KEY (`id`)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

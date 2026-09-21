@@ -1,0 +1,2 @@
+ALTER TABLE `invoices`
+  ADD COLUMN `shopName` VARCHAR(255) NULL;

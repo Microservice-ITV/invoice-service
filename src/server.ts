@@ -1,0 +1,51 @@
+import app from '@/app';
+import env from '@/config/env';
+import prisma from '@/config/database';
+import { getRabbitChannel, closeRabbitConnection } from '@/rabbitmq/connection';
+import { startPaymentCompletedConsumer } from '@/rabbitmq/consumers/payment-completed.consumer';
+import { startOrderPaidConsumer } from '@/rabbitmq/consumers/order-paid.consumer';
+import logger from '@/utils/logger';
+
+const startServer = async (): Promise<void> => {
+  try {
+    await prisma.$connect();
+    logger.info('Database connected');
+
+    await getRabbitChannel();
+    await startPaymentCompletedConsumer();
+    await startOrderPaidConsumer();
+    logger.info('RabbitMQ consumer initialized');
+
+    const server = app.listen(env.PORT, () => {
+      logger.info(`Invoice service running on port ${env.PORT}`);
+    });
+
+    const shutdown = async (signal: string): Promise<void> => {
+      logger.warn(`Received ${signal}, shutting down invoice service`);
+      server.close(async () => {
+        try {
+          await prisma.$disconnect();
+          await closeRabbitConnection();
+          logger.info('Invoice service shut down gracefully');
+          process.exit(0);
+        } catch (error) {
+          logger.error('Error during graceful shutdown', error as Error);
+          process.exit(1);
+        }
+      });
+    };
+
+    process.on('SIGINT', () => {
+      void shutdown('SIGINT');
+    });
+
+    process.on('SIGTERM', () => {
+      void shutdown('SIGTERM');
+    });
+  } catch (error) {
+    logger.error('Failed to start Invoice Service', error as Error);
+    process.exit(1);
+  }
+};
+
+void startServer();

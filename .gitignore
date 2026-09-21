@@ -1,0 +1,12 @@
+node_modules
+.dist
+/dist
+.env
+.env.*
+!.env.example
+logs
+*.log
+coverage
+.vscode/
+.idea/
+.cursor/
