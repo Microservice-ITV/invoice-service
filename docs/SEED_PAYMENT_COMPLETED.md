@@ -14,15 +14,14 @@ Inside the container:
 docker compose exec invoice-service npm run seed:payment-completed
 ```
 
-The default event uses the seeded `main-store` shop and creates a paid invoice for `105000.00 MMK`. The default order ID is deterministic, so running the command again will not create a duplicate invoice.
+The default event uses the seeded `main-store` shop and requests a paid invoice for `105000.00 MMK`. The order ID must exist in the order service and its invoice snapshot total must match the event amount. The payment and transaction IDs are unique by default, so each successful run creates a new invoice.
 
 Override values when needed:
 
 ```bash
 SEED_ORDER_ID=11111111-1111-4111-8111-111111111111 \
-SEED_SHOP_ID=00468bc2-856e-4852-9e38-2609acb7e6cd \
-SEED_PAYMENT_METHOD=MANUAL_SLIP \
-SEED_GRAND_TOTAL=125000.00 \
+SEED_AMOUNT=125000.00 \
+SEED_SHOP_NAME="Main Store" \
 npm run seed:payment-completed
 ```
 

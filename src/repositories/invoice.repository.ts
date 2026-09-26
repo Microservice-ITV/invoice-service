@@ -91,6 +91,7 @@ export class InvoiceRepository {
     taxAmount: string;
     discountAmount: string;
     grandTotal: string;
+    paymentMethod: string | null;
     paymentGatewayRef: string;
     lineItems: InvoiceLineItem[];
     items: Array<OrderInvoiceSnapshotItem & { requestedQuantity: number }>;
@@ -190,7 +191,7 @@ export class InvoiceRepository {
           discountAmount: data.discountAmount,
           grandTotal: data.grandTotal,
           currency: data.currency,
-          paymentMethod: null,
+          paymentMethod: data.paymentMethod,
           paymentGatewayRef: data.paymentGatewayRef,
           status: 'PAID',
           items: {
@@ -480,12 +481,93 @@ export class InvoiceRepository {
     });
   }
 
+  async transitionVerification(
+    id: string,
+    approved: boolean,
+    verifiedBy: string,
+    reason?: string,
+  ) {
+    const result = await prisma.invoice.updateMany({
+      where: {
+        id,
+        status: 'PENDING_VERIFICATION',
+      },
+      data: approved
+        ? {
+          status: 'PAID',
+          verifiedBy,
+          verifiedAt: new Date(),
+          rejectionReason: null,
+          verificationNote: reason ?? null,
+        }
+        : {
+          status: 'REJECTED',
+          verifiedBy,
+          verifiedAt: new Date(),
+          rejectionReason: reason ?? 'Payment verification rejected',
+        },
+    });
+
+    if (result.count !== 1) {
+      return null;
+    }
+
+    return this.findById(id);
+  }
+
+  async claimPdfGeneration(id: string): Promise<boolean> {
+    const result = await prisma.invoice.updateMany({
+      where: {
+        id,
+        pdfUrl: null,
+        OR: [
+          { pdfStatus: { not: 'GENERATING' } },
+          {
+            pdfStatus: 'GENERATING',
+            pdfUpdatedAt: { lt: new Date(Date.now() - 15 * 60 * 1000) },
+          },
+        ],
+      },
+      data: {
+        pdfStatus: 'GENERATING',
+        pdfError: null,
+        pdfAttemptCount: { increment: 1 },
+        pdfUpdatedAt: new Date(),
+      },
+    });
+
+    return result.count === 1;
+  }
+
+  async markPdfReady(id: string, pdfUrl: string) {
+    return prisma.invoice.update({
+      where: { id },
+      data: {
+        pdfUrl,
+        pdfStatus: 'READY',
+        pdfError: null,
+        pdfUpdatedAt: new Date(),
+      },
+    });
+  }
+
+  async markPdfFailed(id: string, error: string) {
+    return prisma.invoice.update({
+      where: { id },
+      data: {
+        pdfStatus: 'FAILED',
+        pdfError: error.slice(0, 4000),
+        pdfUpdatedAt: new Date(),
+      },
+    });
+  }
+
   async listInvoices(
     filters: InvoiceFilters = {},
     skip = 0,
     take = 50,
   ) {
-    return prisma.invoice.findMany({
+    const invoices = await prisma.invoice.findMany({
       where: {
         ...(filters.shopId ? { shopId: filters.shopId } : {}),
         ...(filters.customerId ? { customerId: filters.customerId } : {}),
@@ -507,11 +589,24 @@ export class InvoiceRepository {
         deliveryFee: true,
         grandTotal: true,
         currency: true,
+        lineItems: true,
+        items: {
+          select: {
+            productName: true,
+            quantity: true,
+            unitPrice: true,
+            totalPrice: true,
+          },
+        },
         paymentMethod: true,
         paymentGatewayRef: true,
         paymentSlipUrl: true,
         status: true,
         pdfUrl: true,
+        pdfStatus: true,
+        pdfError: true,
+        pdfAttemptCount: true,
+        pdfUpdatedAt: true,
         verifiedBy: true,
         verifiedAt: true,
         rejectionReason: true,
@@ -526,6 +621,18 @@ export class InvoiceRepository {
       skip,
       take,
     });
+
+    return invoices.map(({ items, lineItems, ...invoice }) => ({
+      ...invoice,
+      lineItems: Array.isArray(lineItems) && lineItems.length > 0
+        ? lineItems
+        : items.map((item) => ({
+          name: item.productName,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice.toString(),
+          total: item.totalPrice.toString(),
+        })),
+    }));
   }
 }
 

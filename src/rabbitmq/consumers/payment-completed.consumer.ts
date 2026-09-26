@@ -28,7 +28,7 @@ export const startPaymentCompletedConsumer = async (): Promise<void> => {
         || !data.payment_id?.trim() || !data.order_id?.trim() || !data.transaction_id?.trim()
         || !data.checkout_id?.trim() || typeof data.amount !== 'number' || !Number.isFinite(data.amount)
         || !data.currency?.trim()) {
-        throw new Error('Invalid payment.completed payload');
+        throw  new Error('Invalid payment.completed payload');
       }
 
       logger.info(
@@ -41,6 +41,7 @@ export const startPaymentCompletedConsumer = async (): Promise<void> => {
         transactionId: data.transaction_id,
         amount: data.amount,
         currency: data.currency,
+        paymentMethod: data.payment_method ?? null,
         shopName: data.shop_name ?? null,
         customerName: data.customer_name ?? null,
         customerEmail: data.customer_email ?? null,

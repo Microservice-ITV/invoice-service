@@ -45,6 +45,10 @@ model Invoice {
   status             InvoiceStatus @default(UNPAID)
 
   pdfUrl             String?       @db.VarChar(255)
+  pdfStatus          String        @default("PENDING") @db.VarChar(20)
+  pdfError           String?       @db.Text
+  pdfAttemptCount    Int           @default(0)
+  pdfUpdatedAt       DateTime?
 
   verifiedBy         String?       @db.Char(36)
   verifiedAt         DateTime?
