@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { InvoiceLineItem, InvoiceStatus, PartialInvoiceRequest, RefundMethod } from '@/types/invoice';
 import invoiceRepository from '@/repositories/invoice.repository';
 import orderSnapshotService, { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
+import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
@@ -59,6 +60,16 @@ const moneyToMinorUnits = (value: string | number): bigint => {
   return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
 };
 
+const formatMinorUnits = (value: bigint): string =>
+  `${value / 100n}.${(value % 100n).toString().padStart(2, '0')}`;
+
+export const calculateShopSubtotal = (
+  items: Array<Pick<OrderInvoiceSnapshotItem, 'unitPrice' | 'quantity'>>,
+): string => formatMinorUnits(items.reduce(
+  (total, item) => total + moneyToMinorUnits(item.unitPrice) * BigInt(item.quantity),
+  0n,
+));
+
 const multiplyMoney = (unitPrice: string, quantity: number): string => {
   const cents = moneyToMinorUnits(unitPrice) * BigInt(quantity);
   return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
@@ -78,6 +89,39 @@ export const validatePartialInvoiceShopSelection = (shopIds: Set<string>): void 
   if (shopIds.size !== 1) {
     throw new ValidationError('Partial invoice items must belong to one shop');
   }
+};
+
+export const allocateShopTotals = (
+  subtotal: string,
+  deliveryFee: string,
+  discountAmount: string,
+  shopSubtotals: Array<{ shopId: string; subtotal: string }>,
+) => {
+  const totalSubtotal = moneyToMinorUnits(subtotal);
+  let remainingDelivery = moneyToMinorUnits(deliveryFee);
+  let remainingDiscount = moneyToMinorUnits(discountAmount);
+
+  return shopSubtotals.map((shop, index) => {
+    const shopSubtotal = moneyToMinorUnits(shop.subtotal);
+    const last = index === shopSubtotals.length - 1;
+    const delivery = last || totalSubtotal === 0n
+      ? remainingDelivery
+      : moneyToMinorUnits(deliveryFee) * shopSubtotal / totalSubtotal;
+    const discount = last || totalSubtotal === 0n
+      ? remainingDiscount
+      : moneyToMinorUnits(discountAmount) * shopSubtotal / totalSubtotal;
+    remainingDelivery -= delivery;
+    remainingDiscount -= discount;
+    const grandTotal = shopSubtotal + delivery - discount;
+
+    return {
+      shopId: shop.shopId,
+      subtotal: formatMinorUnits(shopSubtotal),
+      deliveryFee: formatMinorUnits(delivery),
+      discountAmount: formatMinorUnits(discount),
+      grandTotal: formatMinorUnits(grandTotal),
+    };
+  });
 };
 
 export const normalizePartialInvoiceRequest = (payload: PartialInvoiceRequest) => ({
@@ -134,6 +178,65 @@ export const buildPartialInvoiceRequestHash = (payload: PartialInvoiceRequest): 
   };
 
   return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+};
+
+export const resolveInvoiceDisplayData = ({
+  snapshotCustomerName,
+  payloadCustomerName,
+  snapshotCustomerEmail,
+  payloadCustomerEmail,
+  snapshotShopName,
+  payloadShopName,
+  resolvedShopName,
+}: {
+  snapshotCustomerName?: string | null;
+  payloadCustomerName?: string | null;
+  snapshotCustomerEmail?: string | null;
+  payloadCustomerEmail?: string | null;
+  snapshotShopName?: string | null;
+  payloadShopName?: string | null;
+  resolvedShopName?: string | null;
+}) => ({
+  customerName: normalizeString(snapshotCustomerName || payloadCustomerName) || null,
+  customerEmail: normalizeString(snapshotCustomerEmail || payloadCustomerEmail).toLowerCase() || null,
+  shopName: normalizeString(resolvedShopName || snapshotShopName || payloadShopName) || null,
+});
+
+export const resolveInvoiceShopNames = async (
+  shopIds: string[],
+  lookup: (shopId: string) => Promise<string | null> = (shopId) => shopLookupService.getShopName(shopId),
+): Promise<Map<string, string | null>> => {
+  const uniqueShopIds = [...new Set(shopIds.map((shopId) => shopId.trim()).filter(Boolean))];
+  const resolvedEntries = await Promise.all(uniqueShopIds.map(async (shopId) => [
+    shopId,
+    await lookup(shopId),
+  ] as const));
+
+  return new Map(resolvedEntries);
+};
+
+export const populateMissingInvoiceShopNames = async <T extends {
+  shopId: string;
+  shopName: string | null;
+}>(
+  invoices: T[],
+  lookup: (shopId: string) => Promise<string | null> = (shopId) => shopLookupService.getShopName(shopId),
+): Promise<T[]> => {
+  const missingShopIds = invoices
+    .filter((invoice) => !normalizeString(invoice.shopName))
+    .map((invoice) => invoice.shopId);
+  const namesByShopId = await resolveInvoiceShopNames(missingShopIds, lookup);
+
+  return invoices.map((invoice) => {
+    if (normalizeString(invoice.shopName)) {
+      return invoice;
+    }
+
+    return {
+      ...invoice,
+      shopName: namesByShopId.get(invoice.shopId) ?? null,
+    };
+  });
 };
 
 export class InvoiceService {
@@ -245,6 +348,7 @@ export class InvoiceService {
     transactionId: string;
     amount: number;
     currency: string;
+    paymentMethod?: string | null;
     customerName?: string | null;
     customerEmail?: string | null;
     shopName?: string | null;
@@ -264,92 +368,134 @@ export class InvoiceService {
       throw new ValidationError(`Payment currency does not match order currency for ${payload.orderId}`);
     }
 
-    const shopIds = new Set(snapshot.items.map((item) => item.shopId).filter((shopId): shopId is string => Boolean(shopId?.trim())));
-    if (shopIds.size !== 1) {
-      throw new ValidationError(
-        shopIds.size > 1
-          ? 'Automatic paid invoice creation does not support multi-shop orders'
-          : 'Order snapshot does not contain a shop ID',
-      );
-    }
-
     if (!snapshot.customerId.trim() || !payload.paymentId.trim() || !payload.transactionId.trim()) {
       throw new ValidationError('Payment identity and snapshot customer ID are required');
     }
 
     const currency = snapshotCurrency || paymentCurrency;
-    const lineItems: InvoiceLineItem[] = snapshot.items.map((item) => ({
-      name: item.productName?.trim() || item.productSku || item.productId,
-      quantity: item.quantity,
-      unitPrice: item.unitPrice,
-      total: item.lineTotal ?? multiplyMoney(item.unitPrice, item.quantity),
-    }));
-    const requestHash = crypto.createHash('sha256').update(JSON.stringify({
-      paymentId: payload.paymentId,
-      orderId: snapshot.orderId,
-      transactionId: payload.transactionId,
-      amount: String(payload.amount),
-      currency,
-    })).digest('hex');
-    const idempotencyKey = `payment:${payload.paymentId}`;
+    const itemsByShop = new Map<string, OrderInvoiceSnapshotItem[]>();
+    for (const item of snapshot.items) {
+      const shopId = item.shopId?.trim();
+      if (!shopId) {
+        throw new ValidationError('Order snapshot does not contain a shop ID');
+      }
+      const items = itemsByShop.get(shopId) ?? [];
+      items.push(item);
+      itemsByShop.set(shopId, items);
+    }
 
-    const invoice = await invoiceRepository.createPaidInvoiceFromPayment({
-      invoiceNumber: this.generateInvoiceNumber(),
-      orderId: snapshot.orderId,
-      shopId: [...shopIds][0],
-      shopName: normalizeString(payload.shopName) || null,
-      customerId: snapshot.customerId,
-      customerName: normalizeString(payload.customerName) || null,
-      customerEmail: normalizeString(payload.customerEmail).toLowerCase() || null,
-      currency,
-      subtotal: snapshot.subtotal,
-      deliveryFee: snapshot.deliveryFee,
-      taxAmount: '0.00',
-      discountAmount: snapshot.promotionDiscountTotal,
-      grandTotal: snapshot.grandTotal,
-      paymentGatewayRef: payload.transactionId,
-      lineItems,
-      items: snapshot.items.map((item) => ({ ...item, requestedQuantity: item.quantity })),
-      idempotencyKey,
-      requestHash,
-    });
+    const shops = [...itemsByShop.entries()];
+    const shopNames = await resolveInvoiceShopNames(shops.map(([shopId]) => shopId));
+    const shopTotals = allocateShopTotals(
+      snapshot.subtotal,
+      snapshot.deliveryFee,
+      snapshot.promotionDiscountTotal,
+      shops.map(([shopId, items]) => ({
+        shopId,
+        subtotal: calculateShopSubtotal(items),
+      })),
+    );
+    const invoices = [];
 
-    void this.generatePdfAsync(invoice.id, invoice);
+    for (let index = 0; index < shops.length; index += 1) {
+      const [shopId, items] = shops[index];
+      const shopTotal = shopTotals[index];
+      const snapshotShopName = items.find((item) => item.shopName?.trim())?.shopName;
+      const resolvedShopName = shopNames.get(shopId) ?? null;
+      const displayData = resolveInvoiceDisplayData({
+        snapshotCustomerName: snapshot.customerName,
+        payloadCustomerName: payload.customerName,
+        snapshotCustomerEmail: snapshot.customerEmail,
+        payloadCustomerEmail: payload.customerEmail,
+        snapshotShopName,
+        payloadShopName: payload.shopName,
+        resolvedShopName,
+      });
+      const shopName = displayData.shopName;
+      const invoiceItems = items.map((item) => ({
+        ...item,
+        lineTotal: multiplyMoney(item.unitPrice, item.quantity),
+        requestedQuantity: item.quantity,
+      }));
+      const lineItems: InvoiceLineItem[] = invoiceItems.map((item) => ({
+        name: item.productName?.trim() || item.productSku || item.productId,
+        quantity: item.requestedQuantity,
+        unitPrice: item.unitPrice,
+        total: item.lineTotal,
+      }));
+      const requestHash = crypto.createHash('sha256').update(JSON.stringify({
+        paymentId: payload.paymentId,
+        orderId: snapshot.orderId,
+        shopId,
+        transactionId: payload.transactionId,
+        amount: shopTotal.grandTotal,
+        currency,
+        items: invoiceItems.map((item) => [item.orderItemId, item.requestedQuantity]),
+      })).digest('hex');
+      const idempotencyKey = shops.length === 1
+        ? `payment:${payload.paymentId}`
+        : `payment:${payload.paymentId}:shop:${shopId}`;
 
-    return invoice;
+      const invoice = await invoiceRepository.createPaidInvoiceFromPayment({
+        invoiceNumber: this.generateInvoiceNumber(),
+        orderId: snapshot.orderId,
+        shopId,
+        shopName: normalizeString(shopName) || null,
+        customerId: snapshot.customerId,
+        customerName: displayData.customerName,
+        customerEmail: displayData.customerEmail,
+        currency,
+        subtotal: shopTotal.subtotal,
+        deliveryFee: shopTotal.deliveryFee,
+        taxAmount: '0.00',
+        discountAmount: shopTotal.discountAmount,
+        grandTotal: shopTotal.grandTotal,
+        paymentMethod: normalizeString(payload.paymentMethod).toUpperCase() || null,
+        paymentGatewayRef: payload.transactionId,
+        lineItems,
+        items: invoiceItems,
+        idempotencyKey,
+        requestHash,
+      });
+
+      invoices.push(invoice);
+      void this.generatePdfAsync(invoice.id, invoice);
+    }
+
+    return invoices.length === 1 ? invoices[0] : invoices;
   }
 
-  async verifyInvoice(id: string, approved: boolean, verifiedBy: string, rejectionReason?: string) {
+  async verifyInvoice(id: string, approved: boolean, verifiedBy: string, rejectionReason?: string, shopId?: string) {
     const invoice = await invoiceRepository.findById(id);
 
     if (!invoice) {
-      throw new Error('Invoice not found');
+      throw new NotFoundError('Invoice not found');
     }
 
-    const allowedStatuses: InvoiceStatus[] = ['PENDING_VERIFICATION', 'REJECTED'];
+    if (shopId && invoice.shopId !== shopId) {
+      throw new ForbiddenError('Invoice does not belong to the active shop');
+    }
+
+    const allowedStatuses: InvoiceStatus[] = ['PENDING_VERIFICATION'];
     if (!allowedStatuses.includes(invoice.status)) {
-      throw new Error(`Invoice cannot be verified while in ${invoice.status} status`);
+      throw new ConflictError(`Invoice cannot be verified while in ${invoice.status} status`);
     }
 
     if (approved) {
-      const updatedInvoice = await invoiceRepository.updateStatus(id, {
-        status: 'PAID',
-        verifiedBy,
-        verifiedAt: new Date(),
-        rejectionReason: null,
-        verificationNote: rejectionReason ?? null,
-      });
+      const updatedInvoice = await invoiceRepository.transitionVerification(id, true, verifiedBy, rejectionReason);
+      if (!updatedInvoice) {
+        throw new ConflictError('Invoice has already been verified');
+      }
 
       void this.generatePdfAsync(updatedInvoice.id, updatedInvoice);
       return updatedInvoice;
     }
 
-    return invoiceRepository.updateStatus(id, {
-      status: 'REJECTED',
-      verifiedBy,
-      verifiedAt: new Date(),
-      rejectionReason: rejectionReason ?? 'Payment verification rejected',
-    });
+    const updatedInvoice = await invoiceRepository.transitionVerification(id, false, verifiedBy, rejectionReason);
+    if (!updatedInvoice) {
+      throw new ConflictError('Invoice has already been verified');
+    }
+    return updatedInvoice;
   }
 
   async voidInvoice(id: string, voidedBy: string, reason: string) {
@@ -411,7 +557,8 @@ export class InvoiceService {
   }
 
   async getAllInvoices(status?: InvoiceStatus) {
-    return invoiceRepository.listInvoices({ status });
+    const invoices = await invoiceRepository.listInvoices({ status });
+    return populateMissingInvoiceShopNames(invoices);
   }
 
   async getInvoiceById(id: string) {
@@ -441,18 +588,21 @@ export class InvoiceService {
     return invoiceRepository.updateOrderSnapshot(payload.orderId, payload);
   }
 
-  async generateInvoicePdf(id: string) {
+  async generateInvoicePdf(id: string, shopId?: string) {
     const invoice = await invoiceRepository.findById(id);
 
     if (!invoice) {
       throw new Error('Invoice not found');
+    }
+    if (shopId && invoice.shopId !== shopId) {
+      throw new ForbiddenError('Invoice does not belong to the active shop');
     }
 
     await this.generatePdfAsync(invoice.id, invoice);
     return invoiceRepository.findById(id);
   }
 
-  async generateInvoicePdfBatch(invoiceIds: string[]) {
+  async generateInvoicePdfBatch(invoiceIds: string[], shopId?: string) {
     const uniqueIds = [...new Set(invoiceIds.filter((id) => typeof id === 'string' && id.trim().length > 0))];
     const generated: Awaited<ReturnType<typeof invoiceRepository.findById>>[] = [];
 
@@ -460,6 +610,9 @@ export class InvoiceService {
       const invoice = await invoiceRepository.findById(invoiceId);
       if (!invoice) {
         continue;
+      }
+      if (shopId && invoice.shopId !== shopId) {
+        throw new ForbiddenError('Invoice does not belong to the active shop');
       }
 
       await this.generatePdfAsync(invoice.id, invoice);
@@ -472,7 +625,7 @@ export class InvoiceService {
     return generated;
   }
 
-  async buildBatchPdfArchive(invoiceIds: string[]) {
+  async buildBatchPdfArchive(invoiceIds: string[], shopId?: string) {
     const uniqueIds = [...new Set(invoiceIds.filter((id) => typeof id === 'string' && id.trim().length > 0))];
     const entries: Array<{ name: string; buffer: Buffer }> = [];
 
@@ -480,6 +633,9 @@ export class InvoiceService {
       const invoice = await invoiceRepository.findById(invoiceId);
       if (!invoice) {
         continue;
+      }
+      if (shopId && invoice.shopId !== shopId) {
+        throw new ForbiddenError('Invoice does not belong to the active shop');
       }
 
       let pdfUrl = invoice.pdfUrl;
@@ -524,8 +680,13 @@ export class InvoiceService {
       status: InvoiceStatus;
       createdAt: Date;
       lineItems?: unknown;
+      pdfUrl?: string | null;
     }
   ) {
+    if (invoice.pdfUrl || !(await invoiceRepository.claimPdfGeneration(invoiceId))) {
+      return;
+    }
+
     try {
       const pdfUrl = await pdfGeneratorService.buildAndUploadInvoicePdf({
         invoiceNumber: invoice.invoiceNumber,
@@ -547,10 +708,9 @@ export class InvoiceService {
         createdAt: invoice.createdAt,
       });
 
-      await invoiceRepository.updateStatus(invoiceId, {
-        pdfUrl,
-      });
+      await invoiceRepository.markPdfReady(invoiceId, pdfUrl);
     } catch (error) {
+      await invoiceRepository.markPdfFailed(invoiceId, error instanceof Error ? error.message : 'PDF generation failed');
       logger.error(`Failed to generate invoice PDF for ${invoiceId}`, error as Error);
     }
   }

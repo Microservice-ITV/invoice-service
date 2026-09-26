@@ -141,7 +141,12 @@ export class InvoiceController {
         return;
       }
 
-      const invoice = await invoiceService.verifyInvoice(id, approved, verifiedBy, reason);
+      if (req.user?.role !== 'admin' && !req.user?.shopId) {
+        res.status(400).json({ success: false, message: 'Shop context is required' });
+        return;
+      }
+
+      const invoice = await invoiceService.verifyInvoice(id, approved, verifiedBy, reason, req.user?.shopId);
       res.json({
         success: true,
         data: invoice,
@@ -218,7 +223,12 @@ export class InvoiceController {
 
   async generatePdf(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const invoice = await invoiceService.generateInvoicePdf(req.params.id);
+      if (req.user?.role !== 'admin' && !req.user?.shopId) {
+        res.status(400).json({ success: false, message: 'Shop context is required' });
+        return;
+      }
+
+      const invoice = await invoiceService.generateInvoicePdf(req.params.id, req.user?.shopId);
 
       if (!invoice) {
         res.status(404).json({ success: false, message: 'Invoice not found' });
@@ -245,7 +255,12 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = await invoiceService.generateInvoicePdfBatch(invoiceIds);
+      if (req.user?.role !== 'admin' && !req.user?.shopId) {
+        res.status(400).json({ success: false, message: 'Shop context is required' });
+        return;
+      }
+
+      const invoices = await invoiceService.generateInvoicePdfBatch(invoiceIds, req.user?.shopId);
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to generate invoice PDFs'));
@@ -263,7 +278,12 @@ export class InvoiceController {
         return;
       }
 
-      const pdfEntries = await invoiceService.buildBatchPdfArchive(invoiceIds);
+      if (req.user?.role !== 'admin' && !req.user?.shopId) {
+        res.status(400).json({ success: false, message: 'Shop context is required' });
+        return;
+      }
+
+      const pdfEntries = await invoiceService.buildBatchPdfArchive(invoiceIds, req.user?.shopId);
       if (pdfEntries.length === 0) {
         res.status(400).json({ success: false, message: 'No downloadable PDFs were found for the selected invoices.' });
         return;
@@ -290,5 +310,4 @@ export class InvoiceController {
     }
   }
 }
-
 export default new InvoiceController();

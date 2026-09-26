@@ -67,6 +67,7 @@ export interface PaymentCompletedEvent {
     checkout_id: string;
     amount: number;
     currency: string;
+    payment_method?: string;
     shop_name?: string;
     customer_name?: string;
     customer_email?: string;

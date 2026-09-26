@@ -9,12 +9,15 @@ export interface OrderInvoiceSnapshotItem {
   unitPrice: string;
   lineTotal: string | null;
   shopId: string | null;
+  shopName?: string | null;
 }
 
 export interface OrderInvoiceSnapshot {
   orderId: string;
   checkoutId: string;
   customerId: string;
+  customerName?: string | null;
+  customerEmail?: string | null;
   items: OrderInvoiceSnapshotItem[];
   currency: string | null;
   subtotal: string;

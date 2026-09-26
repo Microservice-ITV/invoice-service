@@ -18,7 +18,12 @@ process.env.PUBLIC_BASE_URL = 'http://localhost:9000';
 
 import {
   buildPartialInvoiceRequestHash,
+  allocateShopTotals,
+  calculateShopSubtotal,
   normalizePartialInvoiceRequest,
+  populateMissingInvoiceShopNames,
+  resolveInvoiceDisplayData,
+  resolveInvoiceShopNames,
   validatePartialInvoiceShopSelection,
   validatePartialInvoiceRequest,
   validateRequestedQuantity,
@@ -120,4 +125,110 @@ test('validatePartialInvoiceRequest rejects invalid duplicate or nonpositive ite
       items: [{ orderItemId: 'b', quantity: 0 }],
     });
   });
+});
+
+test('allocateShopTotals distributes charges across shops and reconciles totals', () => {
+  const totals = allocateShopTotals('100.00', '10.00', '5.00', [
+    { shopId: 'shop-a', subtotal: '60.00' },
+    { shopId: 'shop-b', subtotal: '40.00' },
+  ]);
+
+  assert.deepEqual(totals, [
+    {
+      shopId: 'shop-a',
+      subtotal: '60.00',
+      deliveryFee: '6.00',
+      discountAmount: '3.00',
+      grandTotal: '63.00',
+    },
+    {
+      shopId: 'shop-b',
+      subtotal: '40.00',
+      deliveryFee: '4.00',
+      discountAmount: '2.00',
+      grandTotal: '42.00',
+    },
+  ]);
+});
+
+test('allocateShopTotals assigns rounding remainder to the final shop', () => {
+  const totals = allocateShopTotals('100.00', '1.00', '0.00', [
+    { shopId: 'shop-a', subtotal: '33.33' },
+    { shopId: 'shop-b', subtotal: '66.67' },
+  ]);
+
+  assert.equal(totals[0].deliveryFee, '0.33');
+  assert.equal(totals[1].deliveryFee, '0.67');
+});
+
+test('calculateShopSubtotal formats minor units before allocating multi-shop invoices', () => {
+  const shops = [
+    { shopId: 'shop-a', item: { unitPrice: '40000.00', quantity: 1 } },
+    { shopId: 'shop-b', item: { unitPrice: '35000.00', quantity: 1 } },
+    { shopId: 'shop-c', item: { unitPrice: '25000.00', quantity: 1 } },
+  ];
+  const totals = allocateShopTotals(
+    '100000.00',
+    '0.00',
+    '0.00',
+    shops.map(({ shopId, item }) => ({
+      shopId,
+      subtotal: calculateShopSubtotal([item]),
+    })),
+  );
+
+  assert.deepEqual(totals.map((total) => total.grandTotal), ['40000.00', '35000.00', '25000.00']);
+});
+
+test('resolveInvoiceDisplayData prefers actual snapshot names over payload fallback values', () => {
+  const result = resolveInvoiceDisplayData({
+    snapshotCustomerName: 'Alice Customer',
+    payloadCustomerName: 'Fallback Customer',
+    snapshotCustomerEmail: 'alice@example.com',
+    payloadCustomerEmail: 'fallback@example.com',
+    snapshotShopName: 'Snapshot Shop',
+    payloadShopName: 'Fallback Shop',
+    resolvedShopName: 'Resolved Shop',
+  });
+
+  assert.equal(result.customerName, 'Alice Customer');
+  assert.equal(result.customerEmail, 'alice@example.com');
+  assert.equal(result.shopName, 'Resolved Shop');
+});
+
+test('resolveInvoiceShopNames resolves distinct shop IDs from the shop lookup', async () => {
+  const lookupCalls: string[] = [];
+  const names = await resolveInvoiceShopNames(
+    ['shop-a', 'shop-b', 'shop-a'],
+    async (shopId) => {
+      lookupCalls.push(shopId);
+      return shopId === 'shop-a' ? 'Main Store' : 'Outlet Store';
+    },
+  );
+
+  assert.deepEqual(lookupCalls.sort(), ['shop-a', 'shop-b']);
+  assert.equal(names.get('shop-a'), 'Main Store');
+  assert.equal(names.get('shop-b'), 'Outlet Store');
+});
+
+test('populateMissingInvoiceShopNames fills legacy invoices and preserves saved names', async () => {
+  const lookupCalls: string[] = [];
+  const invoices = await populateMissingInvoiceShopNames(
+    [
+      { shopId: 'shop-a', shopName: null, invoiceNumber: 'INV-A' },
+      { shopId: 'shop-b', shopName: null, invoiceNumber: 'INV-B' },
+      { shopId: 'shop-a', shopName: 'Saved Store Name', invoiceNumber: 'INV-C' },
+    ],
+    async (shopId) => {
+      lookupCalls.push(shopId);
+      return shopId === 'shop-a' ? 'Main Store' : 'Outlet Store';
+    },
+  );
+
+  assert.deepEqual(lookupCalls, ['shop-a', 'shop-b']);
+  assert.deepEqual(invoices.map((invoice) => invoice.shopName), [
+    'Main Store',
+    'Outlet Store',
+    'Saved Store Name',
+  ]);
 });

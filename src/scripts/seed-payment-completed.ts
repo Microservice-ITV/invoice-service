@@ -2,37 +2,27 @@ import { ConfirmChannel, connect } from 'amqplib';
 import { rabbitConfig } from '@/rabbitmq/config';
 import { closeRabbitConnection } from '@/rabbitmq/connection';
 
-const defaultShopId = '00468bc2-856e-4852-9e38-2609acb7e6cd';
-const defaultCustomerId = 'd2f3c1c4-1234-4d64-8d2e-4e2d6f0b4567';
 const defaultOrderId = '7f2f5f3d-0c75-4c47-8bb1-b3e7d3b9e101';
 
 const seedEvent = {
-  eventId: process.env.SEED_EVENT_ID ?? `seed-${Date.now()}`,
-  orderId: process.env.SEED_ORDER_ID ?? defaultOrderId,
-  shopId: process.env.SEED_SHOP_ID ?? defaultShopId,
-  customerId: process.env.SEED_CUSTOMER_ID ?? defaultCustomerId,
-  paymentMethod: process.env.SEED_PAYMENT_METHOD ?? 'CARD',
-  paymentGatewayRef: process.env.SEED_PAYMENT_GATEWAY_REF ?? 'seed-payment-ref-001',
-  paymentSlipUrl: null,
-  currency: process.env.SEED_CURRENCY ?? 'MMK',
-  subtotal: process.env.SEED_SUBTOTAL ?? '225000.00',
-  taxAmount: process.env.SEED_TAX_AMOUNT ?? '5000.00',
-  discountAmount: process.env.SEED_DISCOUNT_AMOUNT ?? '0.00',
-  grandTotal: process.env.SEED_GRAND_TOTAL ?? '230000.00',
-  lineItems: [
-    {
-      name: 'Everyday essentials bundle',
-      quantity: 2,
-      unitPrice: '75000.00',
-      total: '150000.00',
-    },
-    {
-      name: 'Household supplies pack',
-      quantity: 3,
-      unitPrice: '25000.00',
-      total: '75000.00',
-    },
-  ],
+  event_id: process.env.SEED_EVENT_ID ?? `seed-${Date.now()}`,
+  event: 'payment.completed',
+  version: 'v1',
+  timestamp: new Date().toISOString(),
+  producer: 'invoice-service-seed',
+  correlation_id: process.env.SEED_CORRELATION_ID ?? `seed-correlation-${Date.now()}`,
+  data: {
+    payment_id: process.env.SEED_PAYMENT_ID ?? `seed-payment-${Date.now()}`,
+    order_id: process.env.SEED_ORDER_ID ?? defaultOrderId,
+    transaction_id: process.env.SEED_TRANSACTION_ID ?? `seed-transaction-${Date.now()}`,
+    checkout_id: process.env.SEED_CHECKOUT_ID ?? `seed-checkout-${Date.now()}`,
+    amount: Number(process.env.SEED_AMOUNT ?? '105000.00'),
+    currency: process.env.SEED_CURRENCY ?? 'MMK',
+    shop_name: process.env.SEED_SHOP_NAME ?? 'Main Store',
+    customer_name: process.env.SEED_CUSTOMER_NAME ?? 'Seed Customer',
+    customer_email: process.env.SEED_CUSTOMER_EMAIL ?? 'seed.customer@example.com',
+    updatedAt: new Date().toISOString(),
+  },
 };
 
 const publishSeedEvent = async (): Promise<void> => {
