@@ -4,12 +4,15 @@ FROM node:22-bookworm-slim
 
 WORKDIR /var/www/html/invoice-service
 
-# Puppeteer's managed Chrome needs these shared libraries; install runtime dependencies without the full Chromium package.
-RUN sed -i 's#http://deb.debian.org/debian-security#http://ftp.de.debian.org/debian-security#; s#http://deb.debian.org/debian#http://ftp.de.debian.org/debian#' /etc/apt/sources.list.d/debian.sources \
-    && apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::Timeout=60 update \
-    && apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
-    openssl \
+# Runtime libraries required by Puppeteer's managed Chrome.
+RUN apt-get -o Acquire::Retries=10 \
+    -o Acquire::http::Timeout=60 \
+    update \
+    && apt-get -o Acquire::Retries=10 \
+    -o Acquire::http::Timeout=60 \
+    install -y --no-install-recommends \
     ca-certificates \
+    openssl \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -29,35 +32,47 @@ RUN sed -i 's#http://deb.debian.org/debian-security#http://ftp.de.debian.org/deb
     libcairo2 \
     libasound2 \
     fonts-liberation \
-    && rm -rf /var/lib/apt/lists/* \
-    && test -f /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+    && rm -rf /var/lib/apt/lists/*
 
+# Copy dependency manifests first for Docker layer caching.
 COPY package.json package-lock.json ./
+
+# Prisma configuration/schema.
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 
+# Install exact locked dependencies.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci \
+    --ignore-scripts \
+    --prefer-offline \
+    --no-audit \
+    --no-fund \
+    --fetch-retries=10 \
+    --fetch-timeout=600000
+
+# Puppeteer uses its own managed Chrome installation.
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_CACHE_DIR=/root/.cache/puppeteer
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --ignore-scripts --prefer-offline --no-audit --no-fund --fetch-retries=10 --fetch-timeout=600000
-
-RUN PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome \
+RUN PUPPETEER_SKIP_DOWNLOAD=false \
+    npx puppeteer browsers install chrome \
     && test -d /root/.cache/puppeteer/chrome
 
+# Copy application source after dependencies.
 COPY src ./src
 COPY tsconfig.json ./
 
+# Generate Prisma Client.
 RUN npx prisma generate
 
-RUN npm install -g nodemon ts-node
-
+# Container startup script.
 COPY docker/node/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-
 EXPOSE 5005
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 CMD ["npm", "run", "dev"]

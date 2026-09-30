@@ -32,7 +32,23 @@ services:
       start_period: 10s
 
   minio:
-    image: quay.io/minio/minio:latest
+    # Image source is pinned because MinIO's own registries no longer serve the
+    # community server anonymously:
+    #   * minio/minio (Docker Hub)  -> deleted  ("repository does not exist")
+    #   * quay.io/minio/*           -> 401 for anonymous pulls (the issued anonymous
+    #                                  token has an empty permission set); other public
+    #                                  Quay images still pull fine, so it is namespace-wide
+    #   * quay.io/minio/aistor/*    -> pulls, but every S3 call fails with
+    #                                  "AccessDenied: No license is installed", i.e. it
+    #                                  needs a commercial/AIStor license
+    #   * dl.min.io binaries / GitHub release assets -> removed (410 Gone / 404)
+    # This Bitnami-built image (Broadcom's legacy archive, Apache-2.0 packaging of the
+    # AGPLv3 MinIO community server) is the remaining legitimate anonymously-pullable
+    # source. It runs the same `minio server` binary, reads the same
+    # MINIO_ROOT_USER/MINIO_ROOT_PASSWORD variables and serves the same 9000/9001 ports,
+    # so neither the application nor the S3 client changes; only the volume mount follows
+    # the image's own data directory (see below).
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
     container_name: invoice-minio
     restart: unless-stopped
     environment:
@@ -41,9 +57,14 @@ services:
     ports:
       - '9010:9000'
       - '9011:9001'
-    command: server /data --console-address ':9001'
+    # The data directory of this image is /bitnami/minio/data and is shipped
+    # group-writable for its non-root runtime user (1001:0), so the named volume is
+    # mounted there and MinIO keeps running as non-root. Mounting an empty path such as
+    # /data instead produces a root-owned volume and MinIO aborts at startup with
+    # "unable to create (/data/.minio.sys/tmp) file access denied".
+    command: server /bitnami/minio/data --console-address ':9001'
     volumes:
-      - minio_data:/data
+      - minio_data:/bitnami/minio/data
 
   invoice-service:
     build:
@@ -65,6 +86,15 @@ services:
       DATABASE_PORT: '3306'
       ORDER_SERVICE_URL: ${ORDER_SERVICE_URL}
       ORDER_SERVICE_API_KEY: ${ORDER_SERVICE_API_KEY}
+      # Inside the compose network MinIO is reached by service name on its
+      # internal port; PUBLIC_BASE_URL (host-published port 9010) still comes
+      # from .env because it is what browsers/clients use to fetch objects.
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: '9000'
+    # Needed so the local ORDER_SERVICE_URL (http://host.docker.internal:<host port>)
+    # can reach the order-service dev stack published on the host. Harmless elsewhere.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     ports:
       - '5005:5005'
     networks:
