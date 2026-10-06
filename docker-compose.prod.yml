@@ -70,45 +70,45 @@ services:
       - /tmp
       - /dev/shm
 
-  invoice-db:
-    image: mysql:8.0
-    container_name: ${MYSQL_CONTAINER_NAME}
-    restart: unless-stopped
+    invoice-db:
+      image: mysql:8.0
+      container_name: ${MYSQL_CONTAINER_NAME}
+      restart: unless-stopped
 
-    environment:
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      environment:
+        MYSQL_DATABASE: ${MYSQL_DATABASE}
+        MYSQL_USER: ${MYSQL_USER}
+        MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+        MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
 
-    command: --default-authentication-plugin=mysql_native_password --collation-server=utf8mb4_unicode_ci --character-set-server=utf8mb4
+      command: --default-authentication-plugin=mysql_native_password --collation-server=utf8mb4_unicode_ci --character-set-server=utf8mb4
 
-    volumes:
-      - invoice-mysql-data:/var/lib/mysql
+      volumes:
+        - invoice-mysql-data:/var/lib/mysql
 
-    ports:
-      - "127.0.0.1:${MYSQL_PORT}:3306"
+      ports:
+        - "127.0.0.1:${MYSQL_PORT}:3306"
 
-    networks:
-      - app-network
+      networks:
+        - app-network
 
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
+      healthcheck:
+        test:
+          - CMD-SHELL
+          - mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent
+        interval: 10s
+        timeout: 5s
+        retries: 30
+        start_period: 120s
 
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      logging:
+        driver: json-file
+        options:
+          max-size: "10m"
+          max-file: "3"
 
-    security_opt:
-      - no-new-privileges:true
+      security_opt:
+        - no-new-privileges:true
 
 volumes:
   invoice-mysql-data:
