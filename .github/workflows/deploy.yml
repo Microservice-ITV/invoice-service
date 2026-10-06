@@ -176,7 +176,7 @@ jobs:
 
             chmod 600 .env.prod
 
-            export PRODUCTION_SMOKE_TEST_URL="https://api.dailyneeditems.com/invoices/api/v1/health"
+            export PRODUCTION_SMOKE_TEST_URL="https://api.dailyneeditems.com/invoices/health"
 
             ./scripts/deploy.sh production \
               "${{ env.IMAGE_NAME }}:${{ github.sha }}"

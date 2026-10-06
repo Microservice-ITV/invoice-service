@@ -879,6 +879,45 @@ verify_gateway_network_connectivity() {
 }
 
 # ============================================================
+# VERIFY PUBLIC HEALTH ROUTE
+# ============================================================
+verify_public_health_route() {
+    local nginx_config
+    local route_block
+
+    if ! nginx_config="$(docker exec "$NGINX_CONTAINER" nginx -T 2>/dev/null)"; then
+        error "Unable to read the active Nginx configuration."
+        return 1
+    fi
+
+    route_block="$(printf '%s\n' "$nginx_config" | awk '
+        /^[[:space:]]*location[[:space:]]*=[[:space:]]*\/invoices\/health[[:space:]]*\{/ {
+            in_route = 1
+            depth = 1
+            print
+            next
+        }
+        in_route {
+            opens = gsub(/\{/, "{")
+            closes = gsub(/\}/, "}")
+            depth += opens - closes
+            print
+            if (depth == 0) {
+                exit
+            }
+        }
+    ')"
+
+    if [[ -z "$route_block" ]] ||
+        ! grep -Eq 'proxy_pass[[:space:]]+http://invoice_service_backend/api/v1/health([;[:space:]]|$)' <<< "$route_block"; then
+        error "Nginx must define 'location = /invoices/health' and proxy it to the invoice blue/green upstream at /api/v1/health."
+        return 1
+    fi
+
+    success "Nginx public health route proxies to the invoice blue/green upstream."
+}
+
+# ============================================================
 # PRODUCTION DEPLOYMENT
 # ============================================================
 deploy_production() {
@@ -939,7 +978,16 @@ deploy_production() {
         return 1
     fi
 
+    if ! docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$NEW_CONTAINER" |
+        grep -q '^SERVICE_API_KEY=.'; then
+        error "SERVICE_API_KEY is not available in $NEW_CONTAINER."
+        return 1
+    fi
+    success "SERVICE_API_KEY is available in the new production container."
+
     verify_gateway_network_connectivity
+
+    verify_public_health_route
 
     log "Switching Nginx traffic"
 
