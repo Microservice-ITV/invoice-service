@@ -21,6 +21,7 @@ model Invoice {
 
   // One Order can have multiple invoices
   orderId            String        @db.Char(36)
+  orderReference     String?       @db.VarChar(32)
 
   shopId             String        @db.Char(36)
   shopName           String?       @db.VarChar(255)
@@ -28,6 +29,14 @@ model Invoice {
   customerId         String        @db.Char(36)
   customerName       String?       @db.VarChar(255)
   customerEmail      String?       @db.VarChar(255)
+  customerPhone      String?       @db.VarChar(64)
+  billingAddress     Json?
+  shippingAddress    Json?
+
+  shopContactName    String?       @db.VarChar(255)
+  shopContactEmail   String?       @db.VarChar(255)
+  shopContactPhone   String?       @db.VarChar(64)
+  shopAddress        String?       @db.Text
 
   lineItems          Json?
 
@@ -148,4 +157,22 @@ model InvoiceIdempotency {
   updatedAt      DateTime @updatedAt
 
   @@map("invoice_idempotency")
+}
+
+model InvoiceSequence {
+  date       String   @id @db.Char(8)
+  lastNumber Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("invoice_sequences")
+}
+
+model InvoiceOrderReference {
+  id             Int      @id @default(autoincrement())
+  orderId        String   @unique @db.Char(36)
+  orderReference String   @unique @db.VarChar(50)
+  createdAt      DateTime @default(now())
+
+  @@map("invoice_order_references")
 }

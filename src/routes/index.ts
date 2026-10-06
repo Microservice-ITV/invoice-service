@@ -20,6 +20,12 @@ router.get(
   invoiceController.getMyInvoices.bind(invoiceController)
 );
 router.get(
+  '/invoices/by-number/:invoiceNumber',
+  auth,
+  requireRoles('customer', 'seller', 'shopAdmin', 'admin'),
+  invoiceController.getInvoiceByNumber.bind(invoiceController)
+);
+router.get(
   '/invoices/shop-invoices',
   auth,
   requireRoles('seller', 'shopAdmin', 'admin'),
@@ -37,6 +43,15 @@ router.get(
   requireRoles('admin'),
   invoiceController.getAdminInvoices.bind(invoiceController)
 );
+// Print/PDF route. Authenticated by a short-lived, single-invoice print token
+// issued by this service; access is re-checked against the invoice owner.
+router.get(
+  '/invoices/print/:invoiceNumber',
+  invoiceController.getInvoiceForPrint.bind(invoiceController),
+);
+
+router.get('/invoices/:id/pdf', auth, invoiceController.downloadInvoicePdf.bind(invoiceController));
+router.get('/invoices/:id', auth, invoiceController.getInvoice.bind(invoiceController));
 router.post(
   '/invoices/:id/verify-slip',
   auth,

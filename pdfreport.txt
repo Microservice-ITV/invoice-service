@@ -1,0 +1,14 @@
+--- extracted text (first 1200 chars) ---
+
+
+--- design markers ---
+FAIL  Computer-generated invoice (should be present)
+FAIL  Seller (should be present)
+FAIL  Buyer (should be present)
+FAIL  DNI-INV- (should be present)
+FAIL  Amount in words (should be present)
+PASS  Daily Need Items (should be absent)
+PASS  Grand total (should be absent)
+PASS  Billed to (should be absent)
+
+5 MARKER(S) FAILED

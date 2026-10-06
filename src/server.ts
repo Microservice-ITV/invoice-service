@@ -1,8 +1,13 @@
 import app from '@/app';
 import env from '@/config/env';
 import prisma from '@/config/database';
-import { getRabbitChannel, closeRabbitConnection } from '@/rabbitmq/connection';
+import {
+  closeRabbitConnection,
+  getRabbitChannel,
+  setRabbitConsumerInitializer,
+} from '@/rabbitmq/connection';
 import { startPaymentCompletedConsumer } from '@/rabbitmq/consumers/payment-completed.consumer';
+import { startPaymentCollectedConsumer } from '@/rabbitmq/consumers/payment-collected.consumer';
 import { startOrderPaidConsumer } from '@/rabbitmq/consumers/order-paid.consumer';
 import logger from '@/utils/logger';
 
@@ -11,9 +16,15 @@ const startServer = async (): Promise<void> => {
     await prisma.$connect();
     logger.info('Database connected');
 
+    const initializeConsumers = async (): Promise<void> => {
+      await startPaymentCompletedConsumer();
+      await startOrderPaidConsumer();
+      await startPaymentCollectedConsumer();
+    };
+    setRabbitConsumerInitializer(initializeConsumers);
+
     await getRabbitChannel();
-    await startPaymentCompletedConsumer();
-    await startOrderPaidConsumer();
+    await initializeConsumers();
     logger.info('RabbitMQ consumer initialized');
 
     const server = app.listen(env.PORT, () => {

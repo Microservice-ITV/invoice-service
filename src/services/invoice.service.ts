@@ -1,10 +1,12 @@
 import crypto from 'crypto';
+import { Prisma } from '@prisma/client';
 import { InvoiceLineItem, InvoiceStatus, PartialInvoiceRequest, RefundMethod } from '@/types/invoice';
 import invoiceRepository from '@/repositories/invoice.repository';
-import orderSnapshotService, { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
+import orderSnapshotService, { InvoiceSnapshotAddress, OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
+import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-policy';
 import logger from '@/utils/logger';
 
 export class AppError extends Error {
@@ -50,6 +52,53 @@ export class ConflictError extends AppError {
 }
 
 const normalizeString = (value?: string | null): string => String(value ?? '').trim();
+
+function toPrismaJsonValue(value: unknown): Prisma.InputJsonValue | null {
+  if (value === null) return null;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(toPrismaJsonValue);
+  }
+  if (typeof value === 'object') {
+    return toPrismaJsonObject(value);
+  }
+  throw new TypeError('Invoice address contains a non-JSON value');
+}
+
+function toPrismaJsonObject(value: object): Prisma.InputJsonObject {
+  const entries = Object.entries(value).map(([key, entry]) => [key, toPrismaJsonValue(entry)] as const);
+  return Object.fromEntries(entries);
+}
+
+const toPrismaJsonAddress = (
+  address: InvoiceSnapshotAddress | null | undefined,
+): Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput =>
+  address == null ? Prisma.DbNull : toPrismaJsonObject(address);
+
+const normalizePdfAddress = (
+  value: Prisma.JsonValue | undefined,
+): Record<string, unknown> | null => {
+  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+};
+
+/**
+ * Invoices are always issued in MMK.
+ *
+ * The upstream order/payment snapshot may carry any source currency (for
+ * example USD). The invoice currency is relabeled to MMK while the monetary
+ * amounts are kept exactly as received — no conversion or exchange-rate math.
+ */
+export const requireMmkInvoiceCurrency = (_value?: string | null): string => 'MMK';
+
+const REACT_PRINT_PDF_MARKER = '/react-print-v9/';
+
+export const hasCurrentInvoicePdf = (pdfUrl?: string | null): boolean =>
+  Boolean(pdfUrl?.includes(REACT_PRINT_PDF_MARKER));
 
 const moneyToMinorUnits = (value: string | number): bigint => {
   const text = String(value).trim();
@@ -266,11 +315,11 @@ export class InvoiceService {
     if (snapshot.orderId !== normalizedRequest.orderId) {
       throw new NotFoundError('Order snapshot does not match the requested order');
     }
-
-    const currency = snapshot.currency?.trim().toUpperCase();
-    if (!currency) {
-      throw new ValidationError('Order snapshot currency is required');
+    if (snapshot.customerId !== customerId) {
+      throw new ForbiddenError('Invoice order does not belong to this customer');
     }
+
+    const currency = requireMmkInvoiceCurrency(snapshot.currency);
 
     const snapshotItems = new Map<string, OrderInvoiceSnapshotItem>();
     for (const item of snapshot.items) {
@@ -312,6 +361,7 @@ export class InvoiceService {
     validatePartialInvoiceShopSelection(shopIds);
 
     const shopId = [...shopIds][0];
+    const shopSnapshot = await shopLookupService.getShopInvoiceSnapshot(shopId);
     const subtotal = selectedItems
       .reduce((total, item) => total + Number(item.unitPrice) * item.requestedQuantity, 0)
       .toFixed(2);
@@ -324,12 +374,19 @@ export class InvoiceService {
     }
 
     return invoiceRepository.createPartialInvoice({
-      invoiceNumber: this.generateInvoiceNumber(),
       orderId: normalizedRequest.orderId,
       shopId,
+      shopName: shopSnapshot?.name ?? null,
       customerId,
       customerName: normalizedRequest.customerName || null,
       customerEmail: normalizedRequest.customerEmail || null,
+      customerPhone: snapshot.customerPhone ?? null,
+      billingAddress: toPrismaJsonAddress(snapshot.billingAddress),
+      shippingAddress: toPrismaJsonAddress(snapshot.shippingAddress),
+      shopContactName: shopSnapshot?.contactName ?? null,
+      shopContactEmail: shopSnapshot?.contactEmail ?? null,
+      shopContactPhone: shopSnapshot?.contactPhone ?? null,
+      shopAddress: shopSnapshot?.address ?? null,
       currency,
       paymentMethod: normalizedRequest.paymentMethod,
       subtotal,
@@ -348,6 +405,7 @@ export class InvoiceService {
     transactionId: string;
     amount: number;
     currency: string;
+    paymentStatus: 'PAID' | 'COLLECTED';
     paymentMethod?: string | null;
     customerName?: string | null;
     customerEmail?: string | null;
@@ -362,17 +420,31 @@ export class InvoiceService {
       throw new ValidationError(`Payment amount does not match order grand total for ${payload.orderId}`);
     }
 
-    const snapshotCurrency = snapshot.currency?.trim().toUpperCase();
-    const paymentCurrency = payload.currency.trim().toUpperCase();
-    if (snapshotCurrency && snapshotCurrency !== paymentCurrency) {
+    const snapshotCurrency = requireMmkInvoiceCurrency(snapshot.currency);
+    const paymentCurrency = requireMmkInvoiceCurrency(payload.currency);
+    if (snapshotCurrency !== paymentCurrency) {
       throw new ValidationError(`Payment currency does not match order currency for ${payload.orderId}`);
+    }
+    const currency = snapshotCurrency;
+
+    const paymentMethod = normalizeString(payload.paymentMethod ?? snapshot.paymentMethod).toUpperCase();
+    if (payload.paymentStatus === 'COLLECTED' && paymentMethod !== 'COD') {
+      throw new ValidationError('Collected payment invoices require COD payment method');
+    }
+    if (payload.paymentStatus === 'PAID' && paymentMethod === 'COD') {
+      throw new ValidationError('COD invoices require a collected payment');
+    }
+    if (payload.paymentStatus === 'PAID' && snapshot.paymentStatus !== 'PAID') {
+      throw new ValidationError('Order snapshot is not in a paid state');
+    }
+    if (payload.paymentStatus === 'COLLECTED' && normalizeString(snapshot.paymentMethod).toUpperCase() !== 'COD') {
+      throw new ValidationError('Collected payment does not match COD order snapshot');
     }
 
     if (!snapshot.customerId.trim() || !payload.paymentId.trim() || !payload.transactionId.trim()) {
       throw new ValidationError('Payment identity and snapshot customer ID are required');
     }
 
-    const currency = snapshotCurrency || paymentCurrency;
     const itemsByShop = new Map<string, OrderInvoiceSnapshotItem[]>();
     for (const item of snapshot.items) {
       const shopId = item.shopId?.trim();
@@ -385,7 +457,11 @@ export class InvoiceService {
     }
 
     const shops = [...itemsByShop.entries()];
-    const shopNames = await resolveInvoiceShopNames(shops.map(([shopId]) => shopId));
+    const shopDetails = await Promise.all(shops.map(async ([shopId]) => [
+      shopId,
+      await shopLookupService.getShopInvoiceSnapshot(shopId),
+    ] as const));
+    const shopSnapshots = new Map(shopDetails);
     const shopTotals = allocateShopTotals(
       snapshot.subtotal,
       snapshot.deliveryFee,
@@ -401,7 +477,8 @@ export class InvoiceService {
       const [shopId, items] = shops[index];
       const shopTotal = shopTotals[index];
       const snapshotShopName = items.find((item) => item.shopName?.trim())?.shopName;
-      const resolvedShopName = shopNames.get(shopId) ?? null;
+      const shopSnapshot = shopSnapshots.get(shopId);
+      const resolvedShopName = shopSnapshot?.name ?? null;
       const displayData = resolveInvoiceDisplayData({
         snapshotCustomerName: snapshot.customerName,
         payloadCustomerName: payload.customerName,
@@ -418,7 +495,10 @@ export class InvoiceService {
         requestedQuantity: item.quantity,
       }));
       const lineItems: InvoiceLineItem[] = invoiceItems.map((item) => ({
+        orderItemId: item.orderItemId,
         name: item.productName?.trim() || item.productSku || item.productId,
+        sku: item.productSku,
+        imageUrl: item.imageUrl ?? null,
         quantity: item.requestedQuantity,
         unitPrice: item.unitPrice,
         total: item.lineTotal,
@@ -437,20 +517,26 @@ export class InvoiceService {
         : `payment:${payload.paymentId}:shop:${shopId}`;
 
       const invoice = await invoiceRepository.createPaidInvoiceFromPayment({
-        invoiceNumber: this.generateInvoiceNumber(),
         orderId: snapshot.orderId,
         shopId,
         shopName: normalizeString(shopName) || null,
         customerId: snapshot.customerId,
         customerName: displayData.customerName,
         customerEmail: displayData.customerEmail,
+        customerPhone: snapshot.customerPhone ?? null,
+        billingAddress: toPrismaJsonAddress(snapshot.billingAddress),
+        shippingAddress: toPrismaJsonAddress(snapshot.shippingAddress),
+        shopContactName: shopSnapshot?.contactName ?? null,
+        shopContactEmail: shopSnapshot?.contactEmail ?? null,
+        shopContactPhone: shopSnapshot?.contactPhone ?? null,
+        shopAddress: shopSnapshot?.address ?? null,
         currency,
         subtotal: shopTotal.subtotal,
         deliveryFee: shopTotal.deliveryFee,
         taxAmount: '0.00',
         discountAmount: shopTotal.discountAmount,
         grandTotal: shopTotal.grandTotal,
-        paymentMethod: normalizeString(payload.paymentMethod).toUpperCase() || null,
+        paymentMethod: paymentMethod || null,
         paymentGatewayRef: payload.transactionId,
         lineItems,
         items: invoiceItems,
@@ -487,7 +573,7 @@ export class InvoiceService {
         throw new ConflictError('Invoice has already been verified');
       }
 
-      void this.generatePdfAsync(updatedInvoice.id, updatedInvoice);
+      void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
       return updatedInvoice;
     }
 
@@ -495,6 +581,7 @@ export class InvoiceService {
     if (!updatedInvoice) {
       throw new ConflictError('Invoice has already been verified');
     }
+    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
     return updatedInvoice;
   }
 
@@ -509,12 +596,14 @@ export class InvoiceService {
       throw new Error(`Invoice cannot be voided while in ${invoice.status} status`);
     }
 
-    return invoiceRepository.updateStatus(id, {
+    const updatedInvoice = await invoiceRepository.updateStatus(id, {
       status: 'VOID',
       verifiedBy: voidedBy,
       verifiedAt: new Date(),
       rejectionReason: reason,
     });
+    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+    return updatedInvoice;
   }
 
   async refundInvoice(
@@ -538,7 +627,7 @@ export class InvoiceService {
       throw new Error('Refund amount must be greater than zero and no more than the invoice total');
     }
 
-    return invoiceRepository.updateStatus(id, {
+    const updatedInvoice = await invoiceRepository.updateStatus(id, {
       status: 'REFUNDED',
       verifiedBy: refundedBy,
       verifiedAt: new Date(),
@@ -546,6 +635,8 @@ export class InvoiceService {
       refundMethod: method,
       refundReason: reason,
     });
+    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+    return updatedInvoice;
   }
 
   async getInvoicesByCustomer(customerId: string) {
@@ -556,13 +647,99 @@ export class InvoiceService {
     return invoiceRepository.listInvoices({ shopId, status });
   }
 
+  async getInvoicesByShops(shopIds: string[]) {
+    return invoiceRepository.listInvoices({ shopIds });
+  }
+
   async getAllInvoices(status?: InvoiceStatus) {
     const invoices = await invoiceRepository.listInvoices({ status });
     return populateMissingInvoiceShopNames(invoices);
   }
 
   async getInvoiceById(id: string) {
-    return invoiceRepository.findById(id);
+    const invoice = await invoiceRepository.findDocumentById(id);
+    return invoice ? this.populateMissingLineItemImages(invoice) : null;
+  }
+
+  async getCustomerInvoiceByNumber(invoiceNumber: string, customerId: string) {
+    const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
+    if (!invoice || invoice.customerId !== customerId) {
+      return null;
+    }
+
+    return this.populateMissingLineItemImages(invoice);
+  }
+
+  async getInvoiceByNumber(invoiceNumber: string) {
+    const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
+    return invoice ? this.populateMissingLineItemImages(invoice) : null;
+  }
+
+  private async populateMissingLineItemImages<T extends {
+    orderId: string;
+    lineItems: InvoiceLineItem[] | null;
+  }>(invoice: T): Promise<T> {
+    const lineItems = invoice.lineItems ?? [];
+    if (lineItems.length === 0 || lineItems.every((item) => item.imageUrl?.trim())) {
+      return invoice;
+    }
+
+    let snapshot: Awaited<ReturnType<typeof orderSnapshotService.getInvoiceSnapshot>>;
+    try {
+      snapshot = await orderSnapshotService.getInvoiceSnapshot(invoice.orderId);
+    } catch (error) {
+      logger.warn('Unable to hydrate historical invoice images; returning persisted invoice data', {
+        orderId: invoice.orderId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        ...invoice,
+        lineItems: lineItems.map((item) => ({
+          ...item,
+          imageUrl: item.imageUrl?.trim() || null,
+        })),
+      };
+    }
+
+    const imageUrlsByOrderItemId = new Map(
+      snapshot.items.flatMap((item) => {
+        const imageUrl = item.imageUrl?.trim();
+        return imageUrl ? [[item.orderItemId, imageUrl] as const] : [];
+      }),
+    );
+
+    return {
+      ...invoice,
+      lineItems: lineItems.map((item) => ({
+        ...item,
+        imageUrl: item.imageUrl?.trim()
+          || (item.orderItemId ? imageUrlsByOrderItemId.get(item.orderItemId) : undefined)
+          || null,
+      })),
+    };
+  }
+
+  async downloadInvoicePdf(id: string, actor: InvoiceAccessActor) {
+    const invoice = await invoiceRepository.findById(id);
+    if (!invoice || !canAccessInvoice(invoice, actor)) {
+      return null;
+    }
+
+    let pdfUrl = invoice.pdfUrl;
+    if (!hasCurrentInvoicePdf(invoice.pdfUrl)) {
+      // Legacy PDFs are regenerated through the shared React print route.
+      // Current renderer output is reused instead of launching Puppeteer again.
+      await this.generatePdfAsync(invoice.id, invoice, { force: true, throwOnFailure: true });
+      pdfUrl = (await invoiceRepository.findById(id))?.pdfUrl ?? null;
+    }
+    if (!pdfUrl) {
+      throw new Error('Invoice PDF generation completed without a downloadable PDF');
+    }
+
+    return {
+      invoice,
+      buffer: await storageService.downloadPdf(pdfUrl),
+    };
   }
 
   async uploadPaymentSlip(id: string, customerId: string, paymentSlipDataUrl: string) {
@@ -574,18 +751,6 @@ export class InvoiceService {
     }
     const paymentSlipUrl = await storageService.uploadImageDataUrl(id, paymentSlipDataUrl);
     return invoiceRepository.updatePaymentSlip(id, paymentSlipUrl);
-  }
-
-  async updateOrderSnapshot(payload: {
-    orderId: string;
-    shopName?: string | null;
-    lineItems?: InvoiceLineItem[];
-    customerName?: string | null;
-    customerEmail?: string | null;
-  }) {
-    const invoice = await invoiceRepository.findByOrderId(payload.orderId);
-    if (!invoice) return null;
-    return invoiceRepository.updateOrderSnapshot(payload.orderId, payload);
   }
 
   async generateInvoicePdf(id: string, shopId?: string) {
@@ -639,8 +804,8 @@ export class InvoiceService {
       }
 
       let pdfUrl = invoice.pdfUrl;
-      if (!pdfUrl) {
-        await this.generatePdfAsync(invoice.id, invoice);
+      if (!hasCurrentInvoicePdf(pdfUrl)) {
+        await this.generatePdfAsync(invoice.id, invoice, { force: true });
         const refreshedInvoice = await invoiceRepository.findById(invoice.id);
         pdfUrl = refreshedInvoice?.pdfUrl ?? null;
       }
@@ -665,11 +830,19 @@ export class InvoiceService {
       id: string;
       invoiceNumber: string;
       orderId: string;
+      orderReference?: string | null;
       shopId: string;
       shopName?: string | null;
+      shopContactName?: string | null;
+      shopContactEmail?: string | null;
+      shopContactPhone?: string | null;
+      shopAddress?: string | null;
       customerId: string;
       customerName?: string | null;
       customerEmail?: string | null;
+      customerPhone?: string | null;
+      billingAddress?: Prisma.JsonValue;
+      shippingAddress?: Prisma.JsonValue;
       subtotal: string | { toString(): string };
       taxAmount: string | { toString(): string };
       deliveryFee?: string | { toString(): string };
@@ -681,21 +854,41 @@ export class InvoiceService {
       createdAt: Date;
       lineItems?: unknown;
       pdfUrl?: string | null;
+      pdfUpdatedAt?: Date | null;
+      updatedAt?: Date;
+    },
+    options: { force?: boolean; throwOnFailure?: boolean } = {},
+  ): Promise<boolean> {
+    if (!options.force && hasCurrentInvoicePdf(invoice.pdfUrl)) {
+      return true;
     }
-  ) {
-    if (invoice.pdfUrl || !(await invoiceRepository.claimPdfGeneration(invoiceId))) {
-      return;
+
+    const force = options.force ?? Boolean(invoice.pdfUrl);
+    if (!(await invoiceRepository.claimPdfGeneration(invoiceId, { force }))) {
+      if (options.throwOnFailure) {
+        throw new Error('Invoice PDF generation is already in progress; please retry the download.');
+      }
+      return false;
     }
 
     try {
       const pdfUrl = await pdfGeneratorService.buildAndUploadInvoicePdf({
+        invoiceId: invoice.id,
         invoiceNumber: invoice.invoiceNumber,
+        orderReference: invoice.orderReference ?? null,
         orderId: invoice.orderId,
         shopId: invoice.shopId,
         customerId: invoice.customerId,
         shopName: invoice.shopName,
+        shopContactName: invoice.shopContactName,
+        shopContactEmail: invoice.shopContactEmail,
+        shopContactPhone: invoice.shopContactPhone,
+        shopAddress: invoice.shopAddress,
         customerName: invoice.customerName,
         customerEmail: invoice.customerEmail,
+        customerPhone: invoice.customerPhone,
+        billingAddress: normalizePdfAddress(invoice.billingAddress),
+        shippingAddress: normalizePdfAddress(invoice.shippingAddress),
         currency: invoice.currency,
         subtotal: invoice.subtotal.toString(),
         taxAmount: invoice.taxAmount.toString(),
@@ -709,17 +902,15 @@ export class InvoiceService {
       });
 
       await invoiceRepository.markPdfReady(invoiceId, pdfUrl);
+      return true;
     } catch (error) {
       await invoiceRepository.markPdfFailed(invoiceId, error instanceof Error ? error.message : 'PDF generation failed');
       logger.error(`Failed to generate invoice PDF for ${invoiceId}`, error as Error);
+      if (options.throwOnFailure) {
+        throw error instanceof Error ? error : new Error('Invoice PDF generation failed');
+      }
+      return false;
     }
-  }
-
-  private generateInvoiceNumber(): string {
-    const date = new Date();
-    const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
-    const randomSequence = Math.floor(10000 + Math.random() * 90000);
-    return `INV-${stamp}-${String(randomSequence)}`;
   }
 
   private normalizeLineItems(value: unknown): InvoiceLineItem[] {
@@ -734,7 +925,11 @@ export class InvoiceService {
         && typeof candidate.quantity === 'number'
         && typeof candidate.unitPrice === 'string'
         && typeof candidate.total === 'string';
-    });
+    }).map((item) => ({
+      ...item,
+      orderItemId: typeof item.orderItemId === 'string' ? item.orderItemId : undefined,
+      sku: typeof item.sku === 'string' ? item.sku : null,
+    }));
   }
 }
 

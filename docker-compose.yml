@@ -30,6 +30,8 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    networks:
+      - itv-network
 
   minio:
     # Image source is pinned because MinIO's own registries no longer serve the
@@ -96,7 +98,7 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     ports:
-      - '5005:5005'
+      - '5006:5006'
     networks:
       - default
       - itv-network
@@ -110,4 +112,3 @@ networks:
   itv-network:
     external: true
     name: itv-network
-

@@ -3,13 +3,13 @@ import { getRabbitChannel } from '@/rabbitmq/connection';
 import { rabbitConfig } from '@/rabbitmq/config';
 import invoiceService from '@/services/invoice.service';
 import logger from '@/utils/logger';
-import { InvoiceLineItem } from '@/types/invoice';
+import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
 
 export const startOrderPaidConsumer = async (): Promise<void> => {
   const channel = await getRabbitChannel();
-  const queueName = 'invoice.order.paid';
+  const queueName = rabbitConfig.queues.orderPaid;
   await channel.assertQueue(queueName, { durable: true });
-  await channel.bindQueue(queueName, rabbitConfig.exchange, 'order.paid');
+  await channel.bindQueue(queueName, rabbitConfig.exchange, rabbitConfig.routingKeys.orderPaid);
 
   await channel.consume(queueName, async (message: ConsumeMessage | null) => {
     if (!message) return;
@@ -17,35 +17,29 @@ export const startOrderPaidConsumer = async (): Promise<void> => {
       const envelope = JSON.parse(message.content.toString()) as { data?: Record<string, unknown> };
       const data: Record<string, unknown> = envelope.data ?? {};
       const orderId = typeof data.order_id === 'string' ? data.order_id : '';
-      const rawItems = Array.isArray(data.line_items) ? data.line_items : [];
-      const lineItems = rawItems.filter((item: unknown): item is InvoiceLineItem => {
-        if (!item || typeof item !== 'object') return false;
-        const candidate = item as Partial<InvoiceLineItem>;
-        return typeof candidate.name === 'string'
-          && typeof candidate.quantity === 'number'
-          && typeof candidate.unitPrice === 'string'
-          && typeof candidate.total === 'string';
-      });
 
       if (orderId) {
-        const address = data.deliveryAddress as Record<string, unknown> | undefined;
-        const snapshot: {
-          orderId: string;
-          lineItems?: InvoiceLineItem[];
-          customerName?: string;
-          customerEmail?: string;
-        } = {
-          orderId,
-        };
-        if (lineItems.length > 0) snapshot.lineItems = lineItems;
-        if (typeof address?.full_name === 'string' && address.full_name.trim()) {
-          snapshot.customerName = address.full_name.trim();
-        }
-        if (typeof address?.email === 'string' && address.email.trim()) {
-          snapshot.customerEmail = address.email.trim();
-        }
-        if (snapshot.lineItems || snapshot.customerName || snapshot.customerEmail) {
-          await invoiceService.updateOrderSnapshot(snapshot);
+        const paymentId = typeof data.payment_id === 'string' ? data.payment_id.trim() : '';
+        const transactionId = typeof data.transaction_id === 'string' ? data.transaction_id.trim() : '';
+        const currency = typeof data.currency === 'string' ? data.currency.trim() : '';
+        if (
+          getFinalInvoicePaymentStatus('order.paid', data) === 'PAID'
+          &&
+          paymentId
+          && transactionId
+          && currency
+          && typeof data.amount === 'number'
+          && Number.isFinite(data.amount)
+        ) {
+          await invoiceService.createInvoiceFromPayment({
+            paymentId,
+            orderId,
+            transactionId,
+            amount: data.amount,
+            currency,
+            paymentStatus: 'PAID',
+            paymentMethod: typeof data.payment_method === 'string' ? data.payment_method : null,
+          });
         }
       }
       channel.ack(message);

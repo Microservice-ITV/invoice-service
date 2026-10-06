@@ -20,14 +20,109 @@ import {
   buildPartialInvoiceRequestHash,
   allocateShopTotals,
   calculateShopSubtotal,
+  hasCurrentInvoicePdf,
   normalizePartialInvoiceRequest,
   populateMissingInvoiceShopNames,
+  requireMmkInvoiceCurrency,
   resolveInvoiceDisplayData,
   resolveInvoiceShopNames,
   validatePartialInvoiceShopSelection,
   validatePartialInvoiceRequest,
   validateRequestedQuantity,
 } from '@/services/invoice.service';
+import { InvoiceService } from '@/services/invoice.service';
+import invoiceRepository, { InvoiceRepository } from '@/repositories/invoice.repository';
+import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-snapshot.service';
+import shopLookupService from '@/services/shop-lookup.service';
+
+const makeOrderSnapshot = (currency: string): OrderInvoiceSnapshot => ({
+  orderId: 'order-1',
+  checkoutId: 'checkout-1',
+  customerId: 'customer-1',
+  customerName: 'Customer One',
+  customerEmail: 'customer@example.com',
+  customerPhone: '555-0100',
+  paymentStatus: 'PAID',
+  paymentMethod: 'CARD',
+  items: [{
+    orderItemId: 'order-item-1',
+    productId: 'product-1',
+    productName: 'Test product',
+    productSku: 'SKU-1',
+    imageUrl: 'https://products.example.test/images/test-product.png',
+    quantity: 1,
+    unitPrice: '100.00',
+    lineTotal: '100.00',
+    shopId: 'shop-1',
+    shopName: 'Shop One',
+  }],
+  currency,
+  subtotal: '100.00',
+  deliveryFee: '0.00',
+  promotionDiscountTotal: '0.00',
+  grandTotal: '100.00',
+});
+
+const makePaymentPayload = (currency: string) => ({
+  paymentId: 'payment-1',
+  orderId: 'order-1',
+  transactionId: 'transaction-1',
+  amount: 100,
+  currency,
+  paymentStatus: 'PAID' as const,
+  paymentMethod: 'CARD',
+});
+
+test('only PDFs made by the current React print renderer are reusable', () => {
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v9/invoice.pdf'),
+    true,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v8/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v7/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v6/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v5/invoice.pdf'),
+    false,
+  );
+  assert.equal(hasCurrentInvoicePdf('invoice-pdfs/shop-1/legacy-invoice.pdf'), false);
+  assert.equal(hasCurrentInvoicePdf(null), false);
+});
+
+const withSnapshotDependencies = async <T>(
+  snapshot: OrderInvoiceSnapshot,
+  run: () => Promise<T>,
+): Promise<T> => {
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  const originalGetShopInvoiceSnapshot = shopLookupService.getShopInvoiceSnapshot;
+  const originalClaimPdfGeneration = invoiceRepository.claimPdfGeneration;
+  orderSnapshotService.getInvoiceSnapshot = async () => snapshot;
+  shopLookupService.getShopInvoiceSnapshot = async () => ({
+    name: 'Shop One',
+    contactName: 'Seller One',
+    contactEmail: 'seller@example.com',
+    contactPhone: '555-0101',
+    address: 'Shop address',
+  });
+  invoiceRepository.claimPdfGeneration = async () => false;
+
+  try {
+    return await run();
+  } finally {
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+    shopLookupService.getShopInvoiceSnapshot = originalGetShopInvoiceSnapshot;
+    invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
+  }
+};
 
 test('validateRequestedQuantity accepts valid partial and full quantities', () => {
   assert.doesNotThrow(() => validateRequestedQuantity('item-1', 2, 5));
@@ -50,6 +145,223 @@ test('validateRequestedQuantity rejects zero and negative quantities', () => {
     () => validateRequestedQuantity('item-1', -1, 5),
     /must be a positive integer/,
   );
+});
+
+test('invoice currency is always normalized to MMK regardless of the source currency', () => {
+  assert.equal(requireMmkInvoiceCurrency('mmk'), 'MMK');
+  assert.equal(requireMmkInvoiceCurrency('USD'), 'MMK');
+  assert.equal(requireMmkInvoiceCurrency(null), 'MMK');
+  assert.equal(requireMmkInvoiceCurrency(undefined), 'MMK');
+});
+
+test('paid invoice creation stores the validated MMK source currency', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let storedCurrency: string | undefined;
+  let storedLineItemImage: string | null | undefined;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    storedCurrency = data.currency;
+    storedLineItemImage = data.lineItems[0]?.imageUrl;
+    return { id: 'invoice-1', currency: data.currency } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+      await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('MMK'));
+    });
+    assert.equal(storedCurrency, 'MMK');
+    assert.equal(storedLineItemImage, 'https://products.example.test/images/test-product.png');
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('customer invoice detail hydrates missing product images from the order snapshot', async () => {
+  const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  invoiceRepository.findDocumentByInvoiceNumber = async () => ({
+    id: 'invoice-1',
+    invoiceNumber: 'INV-1',
+    customerId: 'customer-1',
+    orderId: 'order-1',
+    lineItems: [{
+      orderItemId: 'order-item-1',
+      name: 'Test product',
+      sku: 'SKU-1',
+      quantity: 1,
+      unitPrice: '100.00',
+      total: '100.00',
+      imageUrl: null,
+    }],
+  }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
+  orderSnapshotService.getInvoiceSnapshot = async () => makeOrderSnapshot('MMK');
+
+  try {
+    const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
+    assert.equal(
+      invoice?.lineItems?.[0]?.imageUrl,
+      'https://products.example.test/images/test-product.png',
+    );
+  } finally {
+    invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('invoice detail skips order snapshot lookup when persisted images are available', async () => {
+  const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  let snapshotLookupCount = 0;
+  invoiceRepository.findDocumentByInvoiceNumber = async () => ({
+    id: 'invoice-1',
+    invoiceNumber: 'INV-1',
+    customerId: 'customer-1',
+    orderId: 'order-1',
+    lineItems: [{
+      orderItemId: 'order-item-1',
+      name: 'Test product',
+      sku: 'SKU-1',
+      quantity: 1,
+      unitPrice: '100.00',
+      total: '100.00',
+      imageUrl: 'https://products.example.test/images/persisted.png',
+    }],
+  }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
+  orderSnapshotService.getInvoiceSnapshot = async () => {
+    snapshotLookupCount += 1;
+    throw new Error('Order Service should not be called');
+  };
+
+  try {
+    const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
+    assert.equal(invoice?.lineItems?.[0]?.imageUrl, 'https://products.example.test/images/persisted.png');
+    assert.equal(snapshotLookupCount, 0);
+  } finally {
+    invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('invoice detail succeeds with a null image when optional snapshot hydration fails', async () => {
+  const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  invoiceRepository.findDocumentByInvoiceNumber = async () => ({
+    id: 'invoice-1',
+    invoiceNumber: 'INV-1',
+    customerId: 'customer-1',
+    orderId: 'order-1',
+    lineItems: [{
+      orderItemId: 'order-item-1',
+      name: 'Test product',
+      sku: 'SKU-1',
+      quantity: 1,
+      unitPrice: '100.00',
+      total: '100.00',
+      imageUrl: null,
+    }],
+  }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
+  orderSnapshotService.getInvoiceSnapshot = async () => {
+    throw new Error('Order Service unavailable');
+  };
+
+  try {
+    const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
+    assert.equal(invoice?.invoiceNumber, 'INV-1');
+    assert.equal(invoice?.lineItems?.[0]?.imageUrl, null);
+  } finally {
+    invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('paid invoice creation relabels non-MMK source/payment currencies to MMK without converting amounts', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const stored: Array<{ currency: string; subtotal: string; grandTotal: string }> = [];
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    stored.push({ currency: data.currency, subtotal: data.subtotal, grandTotal: data.grandTotal });
+    return { id: `invoice-${stored.length}`, currency: data.currency } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    await withSnapshotDependencies(makeOrderSnapshot('USD'), async () => {
+      await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('USD'));
+    });
+    await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+      await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('USD'));
+    });
+
+    assert.equal(stored.length, 2);
+    for (const invoice of stored) {
+      assert.equal(invoice.currency, 'MMK');
+      assert.equal(invoice.subtotal, '100.00');
+      assert.equal(invoice.grandTotal, '100.00');
+    }
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('repeated paid events use one stable idempotency key and return one invoice', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const invoicesByKey = new Map<string, { id: string; currency: string }>();
+  let insertCount = 0;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    const existing = invoicesByKey.get(data.idempotencyKey);
+    if (existing) return existing as Awaited<ReturnType<typeof originalCreate>>;
+    insertCount += 1;
+    const invoice = { id: 'invoice-1', currency: data.currency };
+    invoicesByKey.set(data.idempotencyKey, invoice);
+    return invoice as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+      const service = new InvoiceService();
+      const first = await service.createInvoiceFromPayment(makePaymentPayload('MMK'));
+      const second = await service.createInvoiceFromPayment(makePaymentPayload('MMK'));
+      assert.equal(first, second);
+    });
+    assert.equal(insertCount, 1);
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice snapshot update mutation APIs are removed', () => {
+  assert.equal('updateOrderSnapshot' in new InvoiceService(), false);
+  assert.equal('updateOrderSnapshot' in new InvoiceRepository(), false);
+  assert.equal('createInvoice' in new InvoiceRepository(), false);
+});
+
+test('partial invoice creation stores MMK even when the snapshot currency is not MMK', async () => {
+  const originalFindIdempotency = invoiceRepository.findIdempotency;
+  const originalCreatePartialInvoice = invoiceRepository.createPartialInvoice;
+  const storedCurrencies: string[] = [];
+  invoiceRepository.findIdempotency = async () => null;
+  invoiceRepository.createPartialInvoice = async (data) => {
+    storedCurrencies.push(data.currency);
+    return { id: 'partial-invoice-1', currency: data.currency } as Awaited<ReturnType<typeof originalCreatePartialInvoice>>;
+  };
+
+  try {
+    await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+      await new InvoiceService().createPartialInvoice({
+        orderId: 'order-1',
+        items: [{ orderItemId: 'order-item-1', quantity: 1 }],
+      }, 'customer-1', 'partial-key');
+    });
+
+    await withSnapshotDependencies(makeOrderSnapshot('USD'), async () => {
+      await new InvoiceService().createPartialInvoice({
+        orderId: 'order-1',
+        items: [{ orderItemId: 'order-item-1', quantity: 1 }],
+      }, 'customer-1', 'partial-usd-key');
+    });
+
+    assert.deepEqual(storedCurrencies, ['MMK', 'MMK']);
+  } finally {
+    invoiceRepository.findIdempotency = originalFindIdempotency;
+    invoiceRepository.createPartialInvoice = originalCreatePartialInvoice;
+  }
 });
 
 test('validatePartialInvoiceShopSelection rejects mixed-shop selections', () => {

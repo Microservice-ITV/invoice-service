@@ -12,7 +12,11 @@ app.use(helmet());
 
 app.use(
   cors({
-    origin: env.CORS_ORIGIN,
+    // Accepts a comma-separated list so the browser origin and the headless
+    // PDF renderer's origin can both be allowed.
+    origin: env.CORS_ORIGIN.split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
     credentials: true,
   })
 );

@@ -37,27 +37,21 @@ export class StorageService {
 
   async uploadPdf(fileName: string, buffer: Buffer): Promise<string> {
     const safeFileName = fileName.replace(/\\+/g, '/').replace(/^\/+|\/+$/g, '');
-    const objectKey = safeFileName.startsWith('invoices/') ? safeFileName : `invoices/${safeFileName}`;
+    const objectKey = safeFileName.replace(/^invoice-pdfs\//, '');
 
     try {
-      const exists = await s3Client.bucketExists(s3Config.bucket).catch(() => false);
+      const exists = await s3Client.bucketExists(s3Config.pdfBucket).catch(() => false);
 
       if (!exists) {
-        await s3Client.makeBucket(s3Config.bucket, 'us-east-1');
+        await s3Client.makeBucket(s3Config.pdfBucket, 'us-east-1');
       }
 
-      await s3Client.setBucketPolicy(
-        s3Config.bucket,
-        publicReadPolicy(s3Config.bucket),
-      );
-
-      await s3Client.putObject(s3Config.bucket, objectKey, buffer, buffer.byteLength, {
+      await s3Client.putObject(s3Config.pdfBucket, objectKey, buffer, buffer.byteLength, {
         'Content-Type': 'application/pdf',
-        'Cache-Control': 'public, max-age=31536000',
+        'Cache-Control': 'private, no-store',
       });
 
-      const baseUrl = s3Config.publicBaseUrl.replace(/\/+$/, '');
-      return `${baseUrl}/${s3Config.bucket}/${objectKey}`;
+      return `invoice-pdfs/${objectKey}`;
     } catch (error) {
       logger.error('Failed to upload PDF to object storage', error as Error);
       throw error;
@@ -65,16 +59,20 @@ export class StorageService {
   }
 
   async downloadPdf(pdfUrl: string): Promise<Buffer> {
-    const parsedUrl = new URL(pdfUrl);
-    const bucketPrefix = `/${s3Config.bucket}/`;
-    const bucketIndex = parsedUrl.pathname.indexOf(bucketPrefix);
-
-    if (bucketIndex < 0) {
-      throw new Error(`Invalid invoice PDF URL: ${pdfUrl}`);
+    let bucket = s3Config.pdfBucket;
+    let objectKey = pdfUrl;
+    if (/^https?:\/\//i.test(pdfUrl)) {
+      const parsedUrl = new URL(pdfUrl);
+      const bucketPrefix = `/${s3Config.bucket}/`;
+      const bucketIndex = parsedUrl.pathname.indexOf(bucketPrefix);
+      if (bucketIndex < 0) throw new Error('Invalid invoice PDF reference');
+      bucket = s3Config.bucket;
+      objectKey = decodeURIComponent(parsedUrl.pathname.slice(bucketIndex + bucketPrefix.length));
+    } else if (objectKey.startsWith('invoice-pdfs/')) {
+      objectKey = objectKey.slice('invoice-pdfs/'.length);
     }
 
-    const objectKey = decodeURIComponent(parsedUrl.pathname.slice(bucketIndex + bucketPrefix.length));
-    const stream = await s3Client.getObject(s3Config.bucket, objectKey);
+    const stream = await s3Client.getObject(bucket, objectKey);
     const chunks: Buffer[] = [];
 
     for await (const chunk of stream) {

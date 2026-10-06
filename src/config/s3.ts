@@ -11,5 +11,6 @@ export const s3Client = new MinioClient({
 
 export const s3Config = {
   bucket: env.MINIO_BUCKET,
+  pdfBucket: env.MINIO_PDF_BUCKET,
   publicBaseUrl: env.PUBLIC_BASE_URL,
 };

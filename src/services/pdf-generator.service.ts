@@ -1,14 +1,36 @@
 import puppeteer from 'puppeteer';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
+import env from '@/config/env';
+import invoicePrintTokenService from '@/services/invoice-print-token.service';
 import { InvoiceStatus } from '@/types/invoice';
 
+const REACT_PRINT_PDF_MARKER = 'react-print-v9';
+const INTER_FONT_DIRECTORY = join(process.cwd(), 'assets', 'fonts', 'inter');
+const INTER_FONT_FILES = [
+  { filename: 'Inter-Regular.woff2', weight: 400 },
+  { filename: 'Inter-Medium.woff2', weight: 500 },
+  { filename: 'Inter-SemiBold.woff2', weight: 600 },
+  { filename: 'Inter-Bold.woff2', weight: 700 },
+] as const;
+
 export interface InvoicePdfPayload {
+  invoiceId: string;
   invoiceNumber: string;
+  orderReference: string | null;
   orderId: string;
   shopId: string;
   shopName?: string | null;
+  shopContactName?: string | null;
+  shopContactEmail?: string | null;
+  shopContactPhone?: string | null;
+  shopAddress?: string | null;
   customerId: string;
+  customerPhone?: string | null;
+  billingAddress?: Record<string, unknown> | null;
+  shippingAddress?: Record<string, unknown> | null;
   currency: string;
   subtotal: string;
   taxAmount: string;
@@ -21,6 +43,7 @@ export interface InvoicePdfPayload {
   customerName?: string | null;
   customerEmail?: string | null;
   lineItems?: Array<{
+    sku?: string | null;
     name: string;
     quantity: number;
     unitPrice: string;
@@ -30,77 +53,105 @@ export interface InvoicePdfPayload {
 
 export class PdfGeneratorService {
   async buildAndUploadInvoicePdf(payload: InvoicePdfPayload): Promise<string> {
-    const html = this.renderInvoiceHtml(payload);
+    const pdfBuffer = await this.renderInvoicePdf(payload);
+    const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const destination = `${payload.shopId}/${REACT_PRINT_PDF_MARKER}/${payload.invoiceNumber}-${uniqueSuffix}.pdf`;
+    const pdfUrl = await storageService.uploadPdf(destination, pdfBuffer);
 
+    logger.info(`Invoice PDF uploaded for ${payload.invoiceNumber}`);
+    return pdfUrl;
+  }
+
+  async renderInvoicePdf(payload: InvoicePdfPayload): Promise<Buffer> {
     const executablePath = puppeteer.executablePath();
-
-logger.info(`Launching PDF browser: ${executablePath}`);
-
-const browser = await puppeteer.launch({
-  headless: true,
-  executablePath,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-  ],
-});
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
     try {
       const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: 'load' });
+      const printUrl = this.buildPrintRouteUrl(payload);
+
+      await page.setViewport({ width: 1280, height: 1600, deviceScaleFactor: 1 });
+      const response = await page.goto(printUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      if (!response || !response.ok()) {
+        throw new Error(
+          `Invoice print page returned HTTP ${response?.status() ?? 'no response'} at ${printUrl}`,
+        );
+      }
+      await page.waitForFunction('window.__INVOICE_READY__ === true', { timeout: 30000 });
+
+      const renderError = (await page.evaluate('window.__INVOICE_ERROR__ || ""')) as string;
+      if (renderError) {
+        throw new Error(`Invoice print route failed to load the invoice: ${renderError}`);
+      }
+
+      await page.addStyleTag({ content: await this.getEmbeddedInterFontStyles() });
+      await page.evaluate(`(async () => {
+        const weights = [400, 500, 600, 700];
+        const loadedFaces = await Promise.all(weights.map(async (weight) => ({
+          weight,
+          faces: await document.fonts.load(weight + ' 12px Inter'),
+        })));
+        await document.fonts.ready;
+        for (const { weight, faces } of loadedFaces) {
+          if (faces.length === 0 || faces.some((face) => face.status !== 'loaded')) {
+            throw new Error('Inter font weight ' + weight + ' did not load for invoice PDF rendering');
+          }
+        }
+        const invoice = document.querySelector('.invoice-document');
+        if (!invoice || !getComputedStyle(invoice).fontFamily.toLowerCase().includes('inter')) {
+          throw new Error('Inter is not the computed invoice font for PDF rendering');
+        }
+      })()`);
+
       const pdfBuffer = await page.pdf({
         format: 'A4',
         printBackground: true,
-        margin: { top: '20px', right: '20px', bottom: '20px', left: '20px' },
+        preferCSSPageSize: true,
+        margin: { top: '14mm', right: '14mm', bottom: '14mm', left: '14mm' },
       });
-
-      const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const destination = `${payload.shopId}/${payload.invoiceNumber}-${uniqueSuffix}.pdf`;
-      const pdfUrl = await storageService.uploadPdf(destination, Buffer.from(pdfBuffer));
-
-      logger.info(`Invoice PDF uploaded for ${payload.invoiceNumber}: ${pdfUrl}`);
-      return pdfUrl;
+      return Buffer.from(pdfBuffer);
     } finally {
       await browser.close();
     }
   }
 
-  private renderInvoiceHtml(payload: InvoicePdfPayload): string {
-    const createdDate = new Date(payload.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    const lineItems = payload.lineItems ?? [];
-    const statusLabel = payload.status.replace(/_/g, ' ');
-    const customerName = payload.customerName || 'Customer name unavailable';
-    const customerEmail = payload.customerEmail || 'Email unavailable';
-    const shopName = payload.shopName || 'Shop name unavailable';
-    const lineItemsMarkup = lineItems.length > 0
-      ? lineItems.map((item) => `<tr><td><strong>${item.name}</strong><br /><span class="muted">${payload.currency} ${item.unitPrice} each</span></td><td class="qty-cell">${item.quantity}</td><td>${payload.currency} ${item.total}</td></tr>`).join('')
-      : '<tr><td><strong>Order items</strong><br /><span class="muted">Item details were not included in the payment event.</span></td><td class="qty-cell">Not provided</td><td>Not provided</td></tr>';
+  private async getEmbeddedInterFontStyles(): Promise<string> {
+    const fontFaces = await Promise.all(
+      INTER_FONT_FILES.map(async ({ filename, weight }) => {
+        const fontData = await readFile(join(INTER_FONT_DIRECTORY, filename));
+        const dataUri = `data:font/woff2;base64,${fontData.toString('base64')}`;
+        return `@font-face{font-family:'Inter';src:url('${dataUri}') format('woff2');font-style:normal;font-weight:${weight};font-display:block;}`;
+      }),
+    );
 
-    return `<html><head><meta charset="utf-8" /><style>
-      @page { size: A4; margin: 0; } * { box-sizing: border-box; }
-      body { margin: 0; background: #edf4f1; color: #15231e; font-family: Arial, Helvetica, sans-serif; }
-      .page { width: 100%; min-height: 1120px; padding: 42px 48px 34px; background: #fff; }
-      .topbar { display: flex; justify-content: space-between; align-items: flex-start; padding-bottom: 24px; border-bottom: 3px solid #0b966a; }
-      .brand { display: flex; align-items: center; gap: 12px; } .brand-mark { width: 42px; height: 42px; border-radius: 10px; background: #087f5b; color: #fff; text-align: center; line-height: 42px; font-size: 21px; font-weight: 800; }
-      .brand-name { color: #087f5b; font-size: 17px; font-weight: 800; } .brand-subtitle { margin-top: 4px; color: #84928d; font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
-      .invoice-heading { text-align: right; } .invoice-heading h1 { margin: 0; color: #10251d; font-size: 36px; letter-spacing: -.02em; } .invoice-heading p { margin: 6px 0 0; color: #718078; font-size: 10px; }
-      .summary { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 10px; margin: 24px 0; } .summary-card { min-height: 48px; padding: 13px 15px; border: 1px solid #dce9e2; border-radius: 8px; background: #f7fbf9; }
-      .summary-card label { display: block; margin-bottom: 7px; color: #81908a; font-size: 8px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; } .summary-card strong { color: #1a2c25; font-size: 11px; }
-      .status { display: inline-block; padding: 5px 9px; border-radius: 99px; background: #d9f6e9; color: #08764f; font-size: 9px; font-weight: 800; letter-spacing: .08em; }
-      .details { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 24px 0 28px; } .detail-block { min-height: 116px; padding: 16px; border: 1px solid #dce9e2; border-radius: 8px; background: #fff; }
-      .detail-block h2 { margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid #e6efeb; color: #087f5b; font-size: 9px; letter-spacing: .13em; text-transform: uppercase; } .detail-block p { margin: 8px 0 0; color: #253830; font-size: 10px; line-height: 1.5; } .detail-block span { color: #809089; font-size: 8px; text-transform: uppercase; letter-spacing: .08em; }
-      table { width: 100%; border-collapse: collapse; margin-top: 4px; } thead { display: table-header-group; } tr { page-break-inside: avoid; } th { padding: 11px 14px; background: #0b8f67; color: #fff; font-size: 9px; letter-spacing: .1em; text-align: left; text-transform: uppercase; } th:first-child { border-radius: 7px 0 0 0; } th:nth-child(2) { width: 64px; text-align: center; } th:last-child { width: 130px; border-radius: 0 7px 0 0; text-align: right; }
-      td { padding: 12px 14px; border-bottom: 1px solid #e5ece8; color: #42534b; font-size: 10px; } td:nth-child(2) { text-align: center; } td:last-child { color: #1b2d25; font-weight: 700; text-align: right; } .qty-cell { font-weight: 700; color: #1c2a24; } .muted { color: #83918b; font-size: 8px; font-weight: 400; }
-      .total-row td { padding: 16px 14px; border-bottom: 0; background: #e8f7f0; color: #10251d; font-size: 14px; font-weight: 800; } .total-row td:first-child { border-radius: 0 0 0 7px; } .total-row td:last-child { border-radius: 0 0 7px 0; color: #087f5b; font-size: 16px; }
-      .footer { display: flex; justify-content: space-between; gap: 24px; margin-top: 42px; padding-top: 16px; border-top: 1px solid #dce9e2; color: #83918b; font-size: 8px; line-height: 1.6; } .footer strong { color: #0a7e5a; }
-      @media print { body { background: #fff; } .page { min-height: auto; } }
-    </style></head><body><main class="page">
-      <header class="topbar"><div class="brand"><div class="brand-mark">D</div><div><div class="brand-name">Daily Need Items</div><div class="brand-subtitle">Commerce platform</div></div></div><div class="invoice-heading"><h1>Invoice</h1><p>Payment receipt and order summary</p></div></header>
-      <section class="summary"><div class="summary-card"><label>Invoice number</label><strong>${payload.invoiceNumber}</strong></div><div class="summary-card"><label>Issued</label><strong>${createdDate}</strong></div><div class="summary-card"><label>Payment status</label><span class="status">${statusLabel}</span></div></section>
-      <section class="details"><div class="detail-block"><h2>Order details</h2><p><span>Order ID</span><br />${payload.orderId}</p><p><span>Shop</span><br /><strong>${shopName}</strong><br /><span>${payload.shopId}</span></p></div><div class="detail-block"><h2>Customer details</h2><p><span>Customer</span><br /><strong>${customerName}</strong><br /><span>${customerEmail}</span></p></div></section>
-      <table><thead><tr><th>Description</th><th>Qty</th><th>Amount</th></tr></thead><tbody>${lineItemsMarkup}<tr><td>Subtotal</td><td class="qty-cell">-</td><td>${payload.currency} ${payload.subtotal}</td></tr><tr><td>Tax</td><td class="qty-cell">-</td><td>${payload.currency} ${payload.taxAmount}</td></tr><tr><td>Delivery Fee</td><td class="qty-cell">-</td><td>${payload.currency} ${payload.deliveryFee}</td></tr><tr><td>Discount</td><td class="qty-cell">-</td><td>${payload.currency} ${payload.discountAmount}</td></tr><tr class="total-row"><td>Total</td><td class="qty-cell">-</td><td>${payload.currency} ${payload.grandTotal}</td></tr></tbody></table>
-      <footer class="footer"><div><strong>Thank you for your business.</strong><br />This document was generated electronically.</div><div>Keep this invoice for your records.<br />Daily Need Items</div></footer>
-    </main></body></html>`;
+    return `${fontFaces.join('\n')}
+.invoice-document.invoice-document,
+.invoice-document.invoice-document * {
+  font-family: 'Inter', sans-serif !important;
+}`;
+  }
+
+  private buildPrintRouteUrl(payload: InvoicePdfPayload): string {
+    const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, '');
+    if (!frontendBaseUrl) {
+      throw new Error(
+        'FRONTEND_BASE_URL is not configured. Set it to the reachable frontend base URL ' +
+          '(for example http://frontendreact-node:5173 inside Docker) so invoice PDFs can be ' +
+          'rendered from the shared invoice print route.',
+      );
+    }
+
+    const token = invoicePrintTokenService.issue({
+      sub: payload.customerId,
+      invoiceId: payload.invoiceId,
+      invoiceNumber: payload.invoiceNumber,
+      role: 'customer',
+    });
+
+    return `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/print?token=${encodeURIComponent(token)}`;
   }
 }
 

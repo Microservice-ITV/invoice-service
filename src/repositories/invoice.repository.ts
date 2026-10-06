@@ -4,6 +4,93 @@ import { InvoiceFilters, InvoiceLineItem, InvoiceStatus } from '@/types/invoice'
 import { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
 
 export class InvoiceRepository {
+  private normalizeLineItems(
+    lineItems: unknown,
+    items: Array<{
+      orderItemId: string;
+      productSku: string | null;
+      productName: string;
+      quantity: number;
+      unitPrice: { toString(): string };
+      totalPrice: { toString(): string };
+    }>,
+  ): InvoiceLineItem[] {
+    const stored = Array.isArray(lineItems)
+      ? lineItems.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+      : [];
+    if (stored.length === 0) {
+      return items.map((item) => ({
+        orderItemId: item.orderItemId,
+        name: item.productName,
+        sku: item.productSku,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice.toString(),
+        total: item.totalPrice.toString(),
+      }));
+    }
+
+    return stored.map((item, index) => {
+      const matchingItem = typeof item.orderItemId === 'string'
+        ? items.find((candidate) => candidate.orderItemId === item.orderItemId) ?? items[index]
+        : items[index];
+      return {
+        orderItemId: typeof item.orderItemId === 'string' ? item.orderItemId : matchingItem?.orderItemId,
+        name: typeof item.name === 'string' ? item.name : matchingItem?.productName ?? 'Product information unavailable',
+        sku: typeof item.sku === 'string' ? item.sku : matchingItem?.productSku ?? null,
+        imageUrl: typeof item.imageUrl === 'string' ? item.imageUrl : null,
+        quantity: typeof item.quantity === 'number' ? item.quantity : matchingItem?.quantity ?? 0,
+        unitPrice: typeof item.unitPrice === 'string' ? item.unitPrice : matchingItem?.unitPrice.toString() ?? '0.00',
+        total: typeof item.total === 'string' ? item.total : matchingItem?.totalPrice.toString() ?? '0.00',
+      };
+    });
+  }
+
+  private dateStamp(date = new Date()): string {
+    return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}${String(date.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  private async nextSequenceNumber(tx: Prisma.TransactionClient, date: string): Promise<number> {
+    const sequence = await tx.invoiceSequence.upsert({
+      where: { date },
+      update: { lastNumber: { increment: 1 } },
+      create: { date, lastNumber: 1 },
+    });
+    return sequence.lastNumber;
+  }
+
+  private async createInvoiceNumber(tx: Prisma.TransactionClient): Promise<string> {
+    const date = this.dateStamp();
+    const sequence = await this.nextSequenceNumber(tx, date);
+    return `INV-${date}-${String(sequence).padStart(6, '0')}`;
+  }
+
+  private async getOrCreateOrderReference(tx: Prisma.TransactionClient, orderId: string): Promise<string> {
+    const existing = await tx.invoiceOrderReference.findUnique({ where: { orderId } });
+    if (existing) return existing.orderReference;
+
+    const placeholder = `PENDING-${orderId}`;
+    let created: { id: number };
+    try {
+      created = await tx.invoiceOrderReference.create({
+        data: { orderId, orderReference: placeholder },
+        select: { id: true },
+      });
+    } catch (error) {
+      if (!this.isUniqueConstraintError(error)) throw error;
+      const concurrent = await tx.invoiceOrderReference.findUnique({ where: { orderId } });
+      if (concurrent) return concurrent.orderReference;
+      throw error;
+    }
+    const date = this.dateStamp();
+    const sequence = await this.nextSequenceNumber(tx, date);
+    const orderReference = `ORD-${date}-${String(sequence).padStart(6, '0')}`;
+    const updated = await tx.invoiceOrderReference.update({
+      where: { id: created.id },
+      data: { orderReference },
+    });
+    return updated.orderReference;
+  }
+
   /**
    * Legacy compatibility helper.
    *
@@ -21,53 +108,42 @@ export class InvoiceRepository {
     });
   }
 
-  async createInvoice(data: {
-    invoiceNumber: string;
-    orderId: string;
-    shopId: string;
-    shopName?: string | null;
-    customerId: string;
-    customerName?: string | null;
-    customerEmail?: string | null;
-    subtotal: string;
-    deliveryFee?: string;
-    taxAmount: string;
-    discountAmount: string;
-    grandTotal: string;
-    lineItems: InvoiceLineItem[];
-    currency: string;
-    paymentMethod: string | null;
-    paymentGatewayRef: string | null;
-    paymentSlipUrl: string | null;
-    status: InvoiceStatus;
-  }) {
-    return prisma.invoice.create({
-      data: {
-        invoiceNumber: data.invoiceNumber,
-        orderId: data.orderId,
-        shopId: data.shopId,
-        shopName: data.shopName,
-        customerId: data.customerId,
-        customerName: data.customerName,
-        customerEmail: data.customerEmail,
-        subtotal: data.subtotal,
-        deliveryFee: data.deliveryFee ?? '0.00',
-        taxAmount: data.taxAmount,
-        discountAmount: data.discountAmount,
-        grandTotal: data.grandTotal,
-        currency: data.currency,
-        paymentMethod: data.paymentMethod as string,
-        paymentGatewayRef: data.paymentGatewayRef,
-        paymentSlipUrl: data.paymentSlipUrl,
-        status: data.status,
-      },
-    });
-  }
-
   async findById(id: string) {
     return prisma.invoice.findUnique({
       where: { id },
     });
+  }
+
+  async findDocumentById(id: string) {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+    if (!invoice) return null;
+
+    const { items, lineItems, ...document } = invoice;
+    return {
+      ...document,
+      pdfUrl: document.pdfUrl ? `/invoices/${document.id}/pdf` : null,
+      lineItems: this.normalizeLineItems(lineItems, items),
+    };
+  }
+
+  async findDocumentByInvoiceNumber(invoiceNumber: string) {
+    const invoice = await prisma.invoice.findFirst({
+      where: {
+        OR: [{ invoiceNumber }, { id: invoiceNumber }],
+      },
+      include: { items: true },
+    });
+    if (!invoice) return null;
+
+    const { items, lineItems, ...document } = invoice;
+    return {
+      ...document,
+      pdfUrl: document.pdfUrl ? `/invoices/${document.id}/pdf` : null,
+      lineItems: this.normalizeLineItems(lineItems, items),
+    };
   }
 
   async findIdempotency(idempotencyKey: string) {
@@ -78,13 +154,20 @@ export class InvoiceRepository {
   }
 
   async createPaidInvoiceFromPayment(data: {
-    invoiceNumber: string;
     orderId: string;
+    orderReference?: string;
     shopId: string;
     shopName: string | null;
     customerId: string;
     customerName: string | null;
     customerEmail: string | null;
+    customerPhone: string | null;
+    billingAddress: Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput;
+    shippingAddress: Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput;
+    shopContactName: string | null;
+    shopContactEmail: string | null;
+    shopContactPhone: string | null;
+    shopAddress: string | null;
     currency: string;
     subtotal: string;
     deliveryFee: string;
@@ -98,7 +181,8 @@ export class InvoiceRepository {
     idempotencyKey: string;
     requestHash: string;
   }) {
-    return prisma.$transaction(async (tx) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
       const existing = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
@@ -109,6 +193,9 @@ export class InvoiceRepository {
         }
         return existing.invoice;
       }
+
+      const orderReference = data.orderReference ?? await this.getOrCreateOrderReference(tx, data.orderId);
+      const invoiceNumber = await this.createInvoiceNumber(tx);
 
       const allocations: Array<{ id: string; quantity: number }> = [];
       for (const item of data.items) {
@@ -177,13 +264,21 @@ export class InvoiceRepository {
 
       const invoice = await tx.invoice.create({
         data: {
-          invoiceNumber: data.invoiceNumber,
+          invoiceNumber,
           orderId: data.orderId,
+          orderReference,
           shopId: data.shopId,
           shopName: data.shopName,
           customerId: data.customerId,
           customerName: data.customerName,
           customerEmail: data.customerEmail,
+          customerPhone: data.customerPhone,
+          billingAddress: data.billingAddress,
+          shippingAddress: data.shippingAddress,
+          shopContactName: data.shopContactName,
+          shopContactEmail: data.shopContactEmail,
+          shopContactPhone: data.shopContactPhone,
+          shopAddress: data.shopAddress,
           lineItems: data.lineItems as unknown as Prisma.InputJsonValue,
           subtotal: data.subtotal,
           deliveryFee: data.deliveryFee,
@@ -228,16 +323,30 @@ export class InvoiceRepository {
         },
       });
       return invoice;
-    });
+      });
+    } catch (error) {
+      if (this.isUniqueConstraintError(error)) {
+        const existing = await this.findIdempotency(data.idempotencyKey);
+        if (existing?.requestHash === data.requestHash) return existing.invoice;
+      }
+      throw error;
+    }
   }
 
   async createPartialInvoice(data: {
-    invoiceNumber: string;
     orderId: string;
     shopId: string;
+    shopName: string | null;
     customerId: string;
     customerName: string | null;
     customerEmail: string | null;
+    customerPhone: string | null;
+    billingAddress: Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput;
+    shippingAddress: Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput;
+    shopContactName: string | null;
+    shopContactEmail: string | null;
+    shopContactPhone: string | null;
+    shopAddress: string | null;
     currency: string;
     paymentMethod: string | null;
     subtotal: string;
@@ -248,7 +357,8 @@ export class InvoiceRepository {
     idempotencyKey: string;
     requestHash: string;
   }) {
-    return prisma.$transaction(async (tx) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
       const existingIdempotency = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
@@ -260,6 +370,9 @@ export class InvoiceRepository {
         }
         return existingIdempotency.invoice;
       }
+
+      const orderReference = await this.getOrCreateOrderReference(tx, data.orderId);
+      const invoiceNumber = await this.createInvoiceNumber(tx);
 
       const allocations: Array<{ id: string; orderItemId: string; requestedQuantity: number }> = [];
 
@@ -343,12 +456,30 @@ export class InvoiceRepository {
 
       const invoice = await tx.invoice.create({
         data: {
-          invoiceNumber: data.invoiceNumber,
+          invoiceNumber,
           orderId: data.orderId,
+          orderReference,
           shopId: data.shopId,
+          shopName: data.shopName,
           customerId: data.customerId,
           customerName: data.customerName,
           customerEmail: data.customerEmail,
+          customerPhone: data.customerPhone,
+          billingAddress: data.billingAddress,
+          shippingAddress: data.shippingAddress,
+          shopContactName: data.shopContactName,
+          shopContactEmail: data.shopContactEmail,
+          shopContactPhone: data.shopContactPhone,
+          shopAddress: data.shopAddress,
+          lineItems: data.items.map((item) => ({
+            orderItemId: item.orderItemId,
+            name: item.productName ?? item.productSku ?? item.productId,
+            sku: item.productSku,
+            imageUrl: item.imageUrl ?? null,
+            quantity: item.requestedQuantity,
+            unitPrice: item.unitPrice,
+            total: this.multiplyMoney(item.unitPrice, item.requestedQuantity),
+          })) as unknown as Prisma.InputJsonValue,
           subtotal: data.subtotal,
           deliveryFee: '0.00',
           taxAmount: data.taxAmount,
@@ -394,7 +525,14 @@ export class InvoiceRepository {
       });
 
       return invoice;
-    });
+      });
+    } catch (error) {
+      if (this.isUniqueConstraintError(error)) {
+        const existing = await this.findIdempotency(data.idempotencyKey);
+        if (existing?.requestHash === data.requestHash) return existing.invoice;
+      }
+      throw error;
+    }
   }
 
   private isUniqueConstraintError(error: unknown): boolean {
@@ -414,49 +552,6 @@ export class InvoiceRepository {
         paymentSlipUrl,
         status: 'PENDING_VERIFICATION',
         rejectionReason: null,
-      },
-    });
-  }
-
-  /**
-   * Legacy order snapshot update.
-   *
-   * Since orderId is no longer unique, update the most recent invoice
-   * belonging to the order.
-   *
-   * This is temporary compatibility behavior.
-   * Partial-invoice flows should eventually update a specific invoice.
-   */
-  async updateOrderSnapshot(
-    orderId: string,
-    data: {
-      shopName?: string | null;
-      lineItems?: InvoiceLineItem[];
-      customerName?: string | null;
-      customerEmail?: string | null;
-    },
-  ) {
-    const invoice = await prisma.invoice.findFirst({
-      where: { orderId },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    if (!invoice) {
-      return null;
-    }
-
-    return prisma.invoice.update({
-      where: { id: invoice.id },
-      data: {
-        ...(data.shopName !== undefined
-          ? { shopName: data.shopName }
-          : {}),
-        ...(data.customerName !== undefined
-          ? { customerName: data.customerName }
-          : {}),
-        ...(data.customerEmail !== undefined
-          ? { customerEmail: data.customerEmail }
-          : {}),
       },
     });
   }
@@ -515,11 +610,19 @@ export class InvoiceRepository {
     return this.findById(id);
   }
 
-  async claimPdfGeneration(id: string): Promise<boolean> {
+  /**
+   * Claims exclusive PDF generation for an invoice.
+   *
+   * By default a claim only succeeds while no PDF exists yet. `force` allows a
+   * deliberate re-render of an invoice that already has a stored PDF (used when
+   * the customer downloads it, so the file always matches the current design),
+   * while still respecting the in-progress lock.
+   */
+  async claimPdfGeneration(id: string, options: { force?: boolean } = {}): Promise<boolean> {
     const result = await prisma.invoice.updateMany({
       where: {
         id,
-        pdfUrl: null,
+        ...(options.force ? {} : { pdfUrl: null }),
         OR: [
           { pdfStatus: { not: 'GENERATING' } },
           {
@@ -569,7 +672,7 @@ export class InvoiceRepository {
   ) {
     const invoices = await prisma.invoice.findMany({
       where: {
-        ...(filters.shopId ? { shopId: filters.shopId } : {}),
+        ...(filters.shopIds ? { shopId: { in: filters.shopIds } } : filters.shopId ? { shopId: filters.shopId } : {}),
         ...(filters.customerId ? { customerId: filters.customerId } : {}),
         ...(filters.orderId ? { orderId: filters.orderId } : {}),
         ...(filters.status ? { status: filters.status } : {}),
@@ -578,11 +681,19 @@ export class InvoiceRepository {
         id: true,
         invoiceNumber: true,
         orderId: true,
+        orderReference: true,
         shopId: true,
         shopName: true,
         customerId: true,
         customerName: true,
         customerEmail: true,
+        customerPhone: true,
+        billingAddress: true,
+        shippingAddress: true,
+        shopContactName: true,
+        shopContactEmail: true,
+        shopContactPhone: true,
+        shopAddress: true,
         subtotal: true,
         taxAmount: true,
         discountAmount: true,
@@ -592,6 +703,9 @@ export class InvoiceRepository {
         lineItems: true,
         items: {
           select: {
+            orderItemId: true,
+            productId: true,
+            productSku: true,
             productName: true,
             quantity: true,
             unitPrice: true,
@@ -624,14 +738,8 @@ export class InvoiceRepository {
 
     return invoices.map(({ items, lineItems, ...invoice }) => ({
       ...invoice,
-      lineItems: Array.isArray(lineItems) && lineItems.length > 0
-        ? lineItems
-        : items.map((item) => ({
-          name: item.productName,
-          quantity: item.quantity,
-          unitPrice: item.unitPrice.toString(),
-          total: item.totalPrice.toString(),
-        })),
+      pdfUrl: invoice.pdfUrl ? `/invoices/${invoice.id}/pdf` : null,
+      lineItems: this.normalizeLineItems(lineItems, items),
     }));
   }
 }

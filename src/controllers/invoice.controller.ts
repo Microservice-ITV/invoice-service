@@ -1,6 +1,8 @@
 import { NextFunction, Request, Response } from 'express';
 import invoiceService from '@/services/invoice.service';
 import { InvoiceStatus, RefundMethod } from '@/types/invoice';
+import { canAccessInvoice } from '@/services/invoice-access-policy';
+import invoicePrintTokenService from '@/services/invoice-print-token.service';
 
 const invoiceStatusValues: InvoiceStatus[] = [
   'UNPAID',
@@ -77,6 +79,28 @@ export class InvoiceController {
     }
   }
 
+  async getInvoiceByNumber(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const actor = req.user;
+      if (!actor) {
+        res.status(401).json({ success: false, message: 'Authentication required' });
+        return;
+      }
+
+      const invoice = actor.role === 'customer'
+        ? await invoiceService.getCustomerInvoiceByNumber(req.params.invoiceNumber, actor.customerId ?? '')
+        : await invoiceService.getInvoiceByNumber(req.params.invoiceNumber);
+      if (!invoice || !canAccessInvoice(invoice, actor)) {
+        res.status(404).json({ success: false, message: 'Invoice not found' });
+        return;
+      }
+
+      res.json({ success: true, data: invoice });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to fetch customer invoice'));
+    }
+  }
+
   async getShopInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const shopId = req.user?.shopId;
@@ -93,6 +117,84 @@ export class InvoiceController {
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch shop invoices'));
+    }
+  }
+
+  async getInvoice(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const invoice = await invoiceService.getInvoiceById(req.params.id);
+      if (!invoice || !req.user || !canAccessInvoice(invoice, req.user)) {
+        res.status(404).json({ success: false, message: 'Invoice not found' });
+        return;
+      }
+      res.json({ success: true, data: invoice });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to fetch invoice'));
+    }
+  }
+
+  /**
+   * Serves a single invoice to the authenticated print/PDF route.
+   *
+   * Requires a short-lived, single-invoice print token issued by this service
+   * for the server-side renderer. The token is verified here (signature,
+   * expiry, scope and invoice number) and access is then re-checked against the
+   * caller's recorded owner, so invoices are never exposed publicly.
+   */
+  async getInvoiceForPrint(req: Request, res: Response): Promise<void> {
+    try {
+      const invoiceNumber = req.params.invoiceNumber;
+      const printToken = req.header('x-print-token') ?? undefined;
+
+      const claims = invoicePrintTokenService.verify(printToken, invoiceNumber);
+
+      // The token carries the invoice id, so no extra lookup by number is needed;
+      // the number is still re-checked so a token cannot be replayed elsewhere.
+      const invoice = await invoiceService.getInvoiceById(claims.invoiceId);
+      if (!invoice || invoice.invoiceNumber !== invoiceNumber) {
+        res.status(404).json({ success: false, message: 'Invoice not found' });
+        return;
+      }
+
+      const allowed = canAccessInvoice(invoice, {
+        id: claims.sub,
+        customerId: claims.sub,
+        role: claims.role as never,
+        shopId: claims.shopId,
+      });
+
+      if (!allowed) {
+        res.status(403).json({ success: false, message: 'Invoice access denied' });
+        return;
+      }
+
+      res.json({ success: true, data: invoice });
+    } catch (error) {
+      res.status(401).json({
+        success: false,
+        message: error instanceof Error ? error.message : 'Invalid print token',
+      });
+    }
+  }
+
+  async downloadInvoicePdf(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, message: 'Authentication required' });
+        return;
+      }
+
+      const result = await invoiceService.downloadInvoicePdf(req.params.id, req.user);
+      if (!result) {
+        res.status(404).json({ success: false, message: 'Invoice PDF not found' });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}.pdf"`);
+      res.send(result.buffer);
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to download invoice PDF'));
     }
   }
 

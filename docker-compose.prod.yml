@@ -1,0 +1,120 @@
+name: invoice-service-prod
+
+services:
+  invoice-app:
+    image: itvmicroservicesteam/invoice-service:${IMAGE_TAG:-latest}
+    container_name: ${APP_CONTAINER_NAME}
+    restart: unless-stopped
+    init: true
+
+    environment:
+      NODE_ENV: production
+      PORT: 5006
+      DATABASE_URL: ${DATABASE_URL}
+
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
+      RABBITMQ_PAYMENT_COMPLETED_KEY: ${RABBITMQ_PAYMENT_COMPLETED_KEY}
+      RABBITMQ_PAYMENT_COLLECTED_KEY: ${RABBITMQ_PAYMENT_COLLECTED_KEY}
+      RABBITMQ_ORDER_PAID_KEY: ${RABBITMQ_ORDER_PAID_KEY}
+      RABBITMQ_PAYMENT_COMPLETED_QUEUE: ${RABBITMQ_PAYMENT_COMPLETED_QUEUE}
+      RABBITMQ_PAYMENT_COLLECTED_QUEUE: ${RABBITMQ_PAYMENT_COLLECTED_QUEUE}
+      RABBITMQ_ORDER_PAID_QUEUE: ${RABBITMQ_ORDER_PAID_QUEUE}
+
+      AUTH_SERVICE_URL: ${AUTH_SERVICE_URL}
+      AUTH_SERVICE_INTERNAL_KEY: ${AUTH_SERVICE_INTERNAL_KEY}
+      ORDER_SERVICE_URL: ${ORDER_SERVICE_URL}
+      ORDER_SERVICE_API_KEY: ${ORDER_SERVICE_API_KEY}
+      PRODUCT_SERVICE_URL: ${PRODUCT_SERVICE_URL}
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_PDF_BUCKET: ${MINIO_PDF_BUCKET}
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+
+    ports:
+      - "127.0.0.1:${PORT:-5006}:5006"
+
+    networks:
+      - app-network
+
+    depends_on:
+      invoice-db:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:5006/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /tmp
+      - /dev/shm
+
+  invoice-db:
+    image: mysql:8.0
+    container_name: ${MYSQL_CONTAINER_NAME}
+    restart: unless-stopped
+
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+
+    command: --default-authentication-plugin=mysql_native_password --collation-server=utf8mb4_unicode_ci --character-set-server=utf8mb4
+
+    volumes:
+      - invoice-mysql-data:/var/lib/mysql
+
+    ports:
+      - "127.0.0.1:${MYSQL_PORT}:3306"
+
+    networks:
+      - app-network
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  invoice-mysql-data:
+    name: ${MYSQL_VOLUME_NAME}
+
+networks:
+  app-network:
+    external: true
+    name: ${NETWORK_NAME}

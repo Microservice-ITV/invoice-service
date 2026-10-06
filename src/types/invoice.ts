@@ -7,11 +7,16 @@ export type InvoiceStatus =
   | 'REFUNDED';
 
 export interface InvoiceLineItem {
+  orderItemId?: string;
   name: string;
+  sku?: string | null;
+  imageUrl?: string | null;
   quantity: number;
   unitPrice: string;
   total: string;
 }
+
+export type InvoiceAddress = Record<string, unknown>;
 
 export interface InvoicePayload {
   eventId?: string;
@@ -21,6 +26,13 @@ export interface InvoicePayload {
   customerId: string;
   customerName?: string | null;
   customerEmail?: string | null;
+  customerPhone?: string | null;
+  billingAddress?: InvoiceAddress | null;
+  shippingAddress?: InvoiceAddress | null;
+  shopContactName?: string | null;
+  shopContactEmail?: string | null;
+  shopContactPhone?: string | null;
+  shopAddress?: string | null;
   paymentMethod: string | null;
   paymentGatewayRef?: string | null;
   paymentSlipUrl?: string | null;
@@ -35,6 +47,7 @@ export interface InvoicePayload {
 export interface InvoiceFilters {
   status?: InvoiceStatus;
   shopId?: string;
+  shopIds?: string[];
   customerId?: string;
   orderId?: string;
 }
@@ -86,11 +99,19 @@ export interface InvoiceDocument {
   id: string;
   invoiceNumber: string;
   orderId: string;
+  orderReference: string | null;
   shopId: string;
   shopName: string | null;
   customerId: string;
   customerName: string | null;
   customerEmail: string | null;
+  customerPhone: string | null;
+  billingAddress: InvoiceAddress | null;
+  shippingAddress: InvoiceAddress | null;
+  shopContactName: string | null;
+  shopContactEmail: string | null;
+  shopContactPhone: string | null;
+  shopAddress: string | null;
   subtotal: string;
   deliveryFee: string;
   taxAmount: string;

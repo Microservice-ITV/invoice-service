@@ -6,6 +6,7 @@ declare global {
         role?: 'customer' | 'seller' | 'shopAdmin' | 'admin';
         customerId?: string;
         shopId?: string;
+        shopIds?: string[];
         token?: string;
       };
     }

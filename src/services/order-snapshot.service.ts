@@ -5,6 +5,7 @@ export interface OrderInvoiceSnapshotItem {
   productId: string;
   productName: string | null;
   productSku: string | null;
+  imageUrl?: string | null;
   quantity: number;
   unitPrice: string;
   lineTotal: string | null;
@@ -12,12 +13,19 @@ export interface OrderInvoiceSnapshotItem {
   shopName?: string | null;
 }
 
+export type InvoiceSnapshotAddress = Record<string, unknown>;
+
 export interface OrderInvoiceSnapshot {
   orderId: string;
   checkoutId: string;
   customerId: string;
   customerName?: string | null;
   customerEmail?: string | null;
+  customerPhone?: string | null;
+  billingAddress?: InvoiceSnapshotAddress | null;
+  shippingAddress?: InvoiceSnapshotAddress | null;
+  paymentStatus?: string | null;
+  paymentMethod?: string | null;
   items: OrderInvoiceSnapshotItem[];
   currency: string | null;
   subtotal: string;

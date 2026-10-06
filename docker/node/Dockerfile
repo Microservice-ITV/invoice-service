@@ -61,6 +61,7 @@ RUN PUPPETEER_SKIP_DOWNLOAD=false \
 
 # Copy application source after dependencies.
 COPY src ./src
+COPY src/assets/fonts ./assets/fonts
 COPY tsconfig.json ./
 
 # Generate Prisma Client.
