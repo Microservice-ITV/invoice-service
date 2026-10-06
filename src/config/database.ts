@@ -27,7 +27,7 @@ if (process.env.NODE_ENV === 'development') {
   });
 }
 
-process.on('beforeExit', async () => {
+process.once('beforeExit', async () => {
   await prisma.$disconnect();
   logger.info('Database connection closed');
 });
