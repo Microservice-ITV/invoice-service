@@ -52,7 +52,7 @@ jobs:
           ORDER_SERVICE_API_KEY: test-order-key
           MINIO_ACCESS_KEY: test-access-key
           MINIO_SECRET_KEY: test-secret-key
-          JWT_SECRET: test-jwt-secret
+          JWT_SECRET: test-jwt-secret-for-ci-only-32-chars
         run: npm test
 
       - name: 🐳 Docker Hub Login
