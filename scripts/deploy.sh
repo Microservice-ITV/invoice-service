@@ -563,6 +563,11 @@ verify_nginx_upstream() {
 # ============================================================
 verify_gateway_traffic() {
     local expected_container="$1"
+    local response=""
+    local response_body=""
+    local response_status=""
+    local response_content_type=""
+    local curl_exit=0
 
     echo "⏳ Verifying Nginx traffic → $expected_container..."
 
@@ -571,17 +576,32 @@ verify_gateway_traffic() {
     fi
 
     for i in $(seq 1 "$GATEWAY_RETRIES"); do
-        if docker exec "$NGINX_CONTAINER" curl -fsS --max-time 10 "$PRODUCTION_SMOKE_TEST_URL" >/dev/null 2>&1; then
+        if response="$(docker exec "$NGINX_CONTAINER" curl -sS --max-time 10 \
+            -w $'\n__HTTP_STATUS__%{http_code}\n__CONTENT_TYPE__%{content_type}' \
+            "$PRODUCTION_SMOKE_TEST_URL" 2>/dev/null)"; then
+            curl_exit=0
+        else
+            curl_exit=$?
+        fi
+
+        response_status="${response##*$'\n__HTTP_STATUS__'}"
+        response_status="${response_status%%$'\n'*}"
+        response_content_type="${response##*$'\n__CONTENT_TYPE__'}"
+        response_content_type="${response_content_type%%$'\n'*}"
+        response_body="${response%%$'\n__HTTP_STATUS__'*}"
+
+        if [[ "$curl_exit" -eq 0 && "$response_status" == "200" ]]; then
             success "Real gateway smoke test passed."
             return 0
         fi
 
-        echo "Gateway smoke test retry $i/$GATEWAY_RETRIES"
+        warning "Gateway smoke test attempt $i/$GATEWAY_RETRIES failed: HTTP ${response_status:-unavailable}, content-type ${response_content_type:-unavailable}, response body ${#response_body} bytes, curl exit $curl_exit."
         sleep "$GATEWAY_INTERVAL"
     done
 
     error "Real gateway smoke test failed:"
     echo "   $PRODUCTION_SMOKE_TEST_URL"
+    echo "   Last response: HTTP ${response_status:-unavailable}, content-type ${response_content_type:-unavailable}, body ${#response_body} bytes, curl exit $curl_exit."
     return 1
 }
 
