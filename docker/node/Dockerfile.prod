@@ -3,7 +3,6 @@
 # ============================================================
 # BUILD STAGE
 # ============================================================
-
 FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
@@ -21,17 +20,21 @@ RUN --mount=type=cache,target=/root/.npm \
 
 COPY tsconfig.json ./
 COPY prisma ./prisma
-COPY prisma.config.ts ./
+COPY prisma.config.ts ./prisma.config.ts
 COPY src ./src
 
 RUN npx prisma generate
 RUN npm run build
 
+# Remove development-only packages.
+# Prisma is a production dependency, so the CLI remains available
+# for `npx prisma migrate deploy`.
+RUN npm prune --omit=dev
+
 
 # ============================================================
 # PRODUCTION RUNTIME STAGE
 # ============================================================
-
 FROM node:22-bookworm-slim AS production
 
 ENV NODE_ENV=production
@@ -41,12 +44,8 @@ ENV PUPPETEER_CACHE_DIR=/home/app/.cache/puppeteer
 
 WORKDIR /var/www/html/invoice-service
 
-RUN apt-get -o Acquire::Retries=10 \
-    -o Acquire::http::Timeout=60 \
-    update \
-    && apt-get -o Acquire::Retries=10 \
-    -o Acquire::http::Timeout=60 \
-    install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
         ca-certificates \
         openssl \
         libglib2.0-0 \
@@ -70,30 +69,29 @@ RUN apt-get -o Acquire::Retries=10 \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system app \
-    && useradd --system --gid app --create-home app
-
-COPY package.json package-lock.json ./
-
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev
-
-COPY --from=build /app/dist ./dist
-COPY --from=build /app/prisma ./prisma
-COPY --from=build /app/prisma.config.ts ./prisma.config.ts
-COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
-
-COPY src/assets/fonts ./assets/fonts
-
-COPY docker/node/docker-entrypoint.prod.sh \
-    /usr/local/bin/docker-entrypoint.prod.sh
-
-RUN chmod +x /usr/local/bin/docker-entrypoint.prod.sh \
-    && PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome \
-    && test -d /home/app/.cache/puppeteer/chrome \
+    && useradd --system --gid app --create-home app \
+    && mkdir -p /home/app/.cache/puppeteer \
     && chown -R app:app /var/www/html/invoice-service /home/app
 
+# Copy only the already-pruned production dependencies.
+COPY --from=build --chown=app:app /app/node_modules ./node_modules
+
+COPY --from=build --chown=app:app /app/dist ./dist
+COPY --from=build --chown=app:app /app/prisma ./prisma
+COPY --from=build --chown=app:app /app/prisma.config.ts ./prisma.config.ts
+COPY --chown=app:app package.json package-lock.json ./
+
+COPY --chown=app:app src/assets/fonts ./assets/fonts
+
+COPY --chown=app:app --chmod=755 \
+    docker/node/docker-entrypoint.prod.sh \
+    /usr/local/bin/docker-entrypoint.prod.sh
+
 USER app
+
+# Install Chrome as the non-root runtime user.
+RUN PUPPETEER_SKIP_DOWNLOAD=false \
+    npx puppeteer browsers install chrome
 
 EXPOSE 5006
 
