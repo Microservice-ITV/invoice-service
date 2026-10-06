@@ -403,21 +403,24 @@ wait_for_container_health() {
 get_active_container() {
     local active=""
 
+    # First production deployment:
+    # no upstream file means there is no active Invoice container yet.
     if [[ ! -f "$NGINX_UPSTREAM_FILE" ]]; then
-        error "Production upstream file does not exist:"
-        echo "   $NGINX_UPSTREAM_FILE"
-        return 1
+        echo ""
+        return 0
     fi
 
     active="$(sed -n "s/^[[:space:]]*server[[:space:]]\+\([^:;[:space:]]*\):${HEALTH_PORT};.*/\1/p" "$NGINX_UPSTREAM_FILE" | head -n 1)"
 
+    # Empty upstream means first deployment / no active service.
     if [[ -z "$active" ]]; then
-        error "Unable to determine active production container from Nginx upstream."
-        return 1
+        echo ""
+        return 0
     fi
 
     case "$active" in
-        "$BLUE_CONTAINER"|"$GREEN_CONTAINER"|"$LEGACY_CONTAINER") ;;
+        "$BLUE_CONTAINER"|"$GREEN_CONTAINER"|"$LEGACY_CONTAINER")
+            ;;
         *)
             error "Nginx upstream points to an unexpected container:"
             echo "   $active"
@@ -425,9 +428,13 @@ get_active_container() {
             ;;
     esac
 
+    # If the configured container is no longer running,
+    # treat this as an inactive/first deployment state.
     if ! container_running "$active"; then
-        error "Nginx says '$active' is active, but it is not running."
-        return 1
+        warning "Nginx upstream points to '$active', but it is not running."
+        warning "Treating Invoice Service as having no active container."
+        echo ""
+        return 0
     fi
 
     echo "$active"
@@ -437,9 +444,18 @@ get_new_container() {
     local current="$1"
 
     case "$current" in
-        "$BLUE_CONTAINER") echo "$GREEN_CONTAINER" ;;
-        "$GREEN_CONTAINER") echo "$BLUE_CONTAINER" ;;
-        "$LEGACY_CONTAINER") echo "$BLUE_CONTAINER" ;;
+        "")
+            echo "$BLUE_CONTAINER"
+            ;;
+        "$BLUE_CONTAINER")
+            echo "$GREEN_CONTAINER"
+            ;;
+        "$GREEN_CONTAINER")
+            echo "$BLUE_CONTAINER"
+            ;;
+        "$LEGACY_CONTAINER")
+            echo "$BLUE_CONTAINER"
+            ;;
         *)
             error "Cannot determine new production color."
             return 1
@@ -895,7 +911,11 @@ deploy_production() {
         return 1
     fi
 
-    PREVIOUS_PRODUCTION_IMAGE="$(get_container_image "$CURRENT_CONTAINER")"
+    if [[ -n "$CURRENT_CONTAINER" ]]; then
+        PREVIOUS_PRODUCTION_IMAGE="$(get_container_image "$CURRENT_CONTAINER")"
+    else
+        PREVIOUS_PRODUCTION_IMAGE=""
+    fi
 
     echo
     echo "Previous production image:"
