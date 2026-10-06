@@ -65,18 +65,6 @@ GREEN_CONTAINER="invoice-service-green"
 LEGACY_CONTAINER="invoice-service"
 
 # ============================================================
-# HEALTH / RETRIES
-# ============================================================
-HEALTH_PATH="/api/v1/health"
-HEALTH_PORT="5006"
-HEALTH_RETRIES=30
-HEALTH_INTERVAL=2
-DB_RETRIES=30
-DB_INTERVAL=2
-GATEWAY_RETRIES=10
-GATEWAY_INTERVAL=2
-
-# ============================================================
 # GRACEFUL SHUTDOWN
 # ============================================================
 DRAIN_SECONDS=20
