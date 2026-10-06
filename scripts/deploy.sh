@@ -431,8 +431,8 @@ get_active_container() {
     # If the configured container is no longer running,
     # treat this as an inactive/first deployment state.
     if ! container_running "$active"; then
-        warning "Nginx upstream points to '$active', but it is not running."
-        warning "Treating Invoice Service as having no active container."
+        warning "Nginx upstream points to '$active', but it is not running." >&2
+        warning "Treating Invoice Service as having no active container." >&2
         echo ""
         return 0
     fi
@@ -652,24 +652,28 @@ production_failure_cleanup() {
     echo "========================================="
 
     if [[ "$PRODUCTION_SWITCHED" -eq 1 ]]; then
-        if [[ -n "$CURRENT_CONTAINER" ]] && container_running "$CURRENT_CONTAINER"; then
-            echo "🔄 Restoring traffic to:"
-            echo "   $CURRENT_CONTAINER"
+        if [[ -n "$CURRENT_CONTAINER" ]]; then
+            if container_running "$CURRENT_CONTAINER"; then
+                echo "🔄 Restoring traffic to:"
+                echo "   $CURRENT_CONTAINER"
 
-            if switch_nginx "$CURRENT_CONTAINER"; then
-                if verify_nginx_upstream "$CURRENT_CONTAINER"; then
-                    PRODUCTION_SWITCHED=0
-                    success "Production traffic restored."
+                if switch_nginx "$CURRENT_CONTAINER"; then
+                    if verify_nginx_upstream "$CURRENT_CONTAINER"; then
+                        PRODUCTION_SWITCHED=0
+                        success "Production traffic restored."
+                    else
+                        error "CRITICAL: Nginx rollback verification failed."
+                    fi
                 else
-                    error "CRITICAL: Nginx rollback verification failed."
+                    error "CRITICAL: Nginx rollback failed."
+                    error "Manual intervention may be required."
                 fi
             else
-                error "CRITICAL: Nginx rollback failed."
-                error "Manual intervention may be required."
+                error "Previous production container is unavailable."
+                error "Automatic traffic rollback is not possible."
             fi
         else
-            error "Previous production container is unavailable."
-            error "Automatic traffic rollback is not possible."
+            echo "ℹ️ No previous production container; there is nothing to roll back to."
         fi
     fi
 

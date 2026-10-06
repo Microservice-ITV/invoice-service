@@ -323,7 +323,7 @@ export class InvoiceRepository {
         },
       });
       return invoice;
-      });
+      }, { timeout: 15_000 });
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {
         const existing = await this.findIdempotency(data.idempotencyKey);
