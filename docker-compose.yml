@@ -10,7 +10,7 @@ services:
       MYSQL_PASSWORD: invoice_password
       MYSQL_ROOT_PASSWORD: root_password
     ports:
-      - '3310:3306'
+      - '3311:3306'
     volumes:
       - invoice_mysql_data:/var/lib/mysql
     command: --default-authentication-plugin=mysql_native_password --collation-server=utf8mb4_unicode_ci
