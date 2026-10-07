@@ -1,19 +1,19 @@
-import puppeteer from 'puppeteer';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import storageService from '@/services/storage.service';
-import logger from '@/utils/logger';
-import env from '@/config/env';
-import invoicePrintTokenService from '@/services/invoice-print-token.service';
-import { InvoiceStatus } from '@/types/invoice';
+import puppeteer from "puppeteer";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import storageService from "@/services/storage.service";
+import logger from "@/utils/logger";
+import env from "@/config/env";
+import invoicePrintTokenService from "@/services/invoice-print-token.service";
+import { InvoiceStatus } from "@/types/invoice";
 
-const REACT_PRINT_PDF_MARKER = 'react-print-v13';
-const INTER_FONT_DIRECTORY = join(process.cwd(), 'assets', 'fonts', 'inter');
+const REACT_PRINT_PDF_MARKER = "react-print-v13";
+const INTER_FONT_DIRECTORY = join(process.cwd(), "assets", "fonts", "inter");
 const INTER_FONT_FILES = [
-  { filename: 'Inter-Regular.woff2', weight: 400 },
-  { filename: 'Inter-Medium.woff2', weight: 500 },
-  { filename: 'Inter-SemiBold.woff2', weight: 600 },
-  { filename: 'Inter-Bold.woff2', weight: 700 },
+  { filename: "Inter-Regular.woff2", weight: 400 },
+  { filename: "Inter-Medium.woff2", weight: 500 },
+  { filename: "Inter-SemiBold.woff2", weight: 600 },
+  { filename: "Inter-Bold.woff2", weight: 700 },
 ] as const;
 
 export interface InvoicePdfPayload {
@@ -67,27 +67,73 @@ export class PdfGeneratorService {
     const browser = await puppeteer.launch({
       headless: true,
       executablePath,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+      ],
     });
     try {
       const page = await browser.newPage();
+
+      page.on("console", (msg) => {
+        logger.error(
+          `[invoice-pdf:browser-console] ${msg.type()}: ${msg.text()}`,
+        );
+      });
+
+      page.on("pageerror", (error) => {
+        logger.error(`[invoice-pdf:page-error] ${error.message}`);
+      });
+
+      page.on("requestfailed", (request) => {
+        logger.error(
+          `[invoice-pdf:request-failed] ${request.method()} ${request.url()} :: ${
+            request.failure()?.errorText ?? "unknown"
+          }`,
+        );
+      });
+
+      page.on("response", (response) => {
+        if (response.url().includes("/invoices/print/")) {
+          logger.info(
+            `[invoice-pdf:print-response] ${response.status()} ${response.url()}`,
+          );
+        }
+      });
+
       const printUrl = this.buildPrintRouteUrl(payload);
 
-      await page.setViewport({ width: 1280, height: 1600, deviceScaleFactor: 1 });
-      const response = await page.goto(printUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.setViewport({
+        width: 1280,
+        height: 1600,
+        deviceScaleFactor: 1,
+      });
+      const response = await page.goto(printUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 45000,
+      });
       if (!response || !response.ok()) {
         throw new Error(
-          `Invoice print page returned HTTP ${response?.status() ?? 'no response'} at ${printUrl}`,
+          `Invoice print page returned HTTP ${response?.status() ?? "no response"} at ${printUrl}`,
         );
       }
-      await page.waitForFunction('window.__INVOICE_READY__ === true', { timeout: 30000 });
+      await page.waitForFunction("window.__INVOICE_READY__ === true", {
+        timeout: 30000,
+      });
 
-      const renderError = (await page.evaluate('window.__INVOICE_ERROR__ || ""')) as string;
+      const renderError = (await page.evaluate(
+        'window.__INVOICE_ERROR__ || ""',
+      )) as string;
       if (renderError) {
-        throw new Error(`Invoice print route failed to load the invoice: ${renderError}`);
+        throw new Error(
+          `Invoice print route failed to load the invoice: ${renderError}`,
+        );
       }
 
-      await page.addStyleTag({ content: await this.getEmbeddedInterFontStyles() });
+      await page.addStyleTag({
+        content: await this.getEmbeddedInterFontStyles(),
+      });
       await page.evaluate(`(async () => {
         const weights = [400, 500, 600, 700];
         const loadedFaces = await Promise.all(weights.map(async (weight) => ({
@@ -107,10 +153,10 @@ export class PdfGeneratorService {
       })()`);
 
       const pdfBuffer = await page.pdf({
-        format: 'A4',
+        format: "A4",
         printBackground: true,
         preferCSSPageSize: true,
-        margin: { top: '14mm', right: '14mm', bottom: '14mm', left: '14mm' },
+        margin: { top: "14mm", right: "14mm", bottom: "14mm", left: "14mm" },
       });
       return Buffer.from(pdfBuffer);
     } finally {
@@ -122,12 +168,12 @@ export class PdfGeneratorService {
     const fontFaces = await Promise.all(
       INTER_FONT_FILES.map(async ({ filename, weight }) => {
         const fontData = await readFile(join(INTER_FONT_DIRECTORY, filename));
-        const dataUri = `data:font/woff2;base64,${fontData.toString('base64')}`;
+        const dataUri = `data:font/woff2;base64,${fontData.toString("base64")}`;
         return `@font-face{font-family:'Inter';src:url('${dataUri}') format('woff2');font-style:normal;font-weight:${weight};font-display:block;}`;
       }),
     );
 
-    return `${fontFaces.join('\n')}
+    return `${fontFaces.join("\n")}
 .invoice-document.invoice-document,
 .invoice-document.invoice-document * {
   font-family: 'Inter', sans-serif !important;
@@ -135,12 +181,12 @@ export class PdfGeneratorService {
   }
 
   private buildPrintRouteUrl(payload: InvoicePdfPayload): string {
-    const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, '');
+    const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, "");
     if (!frontendBaseUrl) {
       throw new Error(
-        'FRONTEND_BASE_URL is not configured. Set it to the reachable frontend base URL ' +
-          '(for example http://frontendreact-node:5173 inside Docker) so invoice PDFs can be ' +
-          'rendered from the shared invoice print route.',
+        "FRONTEND_BASE_URL is not configured. Set it to the reachable frontend base URL " +
+          "(for example http://frontendreact-node:5173 inside Docker) so invoice PDFs can be " +
+          "rendered from the shared invoice print route.",
       );
     }
 
@@ -148,7 +194,7 @@ export class PdfGeneratorService {
       sub: payload.customerId,
       invoiceId: payload.invoiceId,
       invoiceNumber: payload.invoiceNumber,
-      role: 'customer',
+      role: "customer",
     });
 
     return `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/print?token=${encodeURIComponent(token)}`;
