@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getFinalInvoicePaymentStatus } from './invoice-event-policy';
 
-test('only final non-COD order-paid events are invoice eligible', () => {
+test('prepaid order-paid events issue a paid invoice', () => {
   assert.equal(getFinalInvoicePaymentStatus('order.paid', { payment_status: 'PAID' }), 'PAID');
-  assert.equal(getFinalInvoicePaymentStatus('order.paid', { payment_status: 'COD' }), null);
   assert.equal(getFinalInvoicePaymentStatus('order.paid', {}), null);
+});
+
+test('COD order-paid events issue an unpaid invoice immediately', () => {
+  assert.equal(getFinalInvoicePaymentStatus('order.paid', { payment_status: 'COD' }), 'UNPAID');
 });
 
 test('payment authorization events never make a COD invoice eligible', () => {
@@ -15,7 +18,7 @@ test('payment authorization events never make a COD invoice eligible', () => {
   );
 });
 
-test('COD becomes invoice eligible only after payment collection', () => {
+test('COD collection marks the existing invoice as collected', () => {
   assert.equal(
     getFinalInvoicePaymentStatus('payment.collected', { payment_method: 'cod' }),
     'COLLECTED',

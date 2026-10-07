@@ -75,8 +75,24 @@ const makePaymentPayload = (currency: string) => ({
 
 test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(
-    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v9/invoice.pdf'),
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v13/invoice.pdf'),
     true,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v12/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v11/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v10/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v9/invoice.pdf'),
+    false,
   );
   assert.equal(
     hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v8/invoice.pdf'),
@@ -152,6 +168,75 @@ test('invoice currency is always normalized to MMK regardless of the source curr
   assert.equal(requireMmkInvoiceCurrency('USD'), 'MMK');
   assert.equal(requireMmkInvoiceCurrency(null), 'MMK');
   assert.equal(requireMmkInvoiceCurrency(undefined), 'MMK');
+});
+
+test('COD invoices are created unpaid as soon as the order is placed', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let storedStatus: string | undefined;
+  let storedMethod: string | null | undefined;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    storedStatus = data.status;
+    storedMethod = data.paymentMethod;
+    return { id: 'invoice-cod', status: data.status, paymentMethod: data.paymentMethod } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'cod',
+    }, async () => {
+      await new InvoiceService().createInvoiceFromPayment({
+        ...makePaymentPayload('MMK'),
+        paymentStatus: 'UNPAID',
+        paymentMethod: 'COD',
+      });
+    });
+    assert.equal(storedStatus, 'UNPAID');
+    assert.equal(storedMethod, 'COD');
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('COD collection updates the existing unpaid invoice instead of creating another', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  const originalMarkCollected = invoiceRepository.markCollected;
+  let created = false;
+  let markedId: string | undefined;
+  invoiceRepository.createPaidInvoiceFromPayment = async () => {
+    created = true;
+    return { id: 'invoice-new' } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'invoice-cod',
+    paymentMethod: 'COD',
+    status: 'UNPAID',
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+  invoiceRepository.markCollected = async (id, paymentGatewayRef) => {
+    markedId = id;
+    return { id, status: 'PAID', paymentGatewayRef } as Awaited<ReturnType<typeof originalMarkCollected>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'cod',
+    }, async () => new InvoiceService().createInvoiceFromPayment({
+      ...makePaymentPayload('MMK'),
+      paymentStatus: 'COLLECTED',
+      paymentMethod: 'COD',
+    }));
+    assert.equal(created, false);
+    assert.equal(markedId, 'invoice-cod');
+    assert.equal((result as { id: string }).id, 'invoice-cod');
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    invoiceRepository.findAllByOrderId = originalFindAll;
+    invoiceRepository.markCollected = originalMarkCollected;
+  }
 });
 
 test('paid invoice creation stores the validated MMK source currency', async () => {

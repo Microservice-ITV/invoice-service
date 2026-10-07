@@ -22,10 +22,15 @@ export const startOrderPaidConsumer = async (): Promise<void> => {
         const paymentId = typeof data.payment_id === 'string' ? data.payment_id.trim() : '';
         const transactionId = typeof data.transaction_id === 'string' ? data.transaction_id.trim() : '';
         const currency = typeof data.currency === 'string' ? data.currency.trim() : '';
+        const paymentStatus = getFinalInvoicePaymentStatus('order.paid', data);
+        const paymentMethod = typeof data.payment_method === 'string'
+          ? data.payment_method
+          : paymentStatus === 'UNPAID'
+            ? 'COD'
+            : null;
         if (
-          getFinalInvoicePaymentStatus('order.paid', data) === 'PAID'
-          &&
-          paymentId
+          (paymentStatus === 'PAID' || paymentStatus === 'UNPAID')
+          && paymentId
           && transactionId
           && currency
           && typeof data.amount === 'number'
@@ -37,8 +42,8 @@ export const startOrderPaidConsumer = async (): Promise<void> => {
             transactionId,
             amount: data.amount,
             currency,
-            paymentStatus: 'PAID',
-            paymentMethod: typeof data.payment_method === 'string' ? data.payment_method : null,
+            paymentStatus,
+            paymentMethod,
           });
         }
       }

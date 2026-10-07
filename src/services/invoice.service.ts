@@ -95,7 +95,7 @@ const normalizePdfAddress = (
  */
 export const requireMmkInvoiceCurrency = (_value?: string | null): string => 'MMK';
 
-const REACT_PRINT_PDF_MARKER = '/react-print-v9/';
+const REACT_PRINT_PDF_MARKER = '/react-print-v13/';
 
 export const hasCurrentInvoicePdf = (pdfUrl?: string | null): boolean =>
   Boolean(pdfUrl?.includes(REACT_PRINT_PDF_MARKER));
@@ -405,7 +405,7 @@ export class InvoiceService {
     transactionId: string;
     amount: number;
     currency: string;
-    paymentStatus: 'PAID' | 'COLLECTED';
+    paymentStatus: 'PAID' | 'UNPAID' | 'COLLECTED';
     paymentMethod?: string | null;
     customerName?: string | null;
     customerEmail?: string | null;
@@ -427,18 +427,68 @@ export class InvoiceService {
     }
     const currency = snapshotCurrency;
 
-    const paymentMethod = normalizeString(payload.paymentMethod ?? snapshot.paymentMethod).toUpperCase();
+    const snapshotPaymentMethod = normalizeString(snapshot.paymentMethod).toUpperCase();
+    const snapshotPaymentStatus = normalizeString(snapshot.paymentStatus).toUpperCase();
+    const paymentMethod = normalizeString(payload.paymentMethod ?? snapshot.paymentMethod).toUpperCase()
+      || ((payload.paymentStatus === 'UNPAID' || payload.paymentStatus === 'COLLECTED') ? 'COD' : '');
+
     if (payload.paymentStatus === 'COLLECTED' && paymentMethod !== 'COD') {
       throw new ValidationError('Collected payment invoices require COD payment method');
     }
-    if (payload.paymentStatus === 'PAID' && paymentMethod === 'COD') {
-      throw new ValidationError('COD invoices require a collected payment');
+    if (payload.paymentStatus === 'UNPAID' && paymentMethod !== 'COD') {
+      throw new ValidationError('Unpaid event invoices are only issued for COD');
     }
-    if (payload.paymentStatus === 'PAID' && snapshot.paymentStatus !== 'PAID') {
+    if (payload.paymentStatus === 'PAID' && paymentMethod === 'COD') {
+      throw new ValidationError('COD invoices are issued unpaid until collection');
+    }
+    if (payload.paymentStatus === 'PAID' && snapshotPaymentStatus !== 'PAID') {
       throw new ValidationError('Order snapshot is not in a paid state');
     }
-    if (payload.paymentStatus === 'COLLECTED' && normalizeString(snapshot.paymentMethod).toUpperCase() !== 'COD') {
+    if (
+      payload.paymentStatus === 'UNPAID'
+      && snapshotPaymentMethod !== 'COD'
+      && snapshotPaymentStatus !== 'COD'
+    ) {
+      throw new ValidationError('Order snapshot is not a COD order');
+    }
+    if (payload.paymentStatus === 'COLLECTED' && snapshotPaymentMethod !== 'COD') {
       throw new ValidationError('Collected payment does not match COD order snapshot');
+    }
+
+    if (payload.paymentStatus === 'COLLECTED') {
+      const existingInvoices = await invoiceRepository.findAllByOrderId(payload.orderId);
+      const collectable = existingInvoices.filter((invoice) => (
+        normalizeString(invoice.paymentMethod).toUpperCase() === 'COD'
+        && ['UNPAID', 'PENDING_VERIFICATION'].includes(invoice.status)
+      ));
+      if (collectable.length > 0) {
+        const updated = [];
+        for (const invoice of collectable) {
+          const marked = await invoiceRepository.markCollected(invoice.id, payload.transactionId);
+          if (!marked) {
+            continue;
+          }
+          void this.generatePdfAsync(marked.id, marked, { force: true });
+          updated.push(marked);
+        }
+        if (updated.length === 1) {
+          return updated[0];
+        }
+        if (updated.length > 1) {
+          return updated;
+        }
+      }
+
+      const alreadyPaid = existingInvoices.filter((invoice) => (
+        normalizeString(invoice.paymentMethod).toUpperCase() === 'COD'
+        && invoice.status === 'PAID'
+      ));
+      if (alreadyPaid.length === 1) {
+        return alreadyPaid[0];
+      }
+      if (alreadyPaid.length > 1) {
+        return alreadyPaid;
+      }
     }
 
     if (!snapshot.customerId.trim() || !payload.paymentId.trim() || !payload.transactionId.trim()) {
@@ -542,6 +592,7 @@ export class InvoiceService {
         items: invoiceItems,
         idempotencyKey,
         requestHash,
+        status: payload.paymentStatus === 'UNPAID' ? 'UNPAID' : 'PAID',
       });
 
       invoices.push(invoice);

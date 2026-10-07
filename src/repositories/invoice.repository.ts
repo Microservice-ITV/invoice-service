@@ -108,6 +108,33 @@ export class InvoiceRepository {
     });
   }
 
+  async findAllByOrderId(orderId: string) {
+    return prisma.invoice.findMany({
+      where: { orderId },
+      include: { items: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async markCollected(id: string, paymentGatewayRef: string) {
+    const result = await prisma.invoice.updateMany({
+      where: {
+        id,
+        status: { in: ['UNPAID', 'PENDING_VERIFICATION'] },
+      },
+      data: {
+        status: 'PAID',
+        paymentGatewayRef,
+      },
+    });
+
+    if (result.count !== 1) {
+      return null;
+    }
+
+    return this.findById(id);
+  }
+
   async findById(id: string) {
     return prisma.invoice.findUnique({
       where: { id },
@@ -180,6 +207,7 @@ export class InvoiceRepository {
     items: Array<OrderInvoiceSnapshotItem & { requestedQuantity: number }>;
     idempotencyKey: string;
     requestHash: string;
+    status?: InvoiceStatus;
   }) {
     try {
       return await prisma.$transaction(async (tx) => {
@@ -288,7 +316,7 @@ export class InvoiceRepository {
           currency: data.currency,
           paymentMethod: data.paymentMethod,
           paymentGatewayRef: data.paymentGatewayRef,
-          status: 'PAID',
+          status: data.status ?? 'PAID',
           items: {
             create: data.items.map((item) => ({
               orderItemId: item.orderItemId,

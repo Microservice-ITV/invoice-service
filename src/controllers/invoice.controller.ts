@@ -190,6 +190,7 @@ export class InvoiceController {
         return;
       }
 
+      res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}.pdf"`);
       res.send(result.buffer);
