@@ -83,7 +83,11 @@ export class PdfGeneratorService {
       });
 
       page.on("pageerror", (error) => {
-        logger.error(`[invoice-pdf:page-error] ${error.message}`);
+        logger.error(
+          `[invoice-pdf:page-error] ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       });
 
       page.on("requestfailed", (request) => {
