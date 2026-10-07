@@ -535,22 +535,78 @@ switch_nginx() {
 # ============================================================
 # VERIFY NGINX UPSTREAM
 # ============================================================
+upstream_has_expected_server() {
+    local config="$1"
+    local expected_server="$2"
+
+    awk -v expected_server="$expected_server" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        {
+            line = trim($0)
+        }
+        !in_upstream && line == "upstream invoice_service_backend {" {
+            upstream_count++
+            in_upstream = 1
+            next
+        }
+        in_upstream {
+            if (line == "server " expected_server ";") {
+                server_count++
+                expected_count++
+                next
+            }
+
+            if (line ~ /^server([[:space:]]|$)/) {
+                server_count++
+                next
+            }
+
+            if (line == "}") {
+                in_upstream = 0
+                next
+            }
+
+            if (line != "" && line !~ /^#/) {
+                unexpected_count++
+            }
+        }
+        END {
+            exit !(upstream_count == 1 && server_count == 1 && expected_count == 1 && unexpected_count == 0 && !in_upstream)
+        }
+    ' <<< "$config"
+}
+
 verify_nginx_upstream() {
     local expected_container="$1"
-    local actual_container=""
+    local expected_server="${expected_container}:${HEALTH_PORT}"
+    local configured_upstream=""
+    local nginx_config=""
 
-    actual_container="$(sed -n "s/^[[:space:]]*server[[:space:]]\+\([^:;[:space:]]*\):${HEALTH_PORT};.*/\1/p" "$NGINX_UPSTREAM_FILE" | head -n 1)"
-
-    if [[ "$actual_container" != "$expected_container" ]]; then
-        error "Nginx upstream verification failed."
-        echo "   Expected: $expected_container"
-        echo "   Actual  : ${actual_container:-none}"
+    if [[ ! -f "$NGINX_UPSTREAM_FILE" ]]; then
+        error "Nginx upstream configuration file is missing:"
+        echo "   $NGINX_UPSTREAM_FILE"
         return 1
     fi
 
-    if ! docker exec "$NGINX_CONTAINER" nginx -T 2>/dev/null | grep -Fq "server ${expected_container}:${HEALTH_PORT};"; then
-        error "Gateway does not contain expected upstream:"
-        echo "   ${expected_container}:${HEALTH_PORT}"
+    configured_upstream="$(<"$NGINX_UPSTREAM_FILE")"
+    if ! upstream_has_expected_server "$configured_upstream" "$expected_server"; then
+        error "Nginx upstream verification failed."
+        echo "   Expected exactly one invoice_service_backend server: $expected_server"
+        return 1
+    fi
+
+    if ! nginx_config="$(docker exec "$NGINX_CONTAINER" nginx -T 2>/dev/null)"; then
+        error "Unable to read the active Nginx configuration."
+        return 1
+    fi
+
+    if ! upstream_has_expected_server "$nginx_config" "$expected_server"; then
+        error "Gateway's loaded invoice_service_backend does not point exclusively to:"
+        echo "   $expected_server"
         return 1
     fi
 
