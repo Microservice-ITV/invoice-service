@@ -205,6 +205,7 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
   const originalMarkCollected = invoiceRepository.markCollected;
   let created = false;
   let markedId: string | undefined;
+  let collected = false;
   invoiceRepository.createPaidInvoiceFromPayment = async () => {
     created = true;
     return { id: 'invoice-new' } as Awaited<ReturnType<typeof originalCreate>>;
@@ -212,10 +213,12 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
   invoiceRepository.findAllByOrderId = async () => [{
     id: 'invoice-cod',
     paymentMethod: 'COD',
-    status: 'UNPAID',
+    paymentGatewayRef: 'payment-1',
+    status: collected ? 'PAID' : 'UNPAID',
   }] as Awaited<ReturnType<typeof originalFindAll>>;
   invoiceRepository.markCollected = async (id, paymentGatewayRef) => {
     markedId = id;
+    collected = true;
     return { id, status: 'PAID', paymentGatewayRef } as Awaited<ReturnType<typeof originalMarkCollected>>;
   };
 
@@ -226,6 +229,7 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
       paymentMethod: 'cod',
     }, async () => new InvoiceService().createInvoiceFromPayment({
       ...makePaymentPayload('MMK'),
+      transactionId: 'payment-1',
       paymentStatus: 'COLLECTED',
       paymentMethod: 'COD',
     }));
@@ -236,6 +240,76 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
     invoiceRepository.findAllByOrderId = originalFindAll;
     invoiceRepository.markCollected = originalMarkCollected;
+  }
+});
+
+test('COD collection rejects an event for a different payment without creating an invoice', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  let created = false;
+  invoiceRepository.createPaidInvoiceFromPayment = async () => {
+    created = true;
+    return { id: 'invoice-new' } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'invoice-cod',
+    paymentMethod: 'COD',
+    paymentGatewayRef: 'different-payment',
+    status: 'UNPAID',
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+
+  try {
+    await assert.rejects(
+      withSnapshotDependencies({
+        ...makeOrderSnapshot('MMK'),
+        paymentStatus: 'COD',
+        paymentMethod: 'cod',
+      }, async () => new InvoiceService().createInvoiceFromPayment({
+        ...makePaymentPayload('MMK'),
+        transactionId: 'payment-1',
+        paymentStatus: 'COLLECTED',
+        paymentMethod: 'COD',
+      })),
+      /Collected payment does not match an existing COD invoice/,
+    );
+    assert.equal(created, false);
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    invoiceRepository.findAllByOrderId = originalFindAll;
+  }
+});
+
+test('replayed COD collection returns the matching paid invoice without creating another', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  let created = false;
+  invoiceRepository.createPaidInvoiceFromPayment = async () => {
+    created = true;
+    return { id: 'invoice-new' } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'invoice-cod',
+    paymentMethod: 'COD',
+    paymentGatewayRef: 'payment-1',
+    status: 'PAID',
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+
+  try {
+    const result = await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'cod',
+    }, async () => new InvoiceService().createInvoiceFromPayment({
+      ...makePaymentPayload('MMK'),
+      transactionId: 'payment-1',
+      paymentStatus: 'COLLECTED',
+      paymentMethod: 'COD',
+    }));
+    assert.equal((result as { id: string }).id, 'invoice-cod');
+    assert.equal(created, false);
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    invoiceRepository.findAllByOrderId = originalFindAll;
   }
 });
 

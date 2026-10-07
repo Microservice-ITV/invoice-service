@@ -25,6 +25,9 @@ export const startPaymentCollectedConsumer = async (): Promise<void> => {
       const orderId = typeof data.order_id === 'string' ? data.order_id.trim() : '';
       const amount = data.amount;
       const currency = typeof data.currency === 'string' ? data.currency.trim() : '';
+      const paymentMethod = typeof data.payment_method === 'string'
+        ? data.payment_method.trim().toLowerCase()
+        : '';
 
       if (
         envelope.event !== 'payment.collected'
@@ -32,6 +35,7 @@ export const startPaymentCollectedConsumer = async (): Promise<void> => {
         || paymentStatus !== 'COLLECTED'
         || !paymentId
         || !orderId
+        || paymentMethod !== 'cod'
         || typeof amount !== 'number'
         || !Number.isFinite(amount)
         || !currency

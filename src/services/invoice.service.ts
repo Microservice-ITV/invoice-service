@@ -457,30 +457,28 @@ export class InvoiceService {
 
     if (payload.paymentStatus === 'COLLECTED') {
       const existingInvoices = await invoiceRepository.findAllByOrderId(payload.orderId);
-      const collectable = existingInvoices.filter((invoice) => (
+      const matchingCodInvoices = existingInvoices.filter((invoice) => (
         normalizeString(invoice.paymentMethod).toUpperCase() === 'COD'
-        && ['UNPAID', 'PENDING_VERIFICATION'].includes(invoice.status)
+        && normalizeString(invoice.paymentGatewayRef) === normalizeString(payload.transactionId)
       ));
-      if (collectable.length > 0) {
-        const updated = [];
-        for (const invoice of collectable) {
-          const marked = await invoiceRepository.markCollected(invoice.id, payload.transactionId);
-          if (!marked) {
-            continue;
-          }
+      if (matchingCodInvoices.length === 0) {
+        throw new ValidationError('Collected payment does not match an existing COD invoice');
+      }
+
+      const collectable = matchingCodInvoices.filter((invoice) => (
+        ['UNPAID', 'PENDING_VERIFICATION'].includes(invoice.status)
+      ));
+      for (const invoice of collectable) {
+        const marked = await invoiceRepository.markCollected(invoice.id, payload.transactionId);
+        if (marked) {
           void this.generatePdfAsync(marked.id, marked, { force: true });
-          updated.push(marked);
-        }
-        if (updated.length === 1) {
-          return updated[0];
-        }
-        if (updated.length > 1) {
-          return updated;
         }
       }
 
-      const alreadyPaid = existingInvoices.filter((invoice) => (
+      const currentInvoices = await invoiceRepository.findAllByOrderId(payload.orderId);
+      const alreadyPaid = currentInvoices.filter((invoice) => (
         normalizeString(invoice.paymentMethod).toUpperCase() === 'COD'
+        && normalizeString(invoice.paymentGatewayRef) === normalizeString(payload.transactionId)
         && invoice.status === 'PAID'
       ));
       if (alreadyPaid.length === 1) {
@@ -489,6 +487,8 @@ export class InvoiceService {
       if (alreadyPaid.length > 1) {
         return alreadyPaid;
       }
+
+      throw new ValidationError('No unpaid or paid invoice matches the collected COD payment');
     }
 
     if (!snapshot.customerId.trim() || !payload.paymentId.trim() || !payload.transactionId.trim()) {
