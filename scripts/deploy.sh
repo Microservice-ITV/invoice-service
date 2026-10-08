@@ -50,7 +50,7 @@ STAGING_HOST_PORT="15006"
 # ============================================================
 HEALTH_PATH="/api/v1/health"
 HEALTH_PORT="5006"
-HEALTH_RETRIES=30
+HEALTH_RETRIES=60
 HEALTH_INTERVAL=2
 DB_RETRIES=120
 DB_INTERVAL=2
