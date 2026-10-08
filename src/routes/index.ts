@@ -43,6 +43,30 @@ router.get(
   requireRoles('admin'),
   invoiceController.getAdminInvoices.bind(invoiceController)
 );
+router.post(
+  '/admin/invoices/replay',
+  auth,
+  requireRoles('admin'),
+  invoiceController.replayInvoices.bind(invoiceController)
+);
+router.get(
+  '/admin/invoices/missing',
+  auth,
+  requireRoles('admin'),
+  invoiceController.getMissingInvoices.bind(invoiceController)
+);
+router.post(
+  '/admin/invoices/missing/replay',
+  auth,
+  requireRoles('admin'),
+  invoiceController.replayMissingInvoice.bind(invoiceController)
+);
+router.post(
+  '/admin/invoices/missing/replay-all',
+  auth,
+  requireRoles('admin'),
+  invoiceController.replayAllMissingInvoices.bind(invoiceController)
+);
 // Print/PDF route. Authenticated by a short-lived, single-invoice print token
 // issued by this service; access is re-checked against the invoice owner.
 router.get(

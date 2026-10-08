@@ -7,7 +7,7 @@ import env from "@/config/env";
 import invoicePrintTokenService from "@/services/invoice-print-token.service";
 import { InvoiceStatus } from "@/types/invoice";
 
-const REACT_PRINT_PDF_MARKER = "react-print-v13";
+const REACT_PRINT_PDF_MARKER = "react-print-v15";
 const INTER_FONT_DIRECTORY = join(process.cwd(), "assets", "fonts", "inter");
 const INTER_FONT_FILES = [
   { filename: "Inter-Regular.woff2", weight: 400 },

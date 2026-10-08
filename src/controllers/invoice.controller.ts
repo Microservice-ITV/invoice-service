@@ -1,5 +1,5 @@
 import { NextFunction, Request, Response } from 'express';
-import invoiceService from '@/services/invoice.service';
+import invoiceService, { MAX_INVOICE_REPLAY_ORDER_IDS } from '@/services/invoice.service';
 import { InvoiceStatus, RefundMethod } from '@/types/invoice';
 import { canAccessInvoice } from '@/services/invoice-access-policy';
 import invoicePrintTokenService from '@/services/invoice-print-token.service';
@@ -27,6 +27,88 @@ const normalizeStatus = (value: string | undefined): InvoiceStatus | undefined =
 };
 
 export class InvoiceController {
+  async replayInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const orderIds = req.body?.orderIds;
+      if (
+        !Array.isArray(orderIds)
+        || orderIds.length === 0
+        || orderIds.length > MAX_INVOICE_REPLAY_ORDER_IDS
+        || orderIds.some((orderId: unknown) => typeof orderId !== 'string' || !orderId.trim())
+      ) {
+        res.status(400).json({
+          success: false,
+          message: `orderIds must contain between 1 and ${MAX_INVOICE_REPLAY_ORDER_IDS} non-empty strings`,
+        });
+        return;
+      }
+
+      const summary = await invoiceService.replayInvoices(orderIds.map((orderId: string) => orderId.trim()));
+      res.json({ success: true, data: summary });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to replay invoices'));
+    }
+  }
+
+  async getMissingInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const limitValue = req.query.limit;
+      const limit = limitValue === undefined ? 25 : Number(limitValue);
+      const cursor = req.query.cursor;
+      if (
+        !Number.isInteger(limit)
+        || limit < 1
+        || limit > 100
+        || (cursor !== undefined && typeof cursor !== 'string')
+        || (typeof cursor === 'string' && cursor.length > 512)
+      ) {
+        res.status(400).json({ success: false, message: 'Invalid missing invoice query parameters' });
+        return;
+      }
+
+      const page = await invoiceService.getMissingInvoices(limit, cursor as string | undefined);
+      res.json({ success: true, data: page });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to find missing invoices'));
+    }
+  }
+
+  async replayMissingInvoice(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { orderId, shopId } = req.body ?? {};
+      if (
+        typeof orderId !== 'string' || !orderId.trim()
+        || typeof shopId !== 'string' || !shopId.trim()
+      ) {
+        res.status(400).json({ success: false, message: 'orderId and shopId are required' });
+        return;
+      }
+
+      const result = await invoiceService.replayMissingInvoice(orderId.trim(), shopId.trim());
+      res.json({ success: true, data: result });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to replay missing invoice'));
+    }
+  }
+
+  async replayAllMissingInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const cursor = req.body?.cursor;
+      if (
+        cursor !== undefined
+        && (typeof cursor !== 'string' || cursor.length > 512)
+      ) {
+        res.status(400).json({ success: false, message: 'Invalid replay cursor' });
+        return;
+      }
+
+      const summary = await invoiceService.replayAllMissingInvoices(cursor as string | undefined);
+      res.json({ success: true, data: summary });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to replay missing invoices'));
+    }
+  }
+
   async createInvoice(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const payload = req.body as Parameters<typeof invoiceService.createInvoiceFromPayment>[0];

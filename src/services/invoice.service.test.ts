@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Prisma } from '@prisma/client';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'mysql://invoice:invoice@localhost:3306/invoice_test';
@@ -34,6 +35,8 @@ import { InvoiceService } from '@/services/invoice.service';
 import invoiceRepository, { InvoiceRepository } from '@/repositories/invoice.repository';
 import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
+import pdfGeneratorService from '@/services/pdf-generator.service';
+import storageService from '@/services/storage.service';
 
 const makeOrderSnapshot = (currency: string): OrderInvoiceSnapshot => ({
   orderId: 'order-1',
@@ -75,8 +78,16 @@ const makePaymentPayload = (currency: string) => ({
 
 test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(
-    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v13/invoice.pdf'),
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v15/invoice.pdf'),
     true,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v14/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v13/invoice.pdf'),
+    false,
   );
   assert.equal(
     hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v12/invoice.pdf'),
@@ -114,6 +125,91 @@ test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(hasCurrentInvoicePdf(null), false);
 });
 
+test('invoice download regenerates a stale PDF before returning it', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalClaimPdfGeneration = invoiceRepository.claimPdfGeneration;
+  const originalMarkPdfReady = invoiceRepository.markPdfReady;
+  const originalBuildAndUploadInvoicePdf = pdfGeneratorService.buildAndUploadInvoicePdf;
+  const originalDownloadPdf = storageService.downloadPdf;
+  const stalePdf = Buffer.from('stale-pdf');
+  const currentPdf = Buffer.from('current-pdf');
+  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v14/invoice.pdf';
+  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v15/invoice.pdf';
+  const downloadedUrls: string[] = [];
+  let savedPdfUrl = stalePdfUrl;
+  const invoice = {
+    id: 'invoice-1',
+    invoiceNumber: 'INV-1',
+    orderId: 'order-1',
+    orderReference: null,
+    shopId: 'shop-1',
+    shopName: null,
+    customerId: 'customer-1',
+    customerName: null,
+    customerEmail: null,
+    customerPhone: null,
+    billingAddress: null,
+    shippingAddress: null,
+    shopContactName: null,
+    shopContactEmail: null,
+    shopContactPhone: null,
+    shopAddress: null,
+    lineItems: [],
+    subtotal: new Prisma.Decimal('100.00'),
+    taxAmount: new Prisma.Decimal('0.00'),
+    deliveryFee: new Prisma.Decimal('0.00'),
+    discountAmount: new Prisma.Decimal('0.00'),
+    grandTotal: new Prisma.Decimal('100.00'),
+    currency: 'MMK',
+    paymentMethod: 'CARD',
+    paymentGatewayRef: null,
+    paymentSlipUrl: null,
+    status: 'PAID' as const,
+    pdfUrl: stalePdfUrl,
+    pdfStatus: 'READY',
+    pdfError: null,
+    pdfAttemptCount: 1,
+    pdfUpdatedAt: null,
+    verifiedBy: null,
+    verifiedAt: null,
+    rejectionReason: null,
+    verificationNote: null,
+    refundAmount: null,
+    refundMethod: null,
+    refundReason: null,
+    createdAt: new Date('2026-10-08T00:00:00.000Z'),
+    updatedAt: new Date('2026-10-08T00:00:00.000Z'),
+  } as NonNullable<Awaited<ReturnType<typeof invoiceRepository.findById>>>;
+
+  invoiceRepository.findById = async () => ({ ...invoice, pdfUrl: savedPdfUrl });
+  invoiceRepository.claimPdfGeneration = async () => true;
+  invoiceRepository.markPdfReady = async (_id, pdfUrl) => {
+    savedPdfUrl = pdfUrl;
+    return { ...invoice, pdfUrl };
+  };
+  pdfGeneratorService.buildAndUploadInvoicePdf = async () => currentPdfUrl;
+  storageService.downloadPdf = async (url) => {
+    downloadedUrls.push(url);
+    return url === currentPdfUrl ? currentPdf : stalePdf;
+  };
+
+  try {
+    const result = await new InvoiceService().downloadInvoicePdf('invoice-1', {
+      role: 'customer',
+      customerId: 'customer-1',
+    });
+
+    assert.equal(result?.buffer, currentPdf);
+    assert.deepEqual(downloadedUrls, [currentPdfUrl]);
+  } finally {
+    invoiceRepository.findById = originalFindById;
+    invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
+    invoiceRepository.markPdfReady = originalMarkPdfReady;
+    pdfGeneratorService.buildAndUploadInvoicePdf = originalBuildAndUploadInvoicePdf;
+    storageService.downloadPdf = originalDownloadPdf;
+  }
+});
+
 const withSnapshotDependencies = async <T>(
   snapshot: OrderInvoiceSnapshot,
   run: () => Promise<T>,
@@ -138,6 +234,12 @@ const withSnapshotDependencies = async <T>(
     shopLookupService.getShopInvoiceSnapshot = originalGetShopInvoiceSnapshot;
     invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
   }
+};
+
+const createInvoiceServiceWithoutPdfGeneration = (): InvoiceService => {
+  const service = new InvoiceService();
+  Object.defineProperty(service, 'generatePdfAsync', { value: async () => false });
+  return service;
 };
 
 test('validateRequestedQuantity accepts valid partial and full quantities', () => {
@@ -238,6 +340,41 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
     assert.equal((result as { id: string }).id, 'invoice-cod');
   } finally {
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    invoiceRepository.findAllByOrderId = originalFindAll;
+    invoiceRepository.markCollected = originalMarkCollected;
+  }
+});
+
+test('COD collection attaches its real payment reference to a replayed invoice', async () => {
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  const originalMarkCollected = invoiceRepository.markCollected;
+  let status: 'UNPAID' | 'PAID' = 'UNPAID';
+  let gatewayReference: string | null = null;
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'replayed-cod-invoice',
+    paymentMethod: 'COD',
+    paymentGatewayRef: gatewayReference,
+    status,
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+  invoiceRepository.markCollected = async (id, paymentGatewayRef) => {
+    status = 'PAID';
+    gatewayReference = paymentGatewayRef;
+    return { id, status, paymentGatewayRef } as Awaited<ReturnType<typeof originalMarkCollected>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'COD',
+    }, async () => new InvoiceService().createInvoiceFromPayment({
+      ...makePaymentPayload('MMK'),
+      paymentStatus: 'COLLECTED',
+      paymentMethod: 'COD',
+    }));
+    assert.equal((result as { id: string }).id, 'replayed-cod-invoice');
+    assert.equal(gatewayReference, 'transaction-1');
+  } finally {
     invoiceRepository.findAllByOrderId = originalFindAll;
     invoiceRepository.markCollected = originalMarkCollected;
   }
@@ -463,7 +600,11 @@ test('repeated paid events use one stable idempotency key and return one invoice
   const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
   const invoicesByKey = new Map<string, { id: string; currency: string }>();
   let insertCount = 0;
+  let storedIdempotencyKey: string | undefined;
+  let storedGatewayReference: string | null | undefined;
   invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    storedIdempotencyKey = data.idempotencyKey;
+    storedGatewayReference = data.paymentGatewayRef;
     const existing = invoicesByKey.get(data.idempotencyKey);
     if (existing) return existing as Awaited<ReturnType<typeof originalCreate>>;
     insertCount += 1;
@@ -480,8 +621,327 @@ test('repeated paid events use one stable idempotency key and return one invoice
       assert.equal(first, second);
     });
     assert.equal(insertCount, 1);
+    assert.equal(storedIdempotencyKey, 'payment:payment-1');
+    assert.equal(storedGatewayReference, 'transaction-1');
   } finally {
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice replay skips orders that already have an invoice without fetching a snapshot', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  let snapshotLookupCount = 0;
+  invoiceRepository.findByOrderId = async () => ({ id: 'existing-invoice' }) as Awaited<ReturnType<typeof originalFindByOrderId>>;
+  orderSnapshotService.getInvoiceSnapshot = async () => {
+    snapshotLookupCount += 1;
+    return makeOrderSnapshot('MMK');
+  };
+
+  try {
+    const result = await new InvoiceService().replayInvoices(['order-1']);
+    assert.equal(result.skipped_existing, 1);
+    assert.equal(result.created, 0);
+    assert.equal(result.results[0].status, 'ALREADY_EXISTS');
+    assert.equal(snapshotLookupCount, 0);
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('invoice replay creates an eligible invoice from real snapshot data without inventing payment references', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let createData: Parameters<typeof originalCreate>[0] | undefined;
+  invoiceRepository.findByOrderId = async () => null;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    createData = data;
+    return { id: 'replayed-invoice', status: data.status } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => (
+      createInvoiceServiceWithoutPdfGeneration().replayInvoices(['order-1'])
+    ));
+    assert.equal(result.created, 1);
+    assert.equal(result.results[0].status, 'CREATED');
+    assert.equal(createData?.customerId, 'customer-1');
+    assert.equal(createData?.lineItems[0].name, 'Test product');
+    assert.equal(createData?.lineItems[0].imageUrl, 'https://products.example.test/images/test-product.png');
+    assert.equal(createData?.paymentGatewayRef, null);
+    assert.equal(createData?.idempotencyKey, 'replay:order-1');
+    assert.equal(createData?.status, 'PAID');
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice replay skips orders that are ineligible under the order.paid policy', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let createCount = 0;
+  invoiceRepository.findByOrderId = async () => null;
+  invoiceRepository.createPaidInvoiceFromPayment = async () => {
+    createCount += 1;
+    return { id: 'unexpected-invoice' } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'CANCELLED',
+    }, async () => createInvoiceServiceWithoutPdfGeneration().replayInvoices(['order-1']));
+    assert.equal(result.skipped_ineligible, 1);
+    assert.equal(result.created, 0);
+    assert.equal(result.results[0].status, 'INELIGIBLE');
+    assert.match(result.results[0].reason ?? '', /not eligible/);
+    assert.equal(createCount, 0);
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice replay applies the existing unpaid COD invoice policy', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let storedStatus: string | undefined;
+  let storedMethod: string | null | undefined;
+  invoiceRepository.findByOrderId = async () => null;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    storedStatus = data.status;
+    storedMethod = data.paymentMethod;
+    return { id: 'replayed-cod-invoice' } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'cod',
+    }, async () => createInvoiceServiceWithoutPdfGeneration().replayInvoices(['order-1']));
+    assert.equal(result.created, 1);
+    assert.equal(storedStatus, 'UNPAID');
+    assert.equal(storedMethod, 'COD');
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice replay records a snapshot failure and continues processing later orders', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  invoiceRepository.findByOrderId = async () => null;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => (
+    { id: `invoice-${data.orderId}` } as Awaited<ReturnType<typeof originalCreate>>
+  );
+  orderSnapshotService.getInvoiceSnapshot = async (orderId) => {
+    if (orderId === 'order-fails') throw new Error('snapshot unavailable');
+    return { ...makeOrderSnapshot('MMK'), orderId };
+  };
+
+  try {
+    const result = await createInvoiceServiceWithoutPdfGeneration()
+      .replayInvoices(['order-fails', 'order-succeeds']);
+    assert.equal(result.failed, 1);
+    assert.equal(result.created, 1);
+    assert.deepEqual(result.results.map(({ status }) => status), ['FAILED', 'CREATED']);
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('repeated invoice replay skips the invoice created by the first execution', async () => {
+  const originalFindByOrderId = invoiceRepository.findByOrderId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const invoicesByOrder = new Map<string, { id: string }>();
+  let createCount = 0;
+  invoiceRepository.findByOrderId = async (orderId) => (
+    invoicesByOrder.get(orderId) as Awaited<ReturnType<typeof originalFindByOrderId>> ?? null
+  );
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    createCount += 1;
+    const invoice = { id: `invoice-${data.orderId}` };
+    invoicesByOrder.set(data.orderId, invoice);
+    return invoice as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    const first = await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => (
+      createInvoiceServiceWithoutPdfGeneration().replayInvoices(['order-1'])
+    ));
+    const second = await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => (
+      createInvoiceServiceWithoutPdfGeneration().replayInvoices(['order-1'])
+    ));
+    assert.equal(first.created, 1);
+    assert.equal(second.skipped_existing, 1);
+    assert.equal(createCount, 1);
+  } finally {
+    invoiceRepository.findByOrderId = originalFindByOrderId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('invoice replay enforces the maximum order ID batch size', async () => {
+  await assert.rejects(
+    new InvoiceService().replayInvoices(Array.from({ length: 51 }, (_, index) => `order-${index}`)),
+    /between 1 and 50 order IDs/,
+  );
+});
+
+test('missing invoice discovery finds an uninvoiced shop when another shop invoice exists', async () => {
+  const originalCandidates = orderSnapshotService.getInvoiceCandidates;
+  const originalFindPairs = invoiceRepository.findInvoiceShopPairsByOrderIds;
+  const originalGetShopName = shopLookupService.getShopName;
+  const multiShopSnapshot: OrderInvoiceSnapshot = {
+    ...makeOrderSnapshot('MMK'),
+    subtotal: '200.00',
+    grandTotal: '200.00',
+    items: [
+      { ...makeOrderSnapshot('MMK').items[0], shopId: 'shop-1', shopName: 'Shop One' },
+      {
+        ...makeOrderSnapshot('MMK').items[0],
+        orderItemId: 'order-item-2',
+        productId: 'product-2',
+        productName: 'Second product',
+        shopId: 'shop-2',
+        shopName: null,
+      },
+    ],
+  };
+  orderSnapshotService.getInvoiceCandidates = async () => ({
+    orders: [{ snapshot: multiShopSnapshot, createdAt: '2026-01-01T00:00:00.000Z', cursorAfter: 'cursor-1' }],
+    nextCursor: null,
+  });
+  invoiceRepository.findInvoiceShopPairsByOrderIds = async () => [{ orderId: 'order-1', shopId: 'shop-1' }];
+  shopLookupService.getShopName = async (shopId) => (
+    shopId === 'shop-2' ? 'Resolved Shop Two' : null
+  );
+
+  try {
+    const result = await new InvoiceService().getMissingInvoices();
+    assert.equal(result.data.length, 1);
+    assert.equal(result.data[0].missingShops.length, 1);
+    assert.equal(result.data[0].missingShops[0].shopId, 'shop-2');
+    assert.equal(result.data[0].missingShops[0].shopName, 'Resolved Shop Two');
+    assert.equal(result.data[0].missingShops[0].reason, 'NO_INVOICE_FOR_SHOP');
+    assert.equal(result.hasMore, false);
+  } finally {
+    orderSnapshotService.getInvoiceCandidates = originalCandidates;
+    invoiceRepository.findInvoiceShopPairsByOrderIds = originalFindPairs;
+    shopLookupService.getShopName = originalGetShopName;
+  }
+});
+
+test('targeted missing invoice replay follows COD policy and is idempotent per shop', async () => {
+  const originalFindByOrderIdAndShopId = invoiceRepository.findByOrderIdAndShopId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const invoicesByShop = new Map<string, { id: string }>();
+  const createdShopIds: string[] = [];
+  let storedStatus: string | undefined;
+  let storedPaymentMethod: string | null | undefined;
+  invoiceRepository.findByOrderIdAndShopId = async (_orderId, shopId) => (
+    invoicesByShop.get(shopId) as Awaited<ReturnType<typeof originalFindByOrderIdAndShopId>> ?? null
+  );
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    createdShopIds.push(data.shopId);
+    storedStatus = data.status;
+    storedPaymentMethod = data.paymentMethod;
+    const invoice = { id: `invoice-${data.shopId}` };
+    invoicesByShop.set(data.shopId, invoice);
+    return invoice as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  const snapshot = {
+    ...makeOrderSnapshot('MMK'),
+    paymentStatus: 'COD',
+    paymentMethod: 'COD',
+    subtotal: '200.00',
+    grandTotal: '200.00',
+    items: [
+      { ...makeOrderSnapshot('MMK').items[0], shopId: 'shop-1' },
+      { ...makeOrderSnapshot('MMK').items[0], orderItemId: 'order-item-2', shopId: 'shop-2' },
+    ],
+  };
+
+  try {
+    const service = createInvoiceServiceWithoutPdfGeneration();
+    const first = await withSnapshotDependencies(snapshot, () => service.replayMissingInvoice('order-1', 'shop-2'));
+    const second = await withSnapshotDependencies(snapshot, () => service.replayMissingInvoice('order-1', 'shop-2'));
+    assert.equal(first.status, 'CREATED');
+    assert.equal(second.status, 'ALREADY_EXISTS');
+    assert.deepEqual(createdShopIds, ['shop-2']);
+    assert.equal(storedStatus, 'UNPAID');
+    assert.equal(storedPaymentMethod, 'COD');
+  } finally {
+    invoiceRepository.findByOrderIdAndShopId = originalFindByOrderIdAndShopId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('replay-all creates only missing shop invoices and continues after a candidate failure', async () => {
+  const originalCandidates = orderSnapshotService.getInvoiceCandidates;
+  const originalFindPairs = invoiceRepository.findInvoiceShopPairsByOrderIds;
+  const originalFindByOrderIdAndShopId = invoiceRepository.findByOrderIdAndShopId;
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  const candidateSnapshot = (orderId: string, shopId: string | null): OrderInvoiceSnapshot => ({
+    ...makeOrderSnapshot('MMK'),
+    orderId,
+    items: [{ ...makeOrderSnapshot('MMK').items[0], orderItemId: `${orderId}-item`, shopId }],
+  });
+  const candidates = [
+    { snapshot: candidateSnapshot('bad-order', null), createdAt: '2026-01-01T00:00:00.000Z', cursorAfter: 'cursor-1' },
+    { snapshot: candidateSnapshot('good-order', 'shop-2'), createdAt: '2026-01-02T00:00:00.000Z', cursorAfter: 'cursor-2' },
+  ];
+  const invoicesByShop = new Map<string, { id: string }>();
+  const createdOrderIds: string[] = [];
+  orderSnapshotService.getInvoiceCandidates = async () => ({ orders: candidates, nextCursor: null });
+  invoiceRepository.findInvoiceShopPairsByOrderIds = async () => [];
+  invoiceRepository.findByOrderIdAndShopId = async (_orderId, shopId) => (
+    invoicesByShop.get(shopId) as Awaited<ReturnType<typeof originalFindByOrderIdAndShopId>> ?? null
+  );
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    createdOrderIds.push(data.orderId);
+    const invoice = { id: `invoice-${data.orderId}` };
+    invoicesByShop.set(data.shopId, invoice);
+    return invoice as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    const result = await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => (
+      createInvoiceServiceWithoutPdfGeneration().replayAllMissingInvoices()
+    ));
+    assert.equal(result.created, 1);
+    assert.equal(result.failed, 1);
+    assert.deepEqual(createdOrderIds, ['good-order']);
+    assert.deepEqual(result.results.map(({ status }) => status), ['FAILED', 'CREATED']);
+  } finally {
+    orderSnapshotService.getInvoiceCandidates = originalCandidates;
+    invoiceRepository.findInvoiceShopPairsByOrderIds = originalFindPairs;
+    invoiceRepository.findByOrderIdAndShopId = originalFindByOrderIdAndShopId;
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('customer invoice lists read replay-created invoices from invoice-service storage', async () => {
+  const originalListInvoices = invoiceRepository.listInvoices;
+  const historicalInvoice = { id: 'historical-invoice', orderId: 'order-1' };
+  invoiceRepository.listInvoices = async (filters) => {
+    assert.equal(filters?.customerId, 'customer-1');
+    return [historicalInvoice] as Awaited<ReturnType<typeof originalListInvoices>>;
+  };
+
+  try {
+    const invoices = await new InvoiceService().getInvoicesByCustomer('customer-1');
+    assert.deepEqual(invoices, [historicalInvoice]);
+  } finally {
+    invoiceRepository.listInvoices = originalListInvoices;
   }
 });
 

@@ -17,6 +17,78 @@ test('invoice router includes generate-pdf route', () => {
   assert.equal(hasPdfRoute, true);
 });
 
+test('invoice replay route is restricted to authenticated admins', () => {
+  type RouteTestRequest = { user?: { role?: 'admin' | 'customer' } };
+  type RouteTestResponse = {
+    status(code: number): RouteTestResponse;
+    json(): void;
+  };
+  type RouteMiddleware = (
+    req: RouteTestRequest,
+    res: RouteTestResponse,
+    next: () => void,
+  ) => void;
+  type RouteLayer = {
+    route?: {
+      path?: string;
+      methods?: Record<string, boolean>;
+      stack?: Array<{ handle: unknown }>;
+    };
+  };
+
+  const stack = (router as unknown as { stack?: RouteLayer[] }).stack ?? [];
+  const replayRoute = stack.find((layer) => layer.route?.path === '/admin/invoices/replay');
+  assert.ok(replayRoute);
+  assert.equal(replayRoute.route?.methods?.post, true);
+  assert.equal(replayRoute.route?.stack?.[0].handle, auth);
+
+  const requireAdmin = replayRoute.route?.stack?.[1].handle as RouteMiddleware;
+  let statusCode = 0;
+  const response = {
+    status(code: number) {
+      statusCode = code;
+      return this;
+    },
+    json() {},
+  };
+  let nextCalled = false;
+  requireAdmin({ user: { role: 'customer' } }, response, () => {
+    nextCalled = true;
+  });
+  assert.equal(statusCode, 403);
+  assert.equal(nextCalled, false);
+
+  requireAdmin({ user: { role: 'admin' } }, response, () => {
+    nextCalled = true;
+  });
+  assert.equal(nextCalled, true);
+});
+
+test('missing invoice discovery and replay routes are restricted to authenticated admins', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{
+      route?: {
+        path?: string;
+        methods?: Record<string, boolean>;
+        stack?: Array<{ handle: unknown }>;
+      };
+    }>;
+  }).stack ?? [];
+  const protectedPaths = [
+    ['/admin/invoices/missing', 'get'],
+    ['/admin/invoices/missing/replay', 'post'],
+    ['/admin/invoices/missing/replay-all', 'post'],
+  ] as const;
+
+  for (const [path, method] of protectedPaths) {
+    const route = stack.find((layer) => layer.route?.path === path);
+    assert.ok(route, `expected route ${path}`);
+    assert.equal(route.route?.methods?.[method], true);
+    assert.equal(route.route?.stack?.[0].handle, auth);
+    assert.equal(route.route?.stack?.length, 3);
+  }
+});
+
 test('customer requests with a shop id stay customer scoped', async () => {
   const headers: Record<string, string | undefined> = {
     authorization: `Bearer ${createToken('user-456')}`,

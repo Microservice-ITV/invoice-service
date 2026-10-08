@@ -116,6 +116,22 @@ export class InvoiceRepository {
     });
   }
 
+  async findByOrderIdAndShopId(orderId: string, shopId: string) {
+    return prisma.invoice.findFirst({
+      where: { orderId, shopId },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async findInvoiceShopPairsByOrderIds(orderIds: string[]): Promise<Array<{ orderId: string; shopId: string }>> {
+    if (orderIds.length === 0) return [];
+    return prisma.invoice.findMany({
+      where: { orderId: { in: orderIds } },
+      select: { orderId: true, shopId: true },
+      distinct: ['orderId', 'shopId'],
+    });
+  }
+
   async markCollected(id: string, paymentGatewayRef: string) {
     const result = await prisma.invoice.updateMany({
       where: {
@@ -202,7 +218,7 @@ export class InvoiceRepository {
     discountAmount: string;
     grandTotal: string;
     paymentMethod: string | null;
-    paymentGatewayRef: string;
+    paymentGatewayRef: string | null;
     lineItems: InvoiceLineItem[];
     items: Array<OrderInvoiceSnapshotItem & { requestedQuantity: number }>;
     idempotencyKey: string;

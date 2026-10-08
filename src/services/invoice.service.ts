@@ -2,11 +2,17 @@ import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import { InvoiceLineItem, InvoiceStatus, PartialInvoiceRequest, RefundMethod } from '@/types/invoice';
 import invoiceRepository from '@/repositories/invoice.repository';
-import orderSnapshotService, { InvoiceSnapshotAddress, OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
+import orderSnapshotService, {
+  OrderInvoiceSnapshot,
+  InvoiceSnapshotAddress,
+  OrderInvoiceSnapshotItem,
+  OrderSnapshotError,
+} from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
 import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-policy';
+import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
 import logger from '@/utils/logger';
 
 export class AppError extends Error {
@@ -43,6 +49,86 @@ export class NotFoundError extends AppError {
     this.name = 'NotFoundError';
   }
 }
+
+export const MAX_INVOICE_REPLAY_ORDER_IDS = 50;
+
+export type InvoiceReplayResult = {
+  orderId: string;
+  status: 'CREATED' | 'ALREADY_EXISTS' | 'INELIGIBLE' | 'FAILED';
+  reason?: string;
+};
+
+export type InvoiceReplaySummary = {
+  total: number;
+  created: number;
+  skipped_existing: number;
+  skipped_ineligible: number;
+  failed: number;
+  results: InvoiceReplayResult[];
+};
+
+export type MissingInvoiceShop = {
+  shopId: string;
+  shopName: string | null;
+  expectedInvoiceStatus: 'PAID' | 'UNPAID';
+  subtotal: string;
+  deliveryFee: string;
+  discountAmount: string;
+  grandTotal: string;
+  reason: 'NO_INVOICE_FOR_SHOP';
+};
+
+export type MissingInvoiceOrder = {
+  orderId: string;
+  customerId: string;
+  customerName: string | null;
+  paymentStatus: string;
+  paymentMethod: string | null;
+  currency: string | null;
+  createdAt: string;
+  missingShops: MissingInvoiceShop[];
+};
+
+export type MissingInvoicePage = {
+  data: MissingInvoiceOrder[];
+  nextCursor: string | null;
+  hasMore: boolean;
+};
+
+export type MissingInvoiceReplayResult = {
+  orderId: string;
+  shopId: string;
+  status: 'CREATED' | 'ALREADY_EXISTS' | 'INELIGIBLE' | 'FAILED';
+  reason?: string;
+};
+
+export type MissingInvoiceReplaySummary = {
+  total: number;
+  created: number;
+  skipped_existing: number;
+  skipped_ineligible: number;
+  failed: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  results: MissingInvoiceReplayResult[];
+};
+
+const MISSING_INVOICE_PAGE_SIZE = 50;
+const MAX_MISSING_INVOICE_REPLAYS_PER_REQUEST = 50;
+const MAX_CANDIDATES_PER_REPLAY_REQUEST = 500;
+
+type SnapshotInvoiceCreation = {
+  paymentStatus: 'PAID' | 'UNPAID';
+  paymentMethod?: string | null;
+  currency: string;
+  customerName?: string | null;
+  customerEmail?: string | null;
+  shopName?: string | null;
+  idempotencyKeyBase: string;
+  paymentId?: string | null;
+  transactionId?: string | null;
+  onlyShopId?: string;
+};
 
 export class ConflictError extends AppError {
   constructor(message: string) {
@@ -95,7 +181,7 @@ const normalizePdfAddress = (
  */
 export const requireMmkInvoiceCurrency = (_value?: string | null): string => 'MMK';
 
-const REACT_PRINT_PDF_MARKER = '/react-print-v13/';
+const REACT_PRINT_PDF_MARKER = '/react-print-v15/';
 
 export const hasCurrentInvoicePdf = (pdfUrl?: string | null): boolean =>
   Boolean(pdfUrl?.includes(REACT_PRINT_PDF_MARKER));
@@ -425,41 +511,22 @@ export class InvoiceService {
     if (snapshotCurrency !== paymentCurrency) {
       throw new ValidationError(`Payment currency does not match order currency for ${payload.orderId}`);
     }
-    const currency = snapshotCurrency;
 
-    const snapshotPaymentMethod = normalizeString(snapshot.paymentMethod).toUpperCase();
-    const snapshotPaymentStatus = normalizeString(snapshot.paymentStatus).toUpperCase();
     const paymentMethod = normalizeString(payload.paymentMethod ?? snapshot.paymentMethod).toUpperCase()
       || ((payload.paymentStatus === 'UNPAID' || payload.paymentStatus === 'COLLECTED') ? 'COD' : '');
-
-    if (payload.paymentStatus === 'COLLECTED' && paymentMethod !== 'COD') {
-      throw new ValidationError('Collected payment invoices require COD payment method');
-    }
-    if (payload.paymentStatus === 'UNPAID' && paymentMethod !== 'COD') {
-      throw new ValidationError('Unpaid event invoices are only issued for COD');
-    }
-    if (payload.paymentStatus === 'PAID' && paymentMethod === 'COD') {
-      throw new ValidationError('COD invoices are issued unpaid until collection');
-    }
-    if (payload.paymentStatus === 'PAID' && snapshotPaymentStatus !== 'PAID') {
-      throw new ValidationError('Order snapshot is not in a paid state');
-    }
-    if (
-      payload.paymentStatus === 'UNPAID'
-      && snapshotPaymentMethod !== 'COD'
-      && snapshotPaymentStatus !== 'COD'
-    ) {
-      throw new ValidationError('Order snapshot is not a COD order');
-    }
-    if (payload.paymentStatus === 'COLLECTED' && snapshotPaymentMethod !== 'COD') {
-      throw new ValidationError('Collected payment does not match COD order snapshot');
-    }
+    this.validateSnapshotPayment(snapshot, payload.paymentStatus, paymentMethod);
 
     if (payload.paymentStatus === 'COLLECTED') {
       const existingInvoices = await invoiceRepository.findAllByOrderId(payload.orderId);
       const matchingCodInvoices = existingInvoices.filter((invoice) => (
         normalizeString(invoice.paymentMethod).toUpperCase() === 'COD'
-        && normalizeString(invoice.paymentGatewayRef) === normalizeString(payload.transactionId)
+        && (
+          normalizeString(invoice.paymentGatewayRef) === normalizeString(payload.transactionId)
+          || (
+            !invoice.paymentGatewayRef
+            && ['UNPAID', 'PENDING_VERIFICATION'].includes(invoice.status)
+          )
+        )
       ));
       if (matchingCodInvoices.length === 0) {
         throw new ValidationError('Collected payment does not match an existing COD invoice');
@@ -495,6 +562,473 @@ export class InvoiceService {
       throw new ValidationError('Payment identity and snapshot customer ID are required');
     }
 
+    return this.createInvoicesFromSnapshot(snapshot, {
+      paymentStatus: payload.paymentStatus,
+      paymentMethod,
+      currency: snapshotCurrency,
+      customerName: payload.customerName,
+      customerEmail: payload.customerEmail,
+      shopName: payload.shopName,
+      idempotencyKeyBase: `payment:${payload.paymentId}`,
+      paymentId: payload.paymentId,
+      transactionId: payload.transactionId,
+    });
+  }
+
+  async replayInvoices(orderIds: string[]): Promise<InvoiceReplaySummary> {
+    const uniqueOrderIds = [...new Set(orderIds.map((orderId) => orderId.trim()))];
+    if (uniqueOrderIds.length === 0 || uniqueOrderIds.length > MAX_INVOICE_REPLAY_ORDER_IDS) {
+      throw new ValidationError(`Provide between 1 and ${MAX_INVOICE_REPLAY_ORDER_IDS} order IDs`);
+    }
+
+    const summary: InvoiceReplaySummary = {
+      total: uniqueOrderIds.length,
+      created: 0,
+      skipped_existing: 0,
+      skipped_ineligible: 0,
+      failed: 0,
+      results: [],
+    };
+
+    for (const orderId of uniqueOrderIds) {
+      try {
+        if (await invoiceRepository.findByOrderId(orderId)) {
+          summary.skipped_existing += 1;
+          summary.results.push({ orderId, status: 'ALREADY_EXISTS' });
+          continue;
+        }
+
+        const snapshot = await orderSnapshotService.getInvoiceSnapshot(orderId);
+        if (snapshot.orderId !== orderId) {
+          throw new ValidationError('Order snapshot does not match the requested order');
+        }
+
+        const paymentStatus = getFinalInvoicePaymentStatus('order.paid', {
+          payment_status: normalizeString(snapshot.paymentStatus).toUpperCase(),
+        });
+        if (paymentStatus !== 'PAID' && paymentStatus !== 'UNPAID') {
+          summary.skipped_ineligible += 1;
+          summary.results.push({
+            orderId,
+            status: 'INELIGIBLE',
+            reason: 'Order snapshot is not eligible under the order.paid invoice policy',
+          });
+          continue;
+        }
+
+        const paymentMethod = normalizeString(snapshot.paymentMethod).toUpperCase()
+          || (paymentStatus === 'UNPAID' ? 'COD' : '');
+        this.validateSnapshotPayment(snapshot, paymentStatus, paymentMethod);
+
+        await this.createInvoicesFromSnapshot(snapshot, {
+          paymentStatus,
+          paymentMethod,
+          currency: requireMmkInvoiceCurrency(snapshot.currency),
+          idempotencyKeyBase: `replay:${snapshot.orderId}`,
+        });
+        summary.created += 1;
+        summary.results.push({ orderId, status: 'CREATED' });
+      } catch (error) {
+        let invoiceExists = false;
+        try {
+          invoiceExists = Boolean(await invoiceRepository.findByOrderId(orderId));
+        } catch (lookupError) {
+          logger.error(`Failed to check invoice replay state for order ${orderId}`, lookupError as Error);
+        }
+
+        if (invoiceExists) {
+          summary.skipped_existing += 1;
+          summary.results.push({ orderId, status: 'ALREADY_EXISTS' });
+          continue;
+        }
+
+        logger.error(`Failed to replay invoice for order ${orderId}`, error as Error);
+        summary.failed += 1;
+        summary.results.push({
+          orderId,
+          status: 'FAILED',
+          reason: this.getReplayFailureReason(error),
+        });
+      }
+    }
+
+    return summary;
+  }
+
+  async getMissingInvoices(limit = 25, cursor?: string | null): Promise<MissingInvoicePage> {
+    const pageSize = Math.min(Math.max(Math.trunc(limit) || 25, 1), 100);
+    const data: MissingInvoiceOrder[] = [];
+    let nextCursor = cursor ?? null;
+    let scanned = 0;
+    const shopNamesById = new Map<string, string | null>();
+
+    while (data.length < pageSize && scanned < MAX_CANDIDATES_PER_REPLAY_REQUEST) {
+      const candidates = await orderSnapshotService.getInvoiceCandidates(MISSING_INVOICE_PAGE_SIZE, nextCursor);
+      if (candidates.orders.length === 0) {
+        nextCursor = candidates.nextCursor;
+        break;
+      }
+      scanned += candidates.orders.length;
+
+      const invoicePairs = await invoiceRepository.findInvoiceShopPairsByOrderIds(
+        candidates.orders.map((candidate) => candidate.snapshot.orderId),
+      );
+      const existingByOrder = new Map<string, Set<string>>();
+      for (const pair of invoicePairs) {
+        const shops = existingByOrder.get(pair.orderId) ?? new Set<string>();
+        shops.add(pair.shopId);
+        existingByOrder.set(pair.orderId, shops);
+      }
+
+      for (let index = 0; index < candidates.orders.length; index += 1) {
+        const candidate = candidates.orders[index];
+        nextCursor = candidate.cursorAfter;
+        const snapshot = candidate.snapshot;
+        const paymentStatus = this.getEligiblePaymentStatus(snapshot);
+        if (!paymentStatus) continue;
+
+        const missingShops = this.getMissingShopInvoices(
+          snapshot,
+          paymentStatus,
+          existingByOrder.get(snapshot.orderId) ?? new Set<string>(),
+        );
+        if (missingShops.length > 0) {
+          await Promise.all(missingShops.map(async (shop) => {
+            if (shop.shopName?.trim() || shopNamesById.has(shop.shopId)) return;
+            const name = await shopLookupService.getShopName(shop.shopId);
+            shopNamesById.set(shop.shopId, name);
+          }));
+          data.push({
+            orderId: snapshot.orderId,
+            customerId: snapshot.customerId,
+            customerName: snapshot.customerName ?? null,
+            paymentStatus: normalizeString(snapshot.paymentStatus).toUpperCase(),
+            paymentMethod: snapshot.paymentMethod ?? null,
+            currency: snapshot.currency,
+            createdAt: candidate.createdAt,
+            missingShops: missingShops.map((shop) => ({
+              ...shop,
+              shopName: shop.shopName?.trim() || shopNamesById.get(shop.shopId) || null,
+            })),
+          });
+        }
+
+        if (data.length >= pageSize) {
+          if (index === candidates.orders.length - 1) {
+            nextCursor = candidates.nextCursor;
+          }
+          break;
+        }
+      }
+
+      if (data.length >= pageSize) break;
+      if (!candidates.nextCursor) {
+        nextCursor = null;
+        break;
+      }
+      if (nextCursor === candidates.nextCursor) break;
+      nextCursor = candidates.nextCursor;
+    }
+
+    return { data, nextCursor, hasMore: nextCursor !== null };
+  }
+
+  async replayMissingInvoice(
+    orderId: string,
+    shopId: string,
+  ): Promise<MissingInvoiceReplayResult> {
+    try {
+      const existing = await invoiceRepository.findByOrderIdAndShopId(orderId, shopId);
+      if (existing) return { orderId, shopId, status: 'ALREADY_EXISTS' };
+
+      const snapshot = await orderSnapshotService.getInvoiceSnapshot(orderId);
+      if (snapshot.orderId !== orderId) {
+        throw new ValidationError('Order snapshot does not match the requested order');
+      }
+
+      return this.replayMissingInvoiceFromSnapshot(orderId, shopId, snapshot);
+    } catch (error) {
+      const existing = await invoiceRepository.findByOrderIdAndShopId(orderId, shopId).catch(() => null);
+      if (existing) return { orderId, shopId, status: 'ALREADY_EXISTS' };
+      logger.error(`Failed to replay missing invoice for order ${orderId}, shop ${shopId}`, error as Error);
+      return {
+        orderId,
+        shopId,
+        status: 'FAILED',
+        reason: this.getReplayFailureReason(error),
+      };
+    }
+  }
+
+  async replayAllMissingInvoices(cursor?: string | null): Promise<MissingInvoiceReplaySummary> {
+    const summary: MissingInvoiceReplaySummary = {
+      total: 0,
+      created: 0,
+      skipped_existing: 0,
+      skipped_ineligible: 0,
+      failed: 0,
+      hasMore: false,
+      nextCursor: cursor ?? null,
+      results: [],
+    };
+    let scanCursor = cursor ?? null;
+    let scanned = 0;
+
+    while (
+      summary.total < MAX_MISSING_INVOICE_REPLAYS_PER_REQUEST
+      && scanned < MAX_CANDIDATES_PER_REPLAY_REQUEST
+    ) {
+      const candidates = await orderSnapshotService.getInvoiceCandidates(MISSING_INVOICE_PAGE_SIZE, scanCursor);
+      if (candidates.orders.length === 0) {
+        scanCursor = candidates.nextCursor;
+        break;
+      }
+      scanned += candidates.orders.length;
+
+      const invoicePairs = await invoiceRepository.findInvoiceShopPairsByOrderIds(
+        candidates.orders.map((candidate) => candidate.snapshot.orderId),
+      );
+      const existingByOrder = new Map<string, Set<string>>();
+      for (const pair of invoicePairs) {
+        const shops = existingByOrder.get(pair.orderId) ?? new Set<string>();
+        shops.add(pair.shopId);
+        existingByOrder.set(pair.orderId, shops);
+      }
+
+      for (const candidate of candidates.orders) {
+        if (summary.total >= MAX_MISSING_INVOICE_REPLAYS_PER_REQUEST) {
+          return {
+            ...summary,
+            hasMore: true,
+            nextCursor: scanCursor,
+          };
+        }
+        const snapshot = candidate.snapshot;
+        let missingShops: MissingInvoiceShop[];
+        try {
+          const paymentStatus = this.getEligiblePaymentStatus(snapshot);
+          if (!paymentStatus) {
+            scanCursor = candidate.cursorAfter;
+            continue;
+          }
+          this.validateSnapshotPayment(
+            snapshot,
+            paymentStatus,
+            normalizeString(snapshot.paymentMethod).toUpperCase()
+              || (paymentStatus === 'UNPAID' ? 'COD' : ''),
+          );
+          missingShops = this.getMissingShopInvoices(
+            snapshot,
+            paymentStatus,
+            existingByOrder.get(snapshot.orderId) ?? new Set<string>(),
+          );
+        } catch (error) {
+          summary.total += 1;
+          summary.failed += 1;
+          summary.results.push({
+            orderId: snapshot.orderId,
+            shopId: '',
+            status: 'FAILED',
+            reason: this.getReplayFailureReason(error),
+          });
+          scanCursor = candidate.cursorAfter;
+          continue;
+        }
+
+        for (const missingShop of missingShops) {
+          if (summary.total >= MAX_MISSING_INVOICE_REPLAYS_PER_REQUEST) {
+            return {
+              ...summary,
+              hasMore: true,
+              nextCursor: scanCursor,
+            };
+          }
+          const result = await this.replayMissingInvoiceFromSnapshot(
+            snapshot.orderId,
+            missingShop.shopId,
+            snapshot,
+          );
+          summary.total += 1;
+          summary.results.push(result);
+          if (result.status === 'CREATED') summary.created += 1;
+          else if (result.status === 'ALREADY_EXISTS') summary.skipped_existing += 1;
+          else if (result.status === 'INELIGIBLE') summary.skipped_ineligible += 1;
+          else summary.failed += 1;
+        }
+        scanCursor = candidate.cursorAfter;
+      }
+
+      if (!candidates.nextCursor) {
+        scanCursor = null;
+        break;
+      }
+      scanCursor = candidates.nextCursor;
+    }
+
+    summary.nextCursor = scanCursor;
+    summary.hasMore = scanCursor !== null;
+    return summary;
+  }
+
+  private getEligiblePaymentStatus(snapshot: OrderInvoiceSnapshot): 'PAID' | 'UNPAID' | null {
+    const status = getFinalInvoicePaymentStatus('order.paid', {
+      payment_status: normalizeString(snapshot.paymentStatus).toUpperCase(),
+    });
+    return status === 'PAID' || status === 'UNPAID' ? status : null;
+  }
+
+  private async replayMissingInvoiceFromSnapshot(
+    orderId: string,
+    shopId: string,
+    snapshot: OrderInvoiceSnapshot,
+  ): Promise<MissingInvoiceReplayResult> {
+    try {
+      if (snapshot.orderId !== orderId) {
+        throw new ValidationError('Order snapshot does not match the requested order');
+      }
+      if (await invoiceRepository.findByOrderIdAndShopId(orderId, shopId)) {
+        return { orderId, shopId, status: 'ALREADY_EXISTS' };
+      }
+
+      const paymentStatus = this.getEligiblePaymentStatus(snapshot);
+      if (!paymentStatus) {
+        return {
+          orderId,
+          shopId,
+          status: 'INELIGIBLE',
+          reason: 'Order snapshot is not eligible under the order.paid invoice policy',
+        };
+      }
+
+      const paymentMethod = normalizeString(snapshot.paymentMethod).toUpperCase()
+        || (paymentStatus === 'UNPAID' ? 'COD' : '');
+      this.validateSnapshotPayment(snapshot, paymentStatus, paymentMethod);
+      if (!this.getMissingShopInvoices(snapshot, paymentStatus, new Set()).some((shop) => shop.shopId === shopId)) {
+        return {
+          orderId,
+          shopId,
+          status: 'INELIGIBLE',
+          reason: 'Requested shop is not present in the order snapshot',
+        };
+      }
+
+      await this.createInvoicesFromSnapshot(snapshot, {
+        paymentStatus,
+        paymentMethod,
+        currency: requireMmkInvoiceCurrency(snapshot.currency),
+        idempotencyKeyBase: `replay:${snapshot.orderId}`,
+        onlyShopId: shopId,
+      });
+      const created = await invoiceRepository.findByOrderIdAndShopId(orderId, shopId);
+      return created
+        ? { orderId, shopId, status: 'CREATED' }
+        : {
+          orderId,
+          shopId,
+          status: 'FAILED',
+          reason: 'Invoice creation did not produce an invoice for the requested shop',
+        };
+    } catch (error) {
+      const existing = await invoiceRepository.findByOrderIdAndShopId(orderId, shopId).catch(() => null);
+      if (existing) return { orderId, shopId, status: 'ALREADY_EXISTS' };
+      logger.error(`Failed to replay missing invoice for order ${orderId}, shop ${shopId}`, error as Error);
+      return {
+        orderId,
+        shopId,
+        status: 'FAILED',
+        reason: this.getReplayFailureReason(error),
+      };
+    }
+  }
+
+  private getMissingShopInvoices(
+    snapshot: OrderInvoiceSnapshot,
+    paymentStatus: 'PAID' | 'UNPAID',
+    existingShopIds: Set<string>,
+  ): MissingInvoiceShop[] {
+    const itemsByShop = new Map<string, OrderInvoiceSnapshotItem[]>();
+    for (const item of snapshot.items) {
+      const shopId = item.shopId?.trim();
+      if (!shopId) throw new ValidationError('Order snapshot does not contain a shop ID');
+      const items = itemsByShop.get(shopId) ?? [];
+      items.push(item);
+      itemsByShop.set(shopId, items);
+    }
+    const shopTotals = allocateShopTotals(
+      snapshot.subtotal,
+      snapshot.deliveryFee,
+      snapshot.promotionDiscountTotal,
+      [...itemsByShop.entries()].map(([shopId, items]) => ({
+        shopId,
+        subtotal: calculateShopSubtotal(items),
+      })),
+    );
+    return shopTotals
+      .filter((shop) => !existingShopIds.has(shop.shopId))
+      .map((shop) => ({
+        ...shop,
+        shopName: itemsByShop.get(shop.shopId)?.find((item) => item.shopName?.trim())?.shopName ?? null,
+        expectedInvoiceStatus: paymentStatus,
+        reason: 'NO_INVOICE_FOR_SHOP',
+      }));
+  }
+
+  private getReplayFailureReason(error: unknown): string {
+    if (error instanceof OrderSnapshotError || error instanceof ValidationError) {
+      return error.message;
+    }
+    if (error instanceof AppError) {
+      return error.message;
+    }
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      return `Invoice database operation failed (${error.code})`;
+    }
+    return 'Invoice replay failed due to an unexpected service error';
+  }
+
+  private validateSnapshotPayment(
+    snapshot: OrderInvoiceSnapshot,
+    paymentStatus: 'PAID' | 'UNPAID' | 'COLLECTED',
+    paymentMethod: string,
+  ): void {
+    const snapshotPaymentMethod = normalizeString(snapshot.paymentMethod).toUpperCase();
+    const snapshotPaymentStatus = normalizeString(snapshot.paymentStatus).toUpperCase();
+
+    if (paymentStatus === 'COLLECTED' && paymentMethod !== 'COD') {
+      throw new ValidationError('Collected payment invoices require COD payment method');
+    }
+    if (paymentStatus === 'UNPAID' && paymentMethod !== 'COD') {
+      throw new ValidationError('Unpaid event invoices are only issued for COD');
+    }
+    if (paymentStatus === 'PAID' && paymentMethod === 'COD') {
+      throw new ValidationError('COD invoices are issued unpaid until collection');
+    }
+    if (paymentStatus === 'PAID' && snapshotPaymentStatus !== 'PAID') {
+      throw new ValidationError('Order snapshot is not in a paid state');
+    }
+    if (
+      paymentStatus === 'UNPAID'
+      && snapshotPaymentMethod !== 'COD'
+      && snapshotPaymentStatus !== 'COD'
+    ) {
+      throw new ValidationError('Order snapshot is not a COD order');
+    }
+    if (paymentStatus === 'COLLECTED' && snapshotPaymentMethod !== 'COD') {
+      throw new ValidationError('Collected payment does not match COD order snapshot');
+    }
+  }
+
+  private async createInvoicesFromSnapshot(
+    snapshot: OrderInvoiceSnapshot,
+    payload: SnapshotInvoiceCreation,
+  ) {
+    if (!snapshot.customerId.trim()) {
+      throw new ValidationError('Snapshot customer ID is required');
+    }
+    if (snapshot.items.length === 0) {
+      throw new ValidationError('Order snapshot does not contain invoice items');
+    }
+
     const itemsByShop = new Map<string, OrderInvoiceSnapshotItem[]>();
     for (const item of snapshot.items) {
       const shopId = item.shopId?.trim();
@@ -507,10 +1041,12 @@ export class InvoiceService {
     }
 
     const shops = [...itemsByShop.entries()];
-    const shopDetails = await Promise.all(shops.map(async ([shopId]) => [
+    const shopDetails = await Promise.all(shops
+      .filter(([shopId]) => !payload.onlyShopId || payload.onlyShopId === shopId)
+      .map(async ([shopId]) => [
       shopId,
       await shopLookupService.getShopInvoiceSnapshot(shopId),
-    ] as const));
+      ] as const));
     const shopSnapshots = new Map(shopDetails);
     const shopTotals = allocateShopTotals(
       snapshot.subtotal,
@@ -525,6 +1061,7 @@ export class InvoiceService {
 
     for (let index = 0; index < shops.length; index += 1) {
       const [shopId, items] = shops[index];
+      if (payload.onlyShopId && payload.onlyShopId !== shopId) continue;
       const shopTotal = shopTotals[index];
       const snapshotShopName = items.find((item) => item.shopName?.trim())?.shopName;
       const shopSnapshot = shopSnapshots.get(shopId);
@@ -559,12 +1096,12 @@ export class InvoiceService {
         shopId,
         transactionId: payload.transactionId,
         amount: shopTotal.grandTotal,
-        currency,
+        currency: payload.currency,
         items: invoiceItems.map((item) => [item.orderItemId, item.requestedQuantity]),
       })).digest('hex');
       const idempotencyKey = shops.length === 1
-        ? `payment:${payload.paymentId}`
-        : `payment:${payload.paymentId}:shop:${shopId}`;
+        ? payload.idempotencyKeyBase
+        : `${payload.idempotencyKeyBase}:shop:${shopId}`;
 
       const invoice = await invoiceRepository.createPaidInvoiceFromPayment({
         orderId: snapshot.orderId,
@@ -580,14 +1117,14 @@ export class InvoiceService {
         shopContactEmail: shopSnapshot?.contactEmail ?? null,
         shopContactPhone: shopSnapshot?.contactPhone ?? null,
         shopAddress: shopSnapshot?.address ?? null,
-        currency,
+        currency: payload.currency,
         subtotal: shopTotal.subtotal,
         deliveryFee: shopTotal.deliveryFee,
         taxAmount: '0.00',
         discountAmount: shopTotal.discountAmount,
         grandTotal: shopTotal.grandTotal,
-        paymentMethod: paymentMethod || null,
-        paymentGatewayRef: payload.transactionId,
+        paymentMethod: payload.paymentMethod || null,
+        paymentGatewayRef: payload.transactionId ?? null,
         lineItems,
         items: invoiceItems,
         idempotencyKey,
@@ -777,12 +1314,22 @@ export class InvoiceService {
     }
 
     let pdfUrl = invoice.pdfUrl;
-    if (!hasCurrentInvoicePdf(invoice.pdfUrl)) {
-      // Legacy PDFs are regenerated through the shared React print route.
-      // Current renderer output is reused instead of launching Puppeteer again.
-      await this.generatePdfAsync(invoice.id, invoice, { force: true, throwOnFailure: true });
-      pdfUrl = (await invoiceRepository.findById(id))?.pdfUrl ?? null;
+    if (pdfUrl && hasCurrentInvoicePdf(pdfUrl)) {
+      try {
+        return {
+          invoice,
+          buffer: await storageService.downloadPdf(pdfUrl),
+        };
+      } catch (error) {
+        logger.warn('Stored invoice PDF could not be downloaded; regenerating it', {
+          invoiceId: invoice.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
+
+    await this.generatePdfAsync(invoice.id, invoice, { force: Boolean(pdfUrl), throwOnFailure: true });
+    pdfUrl = (await invoiceRepository.findById(id))?.pdfUrl ?? null;
     if (!pdfUrl) {
       throw new Error('Invoice PDF generation completed without a downloadable PDF');
     }
