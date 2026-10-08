@@ -11,6 +11,9 @@ import orderSnapshotService, {
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
+import invoiceNotificationPublisher, {
+  type InvoiceNotificationType,
+} from '@/rabbitmq/publishers/invoice-notification.publisher';
 import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-policy';
 import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
 import logger from '@/utils/logger';
@@ -538,7 +541,7 @@ export class InvoiceService {
       for (const invoice of collectable) {
         const marked = await invoiceRepository.markCollected(invoice.id, payload.transactionId);
         if (marked) {
-          void this.generatePdfAsync(marked.id, marked, { force: true });
+          void this.generatePdfAndPublishNotification(marked.id, marked, 'invoice.paid', { force: true });
         }
       }
 
@@ -1133,7 +1136,7 @@ export class InvoiceService {
       });
 
       invoices.push(invoice);
-      void this.generatePdfAsync(invoice.id, invoice);
+      void this.generatePdfAndPublishNotification(invoice.id, invoice, 'invoice.generated');
     }
 
     return invoices.length === 1 ? invoices[0] : invoices;
@@ -1509,6 +1512,42 @@ export class InvoiceService {
       }
       return false;
     }
+  }
+
+  private async generatePdfAndPublishNotification(
+    invoiceId: string,
+    invoice: Parameters<InvoiceService['generatePdfAsync']>[1],
+    eventType: InvoiceNotificationType,
+    options: { force?: boolean } = {},
+  ): Promise<void> {
+    try {
+      if (!(await this.generatePdfAsync(invoiceId, invoice, options))) return;
+      const persistedInvoice = await invoiceRepository.findById(invoiceId);
+      if (!persistedInvoice?.pdfUrl || persistedInvoice.pdfStatus !== 'READY') return;
+      await invoiceNotificationPublisher.publish(eventType, persistedInvoice);
+    } catch (error) {
+      logger.error(`Failed to publish ${eventType} notification for invoice ${invoiceId}`, error as Error);
+    }
+  }
+
+  async downloadInvoicePdfForNotification(invoiceId: string, pdfUrl: string) {
+    const invoice = await invoiceRepository.findById(invoiceId);
+    if (!invoice || !invoice.pdfUrl || invoice.pdfStatus !== 'READY') return null;
+
+    const prefix = `invoice-pdfs/${invoice.shopId}/react-print-v15/${invoice.invoiceNumber}-`;
+    if (
+      !pdfUrl.startsWith(prefix)
+      || !/^\d+-[a-z0-9]+\.pdf$/i.test(pdfUrl.slice(prefix.length))
+      || pdfUrl.includes('..')
+      || pdfUrl.includes('\\')
+    ) {
+      throw new ForbiddenError('Invoice PDF reference is invalid');
+    }
+
+    return {
+      invoice,
+      buffer: await storageService.downloadPdf(pdfUrl),
+    };
   }
 
   private normalizeLineItems(value: unknown): InvoiceLineItem[] {

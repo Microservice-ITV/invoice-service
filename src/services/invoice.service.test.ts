@@ -37,6 +37,159 @@ import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-sna
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
+import invoiceNotificationPublisher, {
+  buildInvoiceNotificationEvent,
+} from '@/rabbitmq/publishers/invoice-notification.publisher';
+
+test('notification PDF retrieval returns the exact stored invoice PDF and rejects unrelated references', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalDownloadPdf = storageService.downloadPdf;
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf';
+  const downloaded: string[] = [];
+  const invoice = {
+    id: 'invoice-1',
+    invoiceNumber: 'DNI-INV-1',
+    shopId: 'shop-1',
+    pdfUrl,
+    pdfStatus: 'READY',
+  } as unknown as NonNullable<Awaited<ReturnType<typeof invoiceRepository.findById>>>;
+  invoiceRepository.findById = async () => invoice;
+  storageService.downloadPdf = async (reference) => {
+    downloaded.push(reference);
+    return Buffer.from('%PDF-stored-invoice');
+  };
+
+  try {
+    const service = new InvoiceService();
+    const result = await service.downloadInvoicePdfForNotification('invoice-1', pdfUrl);
+    assert.equal(result?.invoice.id, 'invoice-1');
+    assert.equal(result?.buffer.toString(), '%PDF-stored-invoice');
+    assert.deepEqual(downloaded, [pdfUrl]);
+    await assert.rejects(
+      service.downloadInvoicePdfForNotification('invoice-1', 'invoice-pdfs/other-shop/private.pdf'),
+      /Invoice PDF reference is invalid/,
+    );
+  } finally {
+    invoiceRepository.findById = originalFindById;
+    storageService.downloadPdf = originalDownloadPdf;
+  }
+});
+
+test('invoice notification events include the real payment status and use stable logical IDs', () => {
+  const invoice = {
+    id: 'invoice-1',
+    invoiceNumber: 'DNI-INV-1',
+    orderId: 'order-1',
+    shopId: 'shop-1',
+    shopName: 'Shop One',
+    customerId: 'customer-1',
+    customerName: 'Customer One',
+    customerEmail: 'customer@example.com',
+    createdAt: new Date('2026-10-08T10:00:00.000Z'),
+    paymentMethod: 'COD',
+    status: 'UNPAID',
+    currency: 'MMK',
+    lineItems: [{
+      name: 'Actual product',
+      sku: 'SKU-1',
+      quantity: 2,
+      unitPrice: '50.00',
+      total: '100.00',
+    }],
+    subtotal: { toString: () => '100.00' },
+    taxAmount: { toString: () => '0.00' },
+    deliveryFee: { toString: () => '5.00' },
+    discountAmount: { toString: () => '0.00' },
+    grandTotal: { toString: () => '105.00' },
+    pdfUrl: 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf',
+  };
+  const cod = buildInvoiceNotificationEvent('invoice.generated', invoice);
+  const paid = buildInvoiceNotificationEvent('invoice.paid', { ...invoice, status: 'PAID' });
+  const repeatedPaid = buildInvoiceNotificationEvent('invoice.paid', { ...invoice, status: 'PAID' });
+
+  assert.equal(cod.event_id, 'invoice:invoice-1:generated');
+  assert.equal(cod.data.payment_status, 'UNPAID');
+  assert.equal(cod.data.payment_method, 'COD');
+  assert.equal(cod.data.customer_email, 'customer@example.com');
+  assert.equal(cod.data.items instanceof Array, true);
+  assert.equal(paid.data.payment_status, 'PAID');
+  assert.equal(paid.event_id, repeatedPaid.event_id);
+  assert.notEqual(cod.event_id, paid.event_id);
+});
+
+test('invoice notification waits for the stored PDF and publishing failure does not reject invoice work', async () => {
+  const originalClaimPdf = invoiceRepository.claimPdfGeneration;
+  const originalMarkPdfReady = invoiceRepository.markPdfReady;
+  const originalFindById = invoiceRepository.findById;
+  const originalBuildPdf = pdfGeneratorService.buildAndUploadInvoicePdf;
+  const originalPublish = invoiceNotificationPublisher.publish;
+  const events: string[] = [];
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf';
+  const invoice = {
+    id: 'invoice-1',
+    invoiceNumber: 'DNI-INV-1',
+    orderId: 'order-1',
+    shopId: 'shop-1',
+    shopName: 'Shop One',
+    customerId: 'customer-1',
+    customerName: 'Customer One',
+    customerEmail: 'customer@example.com',
+    subtotal: '100.00',
+    taxAmount: '0.00',
+    deliveryFee: '5.00',
+    discountAmount: '0.00',
+    grandTotal: '105.00',
+    currency: 'MMK',
+    paymentMethod: 'COD',
+    status: 'UNPAID',
+    createdAt: new Date('2026-10-08T10:00:00.000Z'),
+    lineItems: [{ name: 'Actual product', sku: 'SKU-1', quantity: 1, unitPrice: '100.00', total: '100.00' }],
+  };
+  const persistedInvoice = {
+    ...invoice,
+    pdfUrl,
+    pdfStatus: 'READY',
+  } as unknown as NonNullable<Awaited<ReturnType<typeof invoiceRepository.findById>>>;
+  invoiceRepository.claimPdfGeneration = async () => true;
+  invoiceRepository.markPdfReady = async () => persistedInvoice;
+  invoiceRepository.findById = async () => persistedInvoice;
+  pdfGeneratorService.buildAndUploadInvoicePdf = async () => pdfUrl;
+  invoiceNotificationPublisher.publish = async (eventType, sentInvoice) => {
+    assert.equal(sentInvoice.pdfUrl, pdfUrl);
+    events.push(eventType);
+    if (eventType === 'invoice.generated') throw new Error('broker unavailable');
+  };
+  const privateService = new InvoiceService() as unknown as {
+    generatePdfAndPublishNotification: (
+      id: string,
+      invoiceRecord: typeof invoice,
+      eventType: 'invoice.generated' | 'invoice.paid',
+      options?: { force?: boolean },
+    ) => Promise<void>;
+  };
+
+  try {
+    await assert.doesNotReject(privateService.generatePdfAndPublishNotification(
+      invoice.id,
+      invoice,
+      'invoice.generated',
+    ));
+    assert.deepEqual(events, ['invoice.generated']);
+    await privateService.generatePdfAndPublishNotification(
+      invoice.id,
+      invoice,
+      'invoice.paid',
+      { force: true },
+    );
+    assert.deepEqual(events, ['invoice.generated', 'invoice.paid']);
+  } finally {
+    invoiceRepository.claimPdfGeneration = originalClaimPdf;
+    invoiceRepository.markPdfReady = originalMarkPdfReady;
+    invoiceRepository.findById = originalFindById;
+    pdfGeneratorService.buildAndUploadInvoicePdf = originalBuildPdf;
+    invoiceNotificationPublisher.publish = originalPublish;
+  }
+});
 
 const makeOrderSnapshot = (currency: string): OrderInvoiceSnapshot => ({
   orderId: 'order-1',
@@ -340,6 +493,54 @@ test('COD collection updates the existing unpaid invoice instead of creating ano
     assert.equal((result as { id: string }).id, 'invoice-cod');
   } finally {
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+    invoiceRepository.findAllByOrderId = originalFindAll;
+    invoiceRepository.markCollected = originalMarkCollected;
+  }
+});
+
+test('duplicate COD collection events publish only one paid invoice notification', async () => {
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  const originalMarkCollected = invoiceRepository.markCollected;
+  let status: 'UNPAID' | 'PAID' = 'UNPAID';
+  let paymentGatewayRef: string | null = null;
+  const notificationTypes: string[] = [];
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'invoice-cod',
+    paymentMethod: 'COD',
+    paymentGatewayRef,
+    status,
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+  invoiceRepository.markCollected = async (id, reference) => {
+    status = 'PAID';
+    paymentGatewayRef = reference;
+    return { id, status, paymentGatewayRef: reference } as Awaited<ReturnType<typeof originalMarkCollected>>;
+  };
+
+  const service = new InvoiceService();
+  Object.defineProperty(service, 'generatePdfAndPublishNotification', {
+    value: async (_id: string, _invoice: unknown, eventType: string) => {
+      notificationTypes.push(eventType);
+    },
+  });
+  const collectedPayment = {
+    ...makePaymentPayload('MMK'),
+    transactionId: 'payment-1',
+    paymentStatus: 'COLLECTED' as const,
+    paymentMethod: 'COD',
+  };
+
+  try {
+    await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'COD',
+    }, async () => {
+      await service.createInvoiceFromPayment(collectedPayment);
+      await service.createInvoiceFromPayment(collectedPayment);
+    });
+    assert.deepEqual(notificationTypes, ['invoice.paid']);
+    assert.equal(status, 'PAID');
+  } finally {
     invoiceRepository.findAllByOrderId = originalFindAll;
     invoiceRepository.markCollected = originalMarkCollected;
   }

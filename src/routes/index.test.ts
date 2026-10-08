@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import router from './index';
 import env from '@/config/env';
 import { auth } from '@/middleware/auth';
+import { serviceAuth } from '@/middleware/serviceAuth';
 
 env.JWT_SECRET = env.JWT_SECRET ?? 'invoice-service-test-jwt-secret';
 
@@ -87,6 +88,23 @@ test('missing invoice discovery and replay routes are restricted to authenticate
     assert.equal(route.route?.stack?.[0].handle, auth);
     assert.equal(route.route?.stack?.length, 3);
   }
+});
+
+test('internal invoice PDF email route requires the invoice service key', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{
+      route?: {
+        path?: string;
+        methods?: Record<string, boolean>;
+        stack?: Array<{ handle: unknown }>;
+      };
+    }>;
+  }).stack ?? [];
+  const route = stack.find((layer) => layer.route?.path === '/internal/invoices/:id/email-pdf');
+
+  assert.ok(route);
+  assert.equal(route.route?.methods?.get, true);
+  assert.equal(route.route?.stack?.[0].handle, serviceAuth);
 });
 
 test('customer requests with a shop id stay customer scoped', async () => {

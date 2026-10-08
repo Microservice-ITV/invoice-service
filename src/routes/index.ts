@@ -74,6 +74,11 @@ router.get(
   invoiceController.getInvoiceForPrint.bind(invoiceController),
 );
 
+router.get(
+  '/internal/invoices/:id/email-pdf',
+  serviceAuth,
+  invoiceController.downloadInvoicePdfForNotification.bind(invoiceController),
+);
 router.get('/invoices/:id/pdf', auth, invoiceController.downloadInvoicePdf.bind(invoiceController));
 router.get('/invoices/:id', auth, invoiceController.getInvoice.bind(invoiceController));
 router.post(

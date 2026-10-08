@@ -265,10 +265,32 @@ export class InvoiceController {
         res.status(401).json({ success: false, message: 'Authentication required' });
         return;
       }
-
       const result = await invoiceService.downloadInvoicePdf(req.params.id, req.user);
       if (!result) {
         res.status(404).json({ success: false, message: 'Invoice PDF not found' });
+        return;
+      }
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}.pdf"`);
+      res.send(result.buffer);
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to download invoice PDF'));
+    }
+  }
+
+  async downloadInvoicePdfForNotification(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const pdfUrl = req.query.pdfUrl;
+      if (typeof pdfUrl !== 'string' || !pdfUrl.trim()) {
+        res.status(400).json({ success: false, message: 'pdfUrl is required' });
+        return;
+      }
+
+      const result = await invoiceService.downloadInvoicePdfForNotification(req.params.id, pdfUrl);
+      if (!result) {
+        res.status(404).json({ success: false, message: 'Invoice PDF is not ready' });
         return;
       }
 
