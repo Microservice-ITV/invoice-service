@@ -454,6 +454,46 @@ test('COD invoices are created unpaid as soon as the order is placed', async () 
   }
 });
 
+test('guest invoices persist customer details from the order snapshot when email is absent', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  let createData: Parameters<typeof originalCreate>[0] | undefined;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => {
+    createData = data;
+    return { id: 'guest-invoice', status: data.status } as Awaited<ReturnType<typeof originalCreate>>;
+  };
+
+  try {
+    await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      customerId: 'guest-12345678-1234-1234-1234-123456789abc',
+      customerName: 'Guest Customer',
+      customerEmail: null,
+      customerPhone: null,
+      shippingAddress: {
+        full_name: 'Guest Customer',
+        phone_no: '+959123456789',
+        city: 'Yangon',
+        address_line_1: '12 Example Street',
+      },
+    }, async () => {
+      await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('MMK'));
+    });
+
+    assert.equal(createData?.customerId, 'guest-12345678-1234-1234-1234-123456789abc');
+    assert.equal(createData?.customerName, 'Guest Customer');
+    assert.equal(createData?.customerEmail, null);
+    assert.equal(createData?.customerPhone, '+959123456789');
+    assert.deepEqual(createData?.shippingAddress, {
+      full_name: 'Guest Customer',
+      phone_no: '+959123456789',
+      city: 'Yangon',
+      address_line_1: '12 Example Street',
+    });
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
 test('COD collection updates the existing unpaid invoice instead of creating another', async () => {
   const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
   const originalFindAll = invoiceRepository.findAllByOrderId;
@@ -826,6 +866,41 @@ test('repeated paid events use one stable idempotency key and return one invoice
     assert.equal(storedGatewayReference, 'transaction-1');
   } finally {
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('guest invoice lookup requires the order phone and returns only matching invoices', async () => {
+  const originalFindAllByOrderId = invoiceRepository.findAllByOrderId;
+  const originalFindDocumentById = invoiceRepository.findDocumentById;
+  const invoice = {
+    id: 'guest-invoice',
+    invoiceNumber: 'INV-GUEST',
+    orderId: 'guest-order',
+    customerPhone: '+959123456789',
+    lineItems: [],
+    items: [],
+  };
+  invoiceRepository.findAllByOrderId = async () => [
+    invoice,
+    { ...invoice, id: 'other-invoice', invoiceNumber: 'INV-OTHER', customerPhone: '+959987654321' },
+  ] as unknown as Awaited<ReturnType<typeof originalFindAllByOrderId>>;
+  invoiceRepository.findDocumentById = async (id) => (
+    id === invoice.id ? invoice : null
+  ) as Awaited<ReturnType<typeof originalFindDocumentById>>;
+
+  try {
+    const results = await new InvoiceService().getGuestInvoicesByOrder(
+      ' guest-order ',
+      '+95 9 123 456 789',
+    );
+    assert.deepEqual(results.map((result) => result.invoiceNumber), ['INV-GUEST']);
+    await assert.rejects(
+      new InvoiceService().getGuestInvoicesByOrder('guest-order', ''),
+      /Order ID and phone number are required/,
+    );
+  } finally {
+    invoiceRepository.findAllByOrderId = originalFindAllByOrderId;
+    invoiceRepository.findDocumentById = originalFindDocumentById;
   }
 });
 

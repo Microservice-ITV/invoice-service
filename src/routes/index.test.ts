@@ -18,6 +18,23 @@ test('invoice router includes generate-pdf route', () => {
   assert.equal(hasPdfRoute, true);
 });
 
+test('guest invoice lookup is reachable without a registered-user auth middleware', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{
+      route?: {
+        path?: string;
+        methods?: Record<string, boolean>;
+        stack?: Array<{ handle: unknown }>;
+      };
+    }>;
+  }).stack ?? [];
+  const route = stack.find((layer) => layer.route?.path === '/invoices/guest/order');
+
+  assert.ok(route);
+  assert.equal(route.route?.methods?.post, true);
+  assert.equal(route.route?.stack?.length, 1);
+});
+
 test('invoice replay route is restricted to authenticated admins', () => {
   type RouteTestRequest = { user?: { role?: 'admin' | 'customer' } };
   type RouteTestResponse = {

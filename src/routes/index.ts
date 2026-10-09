@@ -13,6 +13,10 @@ router.get('/health', (_req, res) => {
   });
 });
 
+router.post(
+  '/invoices/guest/order',
+  invoiceController.getGuestInvoicesByOrder.bind(invoiceController),
+);
 router.get(
   '/invoices/my-invoices',
   auth,

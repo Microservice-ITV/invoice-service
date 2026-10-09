@@ -112,10 +112,10 @@ export class InvoiceController {
   async createInvoice(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const payload = req.body as Parameters<typeof invoiceService.createInvoiceFromPayment>[0];
-      if (!payload.shopName?.trim() || !payload.customerName?.trim() || !payload.customerEmail?.trim()) {
+      if (!payload.shopName?.trim()) {
         res.status(400).json({
           success: false,
-          message: 'shopName, customerName, and customerEmail are required for invoice snapshots',
+          message: 'shopName is required for invoice snapshots',
         });
         return;
       }
@@ -124,6 +124,28 @@ export class InvoiceController {
       res.status(201).json({ success: true, data: invoice });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to create invoice'));
+    }
+  }
+
+  async getGuestInvoicesByOrder(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const orderId = req.body?.orderId;
+      const phone = req.body?.phone;
+      if (
+        typeof orderId !== 'string' || !orderId.trim() || orderId.length > 64
+        || typeof phone !== 'string' || !phone.trim() || phone.length > 64
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'A valid order ID and phone number are required',
+        });
+        return;
+      }
+
+      const invoices = await invoiceService.getGuestInvoicesByOrder(orderId, phone);
+      res.json({ success: true, data: invoices });
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('Failed to fetch guest invoices'));
     }
   }
 

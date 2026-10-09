@@ -142,6 +142,32 @@ export class ConflictError extends AppError {
 
 const normalizeString = (value?: string | null): string => String(value ?? '').trim();
 
+const normalizePhoneNumber = (value?: string | null): string =>
+  String(value ?? '').replace(/\D/g, '');
+
+const getAddressValue = (
+  address: InvoiceSnapshotAddress | null | undefined,
+  keys: string[],
+): string | null => {
+  for (const key of keys) {
+    const value = address?.[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+};
+
+const getSnapshotCustomerPhone = (snapshot: OrderInvoiceSnapshot): string | null =>
+  normalizeString(snapshot.customerPhone)
+  || getAddressValue(snapshot.shippingAddress, [
+    'phone_no',
+    'phone',
+    'phone_number',
+    'recipient_phone',
+  ])
+  || null;
+
 function toPrismaJsonValue(value: unknown): Prisma.InputJsonValue | null {
   if (value === null) return null;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
@@ -469,7 +495,7 @@ export class InvoiceService {
       customerId,
       customerName: normalizedRequest.customerName || null,
       customerEmail: normalizedRequest.customerEmail || null,
-      customerPhone: snapshot.customerPhone ?? null,
+      customerPhone: getSnapshotCustomerPhone(snapshot),
       billingAddress: toPrismaJsonAddress(snapshot.billingAddress),
       shippingAddress: toPrismaJsonAddress(snapshot.shippingAddress),
       shopContactName: shopSnapshot?.contactName ?? null,
@@ -1113,7 +1139,7 @@ export class InvoiceService {
         customerId: snapshot.customerId,
         customerName: displayData.customerName,
         customerEmail: displayData.customerEmail,
-        customerPhone: snapshot.customerPhone ?? null,
+        customerPhone: getSnapshotCustomerPhone(snapshot),
         billingAddress: toPrismaJsonAddress(snapshot.billingAddress),
         shippingAddress: toPrismaJsonAddress(snapshot.shippingAddress),
         shopContactName: shopSnapshot?.contactName ?? null,
@@ -1232,6 +1258,22 @@ export class InvoiceService {
 
   async getInvoicesByCustomer(customerId: string) {
     return invoiceRepository.listInvoices({ customerId });
+  }
+
+  async getGuestInvoicesByOrder(orderId: string, phone: string) {
+    const normalizedOrderId = normalizeString(orderId);
+    const normalizedPhone = normalizePhoneNumber(phone);
+    if (!normalizedOrderId || normalizedPhone.length < 8) {
+      throw new ValidationError('Order ID and phone number are required');
+    }
+
+    const invoices = await invoiceRepository.findAllByOrderId(normalizedOrderId);
+    const matchingInvoices = invoices.filter((invoice) =>
+      normalizePhoneNumber(invoice.customerPhone) === normalizedPhone,
+    );
+
+    return Promise.all(matchingInvoices.map((invoice) => this.getInvoiceById(invoice.id)))
+      .then((documents) => documents.filter((invoice) => invoice !== null));
   }
 
   async getInvoicesByShop(shopId: string, status?: InvoiceStatus) {
