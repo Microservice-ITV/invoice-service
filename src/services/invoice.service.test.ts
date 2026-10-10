@@ -904,6 +904,47 @@ test('guest invoice lookup requires the order phone and returns only matching in
   }
 });
 
+test('guest invoice lookup resolves a checkout ID to its order ID', async () => {
+  const originalFindAllByOrderId = invoiceRepository.findAllByOrderId;
+  const originalFindDocumentById = invoiceRepository.findDocumentById;
+  const originalGetInvoiceSnapshotByCheckoutId = orderSnapshotService.getInvoiceSnapshotByCheckoutId;
+  const invoice = {
+    id: 'guest-invoice',
+    invoiceNumber: 'INV-GUEST',
+    orderId: 'actual-order-id',
+    customerPhone: '+959123456789',
+    lineItems: [],
+    items: [],
+  };
+  const queriedOrderIds: string[] = [];
+  invoiceRepository.findAllByOrderId = async (orderId) => {
+    queriedOrderIds.push(orderId);
+    return [invoice] as unknown as Awaited<ReturnType<typeof originalFindAllByOrderId>>;
+  };
+  invoiceRepository.findDocumentById = async () => (
+    invoice as unknown as Awaited<ReturnType<typeof originalFindDocumentById>>
+  );
+  orderSnapshotService.getInvoiceSnapshotByCheckoutId = async (checkoutId) => ({
+    ...makeOrderSnapshot('MMK'),
+    orderId: 'actual-order-id',
+    checkoutId,
+  });
+
+  try {
+    const results = await new InvoiceService().getGuestInvoicesByCheckout(
+      'guest-checkout-id',
+      '+95 9 123 456 789',
+    );
+
+    assert.deepEqual(results.map((result) => result.invoiceNumber), ['INV-GUEST']);
+    assert.deepEqual(queriedOrderIds, ['actual-order-id']);
+  } finally {
+    invoiceRepository.findAllByOrderId = originalFindAllByOrderId;
+    invoiceRepository.findDocumentById = originalFindDocumentById;
+    orderSnapshotService.getInvoiceSnapshotByCheckoutId = originalGetInvoiceSnapshotByCheckoutId;
+  }
+});
+
 test('invoice replay skips orders that already have an invoice without fetching a snapshot', async () => {
   const originalFindByOrderId = invoiceRepository.findByOrderId;
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;

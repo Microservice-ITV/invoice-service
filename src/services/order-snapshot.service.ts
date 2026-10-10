@@ -84,6 +84,19 @@ class OrderSnapshotService {
   async getInvoiceSnapshot(orderId: string): Promise<OrderInvoiceSnapshot> {
     const baseUrl = env.ORDER_SERVICE_URL.replace(/\/+$/, '');
     const url = `${baseUrl}/api/internal/orders/${encodeURIComponent(orderId)}/invoice-snapshot`;
+    return this.fetchInvoiceSnapshot(url, (snapshot) => snapshot.orderId === orderId);
+  }
+
+  async getInvoiceSnapshotByCheckoutId(checkoutId: string): Promise<OrderInvoiceSnapshot> {
+    const baseUrl = env.ORDER_SERVICE_URL.replace(/\/+$/, '');
+    const url = `${baseUrl}/api/internal/orders/checkouts/${encodeURIComponent(checkoutId)}/invoice-snapshot`;
+    return this.fetchInvoiceSnapshot(url, (snapshot) => snapshot.checkoutId === checkoutId);
+  }
+
+  private async fetchInvoiceSnapshot(
+    url: string,
+    matchesIdentifier: (snapshot: Partial<OrderInvoiceSnapshot>) => boolean,
+  ): Promise<OrderInvoiceSnapshot> {
     let response: Response;
     try {
       response = await fetch(url, {
@@ -104,7 +117,9 @@ class OrderSnapshotService {
 
     const snapshot = (await response.json()) as Partial<OrderInvoiceSnapshot>;
     if (
-      snapshot.orderId !== orderId
+      !matchesIdentifier(snapshot)
+      || typeof snapshot.orderId !== 'string'
+      || !snapshot.orderId.trim()
       || typeof snapshot.checkoutId !== 'string'
       || typeof snapshot.customerId !== 'string' || !snapshot.customerId.trim()
       || !Array.isArray(snapshot.items)
