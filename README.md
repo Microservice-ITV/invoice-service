@@ -80,9 +80,10 @@ Cross-service facts verified in the neighbouring repositories:
 * `payment-service` publishes `payment.completed` to exchange `order_events`
   (`payment-service/src/rabbitmq/publishers/payment.publisher.ts`, `RABBITMQ_EXCHANGE=order_events`).
 * `order-service` (Laravel) publishes `order.paid` (`src/app/Enums/EventTopic.php:22`) and exposes
-  `GET /api/internal/orders/{orderId}/invoice-snapshot`
-  (`order-service/src/routes/api.php:20`, `InvoiceSnapshotController`) — the endpoint this service
-  calls through `ORDER_SERVICE_URL`.
+  `GET /api/internal/orders/{orderId}/invoice-snapshot` and
+  `GET /api/internal/orders/checkouts/{checkoutId}/invoice-snapshot`
+  (`order-service/src/routes/api.php`, `InvoiceSnapshotController`) — the order-ID endpoint feeds
+  invoice creation, and the checkout-ID endpoint resolves guest checkout lookups to their order.
 * `auth-service` (Laravel) exposes `GET /api/v1/me/access-context` (`src/routes/api.php:72`) and
   `GET /api/v1/internal/shops/{shopId}` behind the `X-Internal-Service-Key` header
   (`ValidateInternalServiceKey`).
@@ -1038,7 +1039,7 @@ Note: objects live under the bucket root with an `invoices/` prefix added by `up
 
 | Caller code | Direction | Endpoint | Auth | Timeout | Failure behaviour |
 | --- | --- | --- | --- | --- | --- |
-| `src/services/order-snapshot.service.ts` | out | `GET {ORDER_SERVICE_URL}/api/internal/orders/{orderId}/invoice-snapshot` | `x-service-key: ORDER_SERVICE_API_KEY` | none set (relies on Node defaults) | non-2xx → `OrderSnapshotError` (statusCode **502**); invalid body → `502`; on the event path this discards the message |
+| `src/services/order-snapshot.service.ts` | out | `GET {ORDER_SERVICE_URL}/api/internal/orders/{orderId}/invoice-snapshot`; `GET {ORDER_SERVICE_URL}/api/internal/orders/checkouts/{checkoutId}/invoice-snapshot` | `x-service-key: ORDER_SERVICE_API_KEY` | none set (relies on Node defaults) | non-2xx → `OrderSnapshotError` (statusCode **502**); invalid body → `502`; on the event path this discards the message |
 | `src/middleware/auth.ts` | out | `GET {AUTH_SERVICE_URL}/api/v1/me/access-context` | `Authorization: Bearer <user token>` | 3 s (`AbortSignal.timeout`) | throws → `401 Invalid authentication token` |
 | `src/services/shop-lookup.service.ts` | out | 1) `GET {AUTH_SERVICE_URL}/api/v1/internal/shops/{shopId}` with `X-Internal-Service-Key: AUTH_SERVICE_INTERNAL_KEY`; 2) `GET {PRODUCT_SERVICE_URL}/shops/{shopId}` | 1) internal service key 2) none | 3 s per attempt | both lookups are best-effort: non-2xx or thrown errors are skipped and the next lookup is tried; final result `null` |
 | `order-service` (Laravel) | in | its `InvoiceSnapshotService` returns `orderId, checkoutId, customerId, items[orderItemId, productId, productName, productSku, quantity, unitPrice, lineTotal, shopId], currency, subtotal, deliveryFee, promotionDiscountTotal, grandTotal` | verifies `x-service-key` against its `WALLET_SERVICE_API_KEY` (`VerifyWalletInternalKey`) | – | `404` when the order/checkout is missing |

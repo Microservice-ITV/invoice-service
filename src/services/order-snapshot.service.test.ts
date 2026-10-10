@@ -63,3 +63,32 @@ test('invoice snapshot errors omit internal 5xx response bodies', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('invoice snapshots can be resolved by checkout ID', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = '';
+  globalThis.fetch = async (input) => {
+    requestedUrl = String(input);
+    return makeResponse(200, {
+      orderId: 'actual-order-id',
+      checkoutId: 'guest-checkout-id',
+      customerId: 'guest-customer-id',
+      items: [],
+      currency: 'MMK',
+      subtotal: '0.00',
+      deliveryFee: '0.00',
+      promotionDiscountTotal: '0.00',
+      grandTotal: '0.00',
+    });
+  };
+
+  try {
+    const snapshot = await orderSnapshotService.getInvoiceSnapshotByCheckoutId('guest-checkout-id');
+
+    assert.equal(snapshot.orderId, 'actual-order-id');
+    assert.equal(snapshot.checkoutId, 'guest-checkout-id');
+    assert.match(requestedUrl, /\/internal\/orders\/checkouts\/guest-checkout-id\/invoice-snapshot$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -130,19 +130,23 @@ export class InvoiceController {
   async getGuestInvoicesByOrder(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const orderId = req.body?.orderId;
+      const checkoutId = req.body?.checkoutId;
       const phone = req.body?.phone;
+      const lookupId = typeof checkoutId === 'string' ? checkoutId : orderId;
       if (
-        typeof orderId !== 'string' || !orderId.trim() || orderId.length > 64
+        typeof lookupId !== 'string' || !lookupId.trim() || lookupId.length > 64
         || typeof phone !== 'string' || !phone.trim() || phone.length > 64
       ) {
         res.status(400).json({
           success: false,
-          message: 'A valid order ID and phone number are required',
+          message: 'A valid order or checkout ID and phone number are required',
         });
         return;
       }
 
-      const invoices = await invoiceService.getGuestInvoicesByOrder(orderId, phone);
+      const invoices = typeof checkoutId === 'string'
+        ? await invoiceService.getGuestInvoicesByCheckout(checkoutId, phone)
+        : await invoiceService.getGuestInvoicesByOrder(lookupId, phone);
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch guest invoices'));

@@ -1267,7 +1267,22 @@ export class InvoiceService {
       throw new ValidationError('Order ID and phone number are required');
     }
 
-    const invoices = await invoiceRepository.findAllByOrderId(normalizedOrderId);
+    return this.getGuestInvoicesForOrder(normalizedOrderId, normalizedPhone);
+  }
+
+  async getGuestInvoicesByCheckout(checkoutId: string, phone: string) {
+    const normalizedCheckoutId = normalizeString(checkoutId);
+    const normalizedPhone = normalizePhoneNumber(phone);
+    if (!normalizedCheckoutId || normalizedPhone.length < 8) {
+      throw new ValidationError('Checkout ID and phone number are required');
+    }
+
+    const snapshot = await orderSnapshotService.getInvoiceSnapshotByCheckoutId(normalizedCheckoutId);
+    return this.getGuestInvoicesForOrder(snapshot.orderId, normalizedPhone);
+  }
+
+  private async getGuestInvoicesForOrder(orderId: string, normalizedPhone: string) {
+    const invoices = await invoiceRepository.findAllByOrderId(orderId);
     const matchingInvoices = invoices.filter((invoice) =>
       normalizePhoneNumber(invoice.customerPhone) === normalizedPhone,
     );
