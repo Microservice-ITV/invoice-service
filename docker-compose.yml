@@ -15,23 +15,9 @@ services:
       - invoice_mysql_data:/var/lib/mysql
     command: --default-authentication-plugin=mysql_native_password --collation-server=utf8mb4_unicode_ci
 
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    container_name: invoice-rabbitmq
-    restart: unless-stopped
-    ports:
-      - '5673:5672'
-      - '15675:15672'
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    networks:
-      - itv-network
+  # Shared broker: use orderservice-rabbitmq on itv-network.
+  # Do NOT declare a second service named "rabbitmq" here — that DNS alias
+  # collided with orderservice-rabbitmq and split checkout events across brokers.
 
   minio:
     # Image source is pinned because MinIO's own registries no longer serve the
@@ -78,8 +64,6 @@ services:
         condition: service_started
       minio:
         condition: service_started
-      rabbitmq:
-        condition: service_healthy
     env_file:
       - .env
     environment:
@@ -88,6 +72,8 @@ services:
       DATABASE_PORT: '3306'
       ORDER_SERVICE_URL: ${ORDER_SERVICE_URL}
       ORDER_SERVICE_API_KEY: ${ORDER_SERVICE_API_KEY}
+      # Shared order-service broker (hostname + container alias on itv-network).
+      RABBITMQ_URL: amqp://guest:guest@orderservice-rabbitmq:5672
       # Inside the compose network MinIO is reached by service name on its
       # internal port; PUBLIC_BASE_URL (host-published port 9010) still comes
       # from .env because it is what browsers/clients use to fetch objects.
@@ -106,7 +92,6 @@ services:
 volumes:
   invoice_mysql_data:
   minio_data:
-  rabbitmq_data:
 
 networks:
   itv-network:
