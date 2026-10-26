@@ -12,6 +12,8 @@ export interface PrintTokenClaims {
   invoiceNumber: string;
   role: string;
   shopId?: string;
+  document?: 'invoice' | 'receipt';
+  receiptId?: string;
 }
 
 /**
@@ -29,7 +31,7 @@ class InvoicePrintTokenService {
     }
 
     return jwt.sign(
-      { scope: 'invoice:print', ...claims },
+      { scope: 'invoice:print', document: 'invoice', ...claims },
       env.JWT_SECRET,
       { algorithm: 'HS256', expiresIn: PRINT_TOKEN_TTL_SECONDS },
     );

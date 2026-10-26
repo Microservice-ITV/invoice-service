@@ -18,6 +18,43 @@ test('invoice router includes generate-pdf route', () => {
   assert.equal(hasPdfRoute, true);
 });
 
+test('thermal invoice and receipt PDF routes are registered under the /api/v1 router with auth', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{ route?: { path?: string; methods?: Record<string, boolean>; stack?: Array<{ handle: unknown }> } }>;
+  }).stack ?? [];
+  for (const path of ['/invoices/:id/thermal-pdf', '/invoices/:id/receipt/pdf']) {
+    const route = stack.find((layer) => layer.route?.path === path);
+    assert.ok(route, `expected route ${path}`);
+    assert.equal(route.route?.methods?.get, true);
+    assert.equal(route.route?.stack?.[0].handle, auth);
+  }
+});
+
+test('token-authenticated React print data routes are registered for invoice and receipt rendering', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{ route?: { path?: string; methods?: Record<string, boolean>; stack?: Array<{ handle: unknown }> } }>;
+  }).stack ?? [];
+  for (const path of ['/invoices/print/:invoiceNumber', '/invoices/print/:invoiceNumber/receipt']) {
+    const route = stack.find((layer) => layer.route?.path === path);
+    assert.ok(route, `expected route ${path}`);
+    assert.equal(route.route?.methods?.get, true);
+    // These routes authenticate via a short-lived signed x-print-token in the controller.
+    assert.equal(route.route?.stack?.length, 1);
+  }
+});
+
+test('thermal invoice and receipt PDF routes are mounted under the invoice API with auth', () => {
+  const stack = (router as unknown as {
+    stack?: Array<{ route?: { path?: string; methods?: Record<string, boolean>; stack?: Array<{ handle: unknown }> } }>;
+  }).stack ?? [];
+  for (const path of ['/invoices/:id/thermal-pdf', '/invoices/:id/receipt/pdf']) {
+    const route = stack.find((layer) => layer.route?.path === path);
+    assert.ok(route, `expected registered route ${path}`);
+    assert.equal(route.route?.methods?.get, true);
+    assert.equal(route.route?.stack?.[0].handle, auth);
+  }
+});
+
 test('guest invoice lookup is reachable without a registered-user auth middleware', () => {
   const stack = (router as unknown as {
     stack?: Array<{

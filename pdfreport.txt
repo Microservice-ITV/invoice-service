@@ -2,13 +2,10 @@
 
 
 --- design markers ---
-FAIL  Computer-generated invoice (should be present)
-FAIL  Seller (should be present)
-FAIL  Buyer (should be present)
-FAIL  DNI-INV- (should be present)
-FAIL  Amount in words (should be present)
-PASS  Daily Need Items (should be absent)
-PASS  Grand total (should be absent)
-PASS  Billed to (should be absent)
+FAIL  Payment Receipt (should be present)
+FAIL  DailyNeedItems (should be present)
+FAIL  Total received (should be present)
+FAIL  RCP-TEST-001 (should be present)
+FAIL  18000.00 MMK (should be present)
 
 5 MARKER(S) FAILED

@@ -255,6 +255,10 @@ export class InvoiceController {
       const printToken = req.header('x-print-token') ?? undefined;
 
       const claims = invoicePrintTokenService.verify(printToken, invoiceNumber);
+      if (claims.document && claims.document !== 'invoice') {
+        res.status(403).json({ success: false, message: 'Print token is not scoped to an invoice document' });
+        return;
+      }
 
       // The token carries the invoice id, so no extra lookup by number is needed;
       // the number is still re-checked so a token cannot be replayed elsewhere.
@@ -304,6 +308,20 @@ export class InvoiceController {
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to download invoice PDF'));
     }
+  }
+
+  async downloadThermalInvoicePdf(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) { res.status(401).json({ success: false, message: 'Authentication required' }); return; }
+      const width = req.query.width === '80mm' ? '80mm' : req.query.width === '58mm' ? '58mm' : null;
+      if (!width) { res.status(400).json({ success: false, message: 'width must be 58mm or 80mm' }); return; }
+      const result = await invoiceService.downloadThermalInvoicePdf(req.params.id, req.user, width);
+      if (!result) { res.status(404).json({ success: false, message: 'Invoice PDF not found' }); return; }
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}-thermal-${width}.pdf"`);
+      res.send(result.buffer);
+    } catch (error) { next(error instanceof Error ? error : new Error('Failed to download thermal invoice PDF')); }
   }
 
   async downloadInvoicePdfForNotification(req: Request, res: Response, next: NextFunction): Promise<void> {

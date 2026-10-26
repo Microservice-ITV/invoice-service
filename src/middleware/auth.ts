@@ -146,11 +146,11 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
       || (req.method === 'POST' && requestPath.endsWith('/upload-slip'))
       || (
         req.method === 'GET'
-        && /\/invoices\/[^/]+\/pdf$/.test(requestPath)
+        && /\/invoices\/[^/]+(?:\/pdf|\/receipt(?:\/pdf)?)$/.test(requestPath)
         && normalizeRole(req.header('x-user-role')) === 'customer'
       );
     const isInvoiceReadRoute = req.method === 'GET'
-      && /\/invoices\/[^/]+(?:\/pdf)?$/.test(requestPath);
+      && /\/invoices\/[^/]+(?:\/pdf|\/receipt(?:\/pdf)?)?$/.test(requestPath);
 
     if (platformRole) {
       req.user = { id: claims.sub, customerId: claims.sub, role: platformRole, shopId: requestedShopId, token };

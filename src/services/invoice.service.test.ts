@@ -33,6 +33,7 @@ import {
 } from '@/services/invoice.service';
 import { InvoiceService } from '@/services/invoice.service';
 import invoiceRepository, { InvoiceRepository } from '@/repositories/invoice.repository';
+import receiptService from '@/services/receipt.service';
 import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
@@ -74,7 +75,6 @@ test('notification PDF retrieval returns the exact stored invoice PDF and reject
     storageService.downloadPdf = originalDownloadPdf;
   }
 });
-
 test('invoice notification events include the real payment status and use stable logical IDs', () => {
   const invoice = {
     id: 'invoice-1',
@@ -363,6 +363,38 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
   }
 });
 
+test('thermal invoice download passes the requested paper width to Puppeteer rendering', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalRender = pdfGeneratorService.renderThermalInvoicePdf;
+  const widths: string[] = [];
+  invoiceRepository.findById = async () => ({
+    id: 'invoice-1', invoiceNumber: 'INV-20261008-000001', orderReference: 'ORD-1', orderId: 'order-1',
+    shopId: 'shop-1', customerId: 'customer-1', shopName: 'Shop', shopContactName: null,
+    shopContactEmail: null, shopContactPhone: null, shopAddress: null, customerName: 'Customer',
+    customerEmail: null, customerPhone: null, billingAddress: null,
+    shippingAddress: { address_line_1: 'Real Street', city: 'Yangon' },
+    currency: 'MMK', subtotal: { toString: () => '10' }, taxAmount: { toString: () => '0' },
+    deliveryFee: { toString: () => '0' }, discountAmount: { toString: () => '0' },
+    grandTotal: { toString: () => '10' }, lineItems: [{ name: 'Product', quantity: 1, total: '10', unitPrice: '10' }],
+    paymentMethod: 'CASH', status: 'PAID', createdAt: new Date(),
+  } as never);
+  pdfGeneratorService.renderThermalInvoicePdf = async (_payload, width) => {
+    widths.push(width);
+    return Buffer.from('%PDF-thermal');
+  };
+  try {
+    const service = new InvoiceService();
+    for (const width of ['58mm', '80mm'] as const) {
+      const result = await service.downloadThermalInvoicePdf('invoice-1', { role: 'admin' }, width);
+      assert.equal(result?.buffer.toString(), '%PDF-thermal');
+    }
+    assert.deepEqual(widths, ['58mm', '80mm']);
+  } finally {
+    invoiceRepository.findById = originalFindById;
+    pdfGeneratorService.renderThermalInvoicePdf = originalRender;
+  }
+});
+
 const withSnapshotDependencies = async <T>(
   snapshot: OrderInvoiceSnapshot,
   run: () => Promise<T>,
@@ -370,6 +402,8 @@ const withSnapshotDependencies = async <T>(
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
   const originalGetShopInvoiceSnapshot = shopLookupService.getShopInvoiceSnapshot;
   const originalClaimPdfGeneration = invoiceRepository.claimPdfGeneration;
+  const originalIssueReceipt = receiptService.issueForInvoice;
+  const originalUpdateReceiptStatus = receiptService.updateReceiptStatus;
   orderSnapshotService.getInvoiceSnapshot = async () => snapshot;
   shopLookupService.getShopInvoiceSnapshot = async () => ({
     name: 'Shop One',
@@ -379,6 +413,10 @@ const withSnapshotDependencies = async <T>(
     address: 'Shop address',
   });
   invoiceRepository.claimPdfGeneration = async () => false;
+  // Receipt issuance writes to the database; tests exercise receipt behavior
+  // in receipt.service.test.ts, so here it defaults to a no-op.
+  receiptService.issueForInvoice = async () => null;
+  receiptService.updateReceiptStatus = async () => null;
 
   try {
     return await run();
@@ -386,6 +424,8 @@ const withSnapshotDependencies = async <T>(
     orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
     shopLookupService.getShopInvoiceSnapshot = originalGetShopInvoiceSnapshot;
     invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
+    receiptService.issueForInvoice = originalIssueReceipt;
+    receiptService.updateReceiptStatus = originalUpdateReceiptStatus;
   }
 };
 
@@ -1479,4 +1519,202 @@ test('populateMissingInvoiceShopNames fills legacy invoices and preserves saved 
     'Outlet Store',
     'Saved Store Name',
   ]);
+});
+
+// --- Receipt issuance on legitimate PAID transitions -------------------------
+// `withSnapshotDependencies` stubs receipt issuance as a no-op before invoking
+// `run()`, so these tests install their recorder inside `run()`. The helper's
+// `finally` then restores the real method automatically.
+
+const installReceiptRecorder = (): Array<{ id: string; status?: string }> => {
+  const calls: Array<{ id: string; status?: string }> = [];
+  receiptService.issueForInvoice = async (invoice) => {
+    calls.push({ id: invoice.id, status: invoice.status });
+    return null;
+  };
+  return calls;
+};
+
+test('online payment invoice creation from order.paid issues a receipt for the PAID invoice', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => ({
+    id: 'invoice-paid',
+    status: data.status,
+  }) as Awaited<ReturnType<typeof originalCreate>>;
+
+  try {
+    await withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+      const calls = installReceiptRecorder();
+      await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('MMK'));
+      assert.deepEqual(calls, [{ id: 'invoice-paid', status: 'PAID' }]);
+    });
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('COD invoice creation alone issues no receipt', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => ({
+    id: 'invoice-cod',
+    status: data.status,
+  }) as Awaited<ReturnType<typeof originalCreate>>;
+
+  try {
+    await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'cod',
+    }, async () => {
+      const calls = installReceiptRecorder();
+      await new InvoiceService().createInvoiceFromPayment({
+        ...makePaymentPayload('MMK'),
+        paymentStatus: 'UNPAID',
+        paymentMethod: 'COD',
+      });
+      assert.deepEqual(calls, [], 'COD invoice creation must not issue a receipt');
+    });
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
+});
+
+test('COD collection (payment.collected) issues a receipt on the collected invoice', async () => {
+  const originalFindAll = invoiceRepository.findAllByOrderId;
+  const originalMarkCollected = invoiceRepository.markCollected;
+  let collected = false;
+  invoiceRepository.findAllByOrderId = async () => [{
+    id: 'invoice-cod',
+    paymentMethod: 'COD',
+    paymentGatewayRef: collected ? 'payment-1' : null,
+    status: collected ? 'PAID' : 'UNPAID',
+  }] as Awaited<ReturnType<typeof originalFindAll>>;
+  invoiceRepository.markCollected = async (id, paymentGatewayRef) => {
+    collected = true;
+    return { id, status: 'PAID', paymentGatewayRef } as Awaited<ReturnType<typeof originalMarkCollected>>;
+  };
+
+  try {
+    await withSnapshotDependencies({
+      ...makeOrderSnapshot('MMK'),
+      paymentStatus: 'COD',
+      paymentMethod: 'COD',
+    }, async () => {
+      const calls = installReceiptRecorder();
+      await new InvoiceService().createInvoiceFromPayment({
+        ...makePaymentPayload('MMK'),
+        transactionId: 'payment-1',
+        paymentStatus: 'COLLECTED',
+        paymentMethod: 'COD',
+      });
+      assert.ok(calls.length >= 1, 'COD collection must issue a receipt');
+      assert.ok(
+        calls.every((call) => call.id === 'invoice-cod' && call.status === 'PAID'),
+        'every issuance targets the collected PAID invoice (repository dedupes to one receipt)',
+      );
+    });
+  } finally {
+    invoiceRepository.findAllByOrderId = originalFindAll;
+    invoiceRepository.markCollected = originalMarkCollected;
+  }
+});
+
+test('approved slip verification issues a receipt; rejection does not', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalTransition = invoiceRepository.transitionVerification;
+  const originalIssue = receiptService.issueForInvoice;
+  const service = new InvoiceService();
+  Object.defineProperty(service, 'generatePdfAsync', { value: async () => false });
+  const calls: Array<{ id: string; status?: string }> = [];
+  receiptService.issueForInvoice = async (invoice) => {
+    calls.push({ id: invoice.id, status: invoice.status });
+    return null;
+  };
+
+  try {
+    // Approved: PENDING_VERIFICATION → PAID.
+    invoiceRepository.findById = async () => ({
+      id: 'invoice-slip',
+      status: 'PENDING_VERIFICATION',
+      shopId: 'shop-1',
+    }) as Awaited<ReturnType<typeof originalFindById>>;
+    invoiceRepository.transitionVerification = async (id, approved) => ({
+      id,
+      status: approved ? 'PAID' : 'REJECTED',
+      shopId: 'shop-1',
+    }) as Awaited<ReturnType<typeof originalTransition>>;
+
+    await service.verifyInvoice('invoice-slip', true, 'admin-1');
+    assert.deepEqual(calls, [{ id: 'invoice-slip', status: 'PAID' }]);
+
+    // Rejected: no receipt issuance.
+    calls.length = 0;
+    await service.verifyInvoice('invoice-slip', false, 'admin-1', 'bad slip');
+    assert.deepEqual(calls, [], 'rejected verification must not issue a receipt');
+  } finally {
+    receiptService.issueForInvoice = originalIssue;
+    invoiceRepository.findById = originalFindById;
+    invoiceRepository.transitionVerification = originalTransition;
+  }
+});
+
+test('voiding and refunding an invoice updates the existing receipt status', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalUpdateStatus = invoiceRepository.updateStatus;
+  const originalUpdate = receiptService.updateReceiptStatus;
+  const updates: Array<{ invoiceId: string; status: string }> = [];
+  receiptService.updateReceiptStatus = async (invoiceId, status) => {
+    updates.push({ invoiceId, status });
+    return null;
+  };
+  const service = new InvoiceService();
+  Object.defineProperty(service, 'generatePdfAsync', { value: async () => false });
+
+  invoiceRepository.findById = async () => ({
+    id: 'invoice-1',
+    status: 'PAID',
+    grandTotal: new Prisma.Decimal('105.00'),
+  }) as Awaited<ReturnType<typeof originalFindById>>;
+  invoiceRepository.updateStatus = async (id, data) => ({
+    id,
+    status: data.status,
+    grandTotal: new Prisma.Decimal('105.00'),
+  }) as Awaited<ReturnType<typeof originalUpdateStatus>>;
+
+  try {
+    await service.voidInvoice('invoice-1', 'admin-1', 'cancelled by admin');
+    await service.refundInvoice('invoice-1', 'admin-1', '105.00', 'BANK_TRANSFER', 'customer request');
+    assert.deepEqual(updates, [
+      { invoiceId: 'invoice-1', status: 'VOID' },
+      { invoiceId: 'invoice-1', status: 'REFUNDED' },
+    ]);
+  } finally {
+    receiptService.updateReceiptStatus = originalUpdate;
+    invoiceRepository.findById = originalFindById;
+    invoiceRepository.updateStatus = originalUpdateStatus;
+  }
+});
+
+test('receipt issuance errors propagate instead of being silently swallowed', async () => {
+  const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
+  invoiceRepository.createPaidInvoiceFromPayment = async (data) => ({
+    id: 'invoice-paid',
+    status: data.status,
+  }) as Awaited<ReturnType<typeof originalCreate>>;
+
+  try {
+    await assert.rejects(
+      withSnapshotDependencies(makeOrderSnapshot('MMK'), async () => {
+        // Override the helper's no-op after it is installed, mirroring a
+        // repository failure inside the real issuance path.
+        receiptService.issueForInvoice = async () => {
+          throw new Error('receipt persistence failed');
+        };
+        await new InvoiceService().createInvoiceFromPayment(makePaymentPayload('MMK'));
+      }),
+      /receipt persistence failed/,
+    );
+  } finally {
+    invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
+  }
 });

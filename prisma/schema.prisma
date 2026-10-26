@@ -15,6 +15,12 @@ enum InvoiceStatus {
   REFUNDED
 }
 
+enum ReceiptStatus {
+  ISSUED
+  VOID
+  REFUNDED
+}
+
 model Invoice {
   id                 String        @id @default(uuid()) @db.Char(36)
   invoiceNumber      String        @unique @db.VarChar(50)
@@ -75,6 +81,7 @@ model Invoice {
   // New normalized invoice items
   items              InvoiceItem[]
   idempotency        InvoiceIdempotency?
+  receipt            Receipt?
 
   @@index([orderId])
   @@index([orderId, shopId])
@@ -175,4 +182,65 @@ model InvoiceOrderReference {
   createdAt      DateTime @default(now())
 
   @@map("invoice_order_references")
+}
+
+// One receipt per PAID invoice. Issued only after the invoice has actually
+// transitioned to PAID (never for UNPAID / PENDING_VERIFICATION / REJECTED /
+// VOID / REFUNDED). The UNIQUE constraint on invoiceId is the database-level
+// guard against duplicate issuance under concurrent events.
+model Receipt {
+  id                String        @id @default(uuid()) @db.Char(36)
+  receiptNumber     String        @unique @db.VarChar(50)
+
+  invoiceId         String        @unique @db.Char(36)
+  invoice           Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  invoiceNumber     String        @db.VarChar(50)
+
+  orderId           String        @db.Char(36)
+  orderReference    String?       @db.VarChar(32)
+
+  shopId            String        @db.Char(36)
+  shopName          String?       @db.VarChar(255)
+
+  customerId        String        @db.Char(36)
+  customerName      String?       @db.VarChar(255)
+  customerEmail     String?       @db.VarChar(255)
+
+  // Snapshot of the PAID invoice totals at issuance time.
+  subtotal          Decimal       @db.Decimal(12, 2)
+  deliveryFee       Decimal       @default(0) @db.Decimal(12, 2)
+  taxAmount         Decimal       @default(0) @db.Decimal(12, 2)
+  discountAmount    Decimal       @default(0) @db.Decimal(12, 2)
+  grandTotal        Decimal       @db.Decimal(12, 2)
+
+  currency          String        @default("MMK") @db.VarChar(10)
+  paymentMethod     String?       @db.VarChar(50)
+  paymentGatewayRef String?       @db.VarChar(255)
+
+  status            ReceiptStatus @default(ISSUED)
+
+  // Independent PDF lifecycle so a failed render can be retried without
+  // ever creating a second receipt row.
+  pdfUrl            String?       @db.VarChar(255)
+  pdfStatus         String        @default("PENDING") @db.VarChar(20)
+  pdfError          String?       @db.Text
+  pdfAttemptCount   Int           @default(0)
+  pdfUpdatedAt      DateTime?
+
+  issuedAt          DateTime      @default(now())
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([shopId, status])
+  @@map("receipts")
+}
+
+model ReceiptSequence {
+  date       String   @id @db.Char(8)
+  lastNumber Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("receipt_sequences")
 }

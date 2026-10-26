@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import invoiceController from '@/controllers/invoice.controller';
+import receiptController from '@/controllers/receipt.controller';
 import { auth, requireRoles } from '@/middleware/auth';
 import { serviceAuth } from '@/middleware/serviceAuth';
 
@@ -77,6 +78,10 @@ router.get(
   '/invoices/print/:invoiceNumber',
   invoiceController.getInvoiceForPrint.bind(invoiceController),
 );
+router.get(
+  '/invoices/print/:invoiceNumber/receipt',
+  receiptController.getReceiptForPrint.bind(receiptController),
+);
 
 router.get(
   '/internal/invoices/:id/email-pdf',
@@ -84,6 +89,19 @@ router.get(
   invoiceController.downloadInvoicePdfForNotification.bind(invoiceController),
 );
 router.get('/invoices/:id/pdf', auth, invoiceController.downloadInvoicePdf.bind(invoiceController));
+router.get('/invoices/:id/thermal-pdf', auth, invoiceController.downloadThermalInvoicePdf.bind(invoiceController));
+// Receipt endpoints: same auth + ownership model as the invoice document and
+// its PDF (admin / owning customer / owning shop via canAccessInvoice).
+router.get(
+  '/invoices/:id/receipt',
+  auth,
+  receiptController.getReceiptByInvoice.bind(receiptController),
+);
+router.get(
+  '/invoices/:id/receipt/pdf',
+  auth,
+  receiptController.downloadReceiptPdf.bind(receiptController),
+);
 router.get('/invoices/:id', auth, invoiceController.getInvoice.bind(invoiceController));
 router.post(
   '/invoices/:id/verify-slip',
