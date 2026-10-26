@@ -83,6 +83,7 @@ services:
     env_file:
       - .env
     environment:
+      PORT:  ${PORT}
       AUTO_MIGRATE: 'true'
       DATABASE_HOST: invoice-db
       DATABASE_PORT: '3306'

@@ -16,6 +16,7 @@ import invoiceNotificationPublisher, {
 } from '@/rabbitmq/publishers/invoice-notification.publisher';
 import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-policy';
 import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
+import receiptService from '@/services/receipt.service';
 import logger from '@/utils/logger';
 
 export class AppError extends Error {
@@ -567,6 +568,9 @@ export class InvoiceService {
       for (const invoice of collectable) {
         const marked = await invoiceRepository.markCollected(invoice.id, payload.transactionId);
         if (marked) {
+          // markCollected only returns a row when the UNPAID → PAID transition
+          // actually committed, so this is a confirmed PAID invoice.
+          await receiptService.issueForInvoice(marked);
           void this.generatePdfAndPublishNotification(marked.id, marked, 'invoice.paid', { force: true });
         }
       }
@@ -578,9 +582,15 @@ export class InvoiceService {
         && invoice.status === 'PAID'
       ));
       if (alreadyPaid.length === 1) {
+        // Idempotent heal: a duplicate `payment.collected` event re-enters here
+        // and can recover a receipt whose first issuance was lost.
+        await receiptService.issueForInvoice(alreadyPaid[0]);
         return alreadyPaid[0];
       }
       if (alreadyPaid.length > 1) {
+        for (const invoice of alreadyPaid) {
+          await receiptService.issueForInvoice(invoice);
+        }
         return alreadyPaid;
       }
 
@@ -1163,6 +1173,13 @@ export class InvoiceService {
 
       invoices.push(invoice);
       void this.generatePdfAndPublishNotification(invoice.id, invoice, 'invoice.generated');
+
+      if (invoice.status === 'PAID') {
+        // Receipt issuance is persisted before its PDF is attempted and errors
+        // propagate: a failed issuance nacks the event (existing consumer
+        // behavior) instead of silently dropping the receipt.
+        await receiptService.issueForInvoice(invoice);
+      }
     }
 
     return invoices.length === 1 ? invoices[0] : invoices;
@@ -1190,6 +1207,10 @@ export class InvoiceService {
         throw new ConflictError('Invoice has already been verified');
       }
 
+      if (updatedInvoice.status === 'PAID') {
+        // transitionVerification committed PENDING_VERIFICATION → PAID here.
+        await receiptService.issueForInvoice(updatedInvoice);
+      }
       void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
       return updatedInvoice;
     }
@@ -1219,6 +1240,9 @@ export class InvoiceService {
       verifiedAt: new Date(),
       rejectionReason: reason,
     });
+    // Update (never delete/create) the existing receipt to mirror the invoice
+    // transition; a missing receipt makes this a no-op.
+    await receiptService.updateReceiptStatus(id, 'VOID');
     void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
     return updatedInvoice;
   }
@@ -1252,6 +1276,9 @@ export class InvoiceService {
       refundMethod: method,
       refundReason: reason,
     });
+    // Mirror the refund on the existing receipt without deleting or
+    // reissuing it; no-op when no receipt exists.
+    await receiptService.updateReceiptStatus(id, 'REFUNDED');
     void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
     return updatedInvoice;
   }
@@ -1383,6 +1410,24 @@ export class InvoiceService {
       invoice,
       buffer: await storageService.downloadPdf(pdfUrl),
     };
+  }
+
+  async downloadThermalInvoicePdf(id: string, actor: InvoiceAccessActor, width: '58mm' | '80mm') {
+    const invoice = await invoiceRepository.findById(id);
+    if (!invoice || !canAccessInvoice(invoice, actor)) return null;
+    const buffer = await pdfGeneratorService.renderThermalInvoicePdf({
+      invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber, orderReference: invoice.orderReference ?? null,
+      orderId: invoice.orderId, shopId: invoice.shopId, customerId: invoice.customerId,
+      shopName: invoice.shopName, shopContactName: invoice.shopContactName, shopContactEmail: invoice.shopContactEmail,
+      shopContactPhone: invoice.shopContactPhone, shopAddress: invoice.shopAddress, customerName: invoice.customerName,
+      customerEmail: invoice.customerEmail, customerPhone: invoice.customerPhone,
+      billingAddress: normalizePdfAddress(invoice.billingAddress), shippingAddress: normalizePdfAddress(invoice.shippingAddress),
+      currency: invoice.currency, subtotal: invoice.subtotal.toString(), taxAmount: invoice.taxAmount.toString(),
+      deliveryFee: invoice.deliveryFee?.toString() ?? '0.00', discountAmount: invoice.discountAmount.toString(),
+      grandTotal: invoice.grandTotal.toString(), lineItems: this.normalizeLineItems(invoice.lineItems),
+      paymentMethod: invoice.paymentMethod, status: invoice.status, createdAt: invoice.createdAt,
+    }, width);
+    return { invoice, buffer };
   }
 
   async uploadPaymentSlip(id: string, customerId: string, paymentSlipDataUrl: string) {
