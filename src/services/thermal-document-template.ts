@@ -219,7 +219,8 @@ export const buildThermalInvoiceHtml = (invoice: ThermalInvoiceData, width: Ther
   const itemContent = items.length
     ? `<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Price</span></div>${itemRows(items, currency)}`
     : '<div class="muted">No line items</div>';
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${baseStyles(width)}</style></head><body>
+  const documentTitle = `Invoice ${clean(invoice.invoiceNumber) || clean(invoice.invoiceId)}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(documentTitle)}</title><style>${baseStyles(width)}</style></head><body>
     <article class="thermal-receipt" data-thermal-document="invoice">
       <header><div class="center">${brandHeader('Invoice')}</div><div class="metadata">${rows}</div></header>
       <div class="divider"></div>

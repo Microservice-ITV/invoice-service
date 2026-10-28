@@ -171,7 +171,10 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
         textOperatorCount: [...streamText.matchAll(/\b(?:Tj|TJ)\b/g)].length,
       };
     });
-    return { pageCount: pageDetails.length, pageDetails, diagnostics };
+    const title = [...objects.values()]
+      .map((body) => body.match(/\/Title\s+\(([^)]*)\)/)?.[1])
+      .find((value) => value !== undefined);
+    return { pageCount: pageDetails.length, pageDetails, diagnostics, title };
   };
 
   for (const width of ['58mm', '80mm'] as const) {
@@ -183,6 +186,7 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
     ] as const) {
       const result = await readPdf(html, width);
       assert.equal(result.pageCount, 1, `${kind} ${width} should fit on one content-sized page`);
+      if (kind === 'invoice') assert.equal(result.title, `Invoice ${invoice.invoiceNumber}`, 'generated PDF metadata title should use the invoice number instead of about:blank');
       assert.ok(result.pageDetails[0].textOperatorCount > 0, `${kind} ${width} page must contain printable text`);
       assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1, `${kind} should use ${width} paper width`);
       assert.ok(result.diagnostics.contentBounds.right <= Number.parseInt(width, 10) * 96 / 25.4 + 1, `${kind} ${width} content should stay inside the physical paper width`);
@@ -207,10 +211,11 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
 });
 
 test('thermal templates safely escape invoice and product text and include local assets only', () => {
-  const malicious = { ...invoicePayload, customerName: '<script>alert("x")</script>&', lineItems: [{
+  const malicious = { ...invoicePayload, invoiceNumber: 'INV-<script>&', customerName: '<script>alert("x")</script>&', lineItems: [{
     name: '<img src=x onerror=alert(1)>', quantity: 1, total: '12',
   }] };
   const html = buildThermalInvoiceHtml(malicious, '58mm');
+  assert.match(html, /<title>Invoice INV-&lt;script&gt;&amp;<\/title>/);
   assert.match(html, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;&amp;/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.doesNotMatch(html, /<script>alert|<img src=x/);

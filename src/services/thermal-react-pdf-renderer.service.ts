@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import pdfBrowserService from '@/services/pdf-browser.service';
 
 export type ThermalPaperWidth = '58mm' | '80mm';
-export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v9';
+export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v10';
 const THERMAL_PDF_CACHE_TTL_MS = 3 * 60 * 1000;
 const THERMAL_PDF_CACHE_MAX_ENTRIES = 40;
 export interface ThermalRenderDiagnostics {
