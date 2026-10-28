@@ -212,8 +212,9 @@ export class InvoiceController {
   async getShopInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const shopId = req.user?.shopId;
+      const shopIds = [...new Set(req.user?.shopIds ?? [])];
 
-      if (!shopId) {
+      if (shopIds.length === 0 && !shopId) {
         res.status(400).json({
           success: false,
           message: 'Shop context is required',
@@ -221,7 +222,9 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = await invoiceService.getInvoicesByShop(shopId);
+      const invoices = shopIds.length > 0
+        ? await invoiceService.getInvoicesByShops(shopIds)
+        : await invoiceService.getInvoicesByShop(shopId as string);
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch shop invoices'));

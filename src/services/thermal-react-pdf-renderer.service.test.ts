@@ -5,16 +5,16 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { inflateSync } from 'node:zlib';
 import env from '@/config/env';
-import invoicePrintTokenService from '@/services/invoice-print-token.service';
 import pdfGeneratorService, { InvoicePdfPayload } from '@/services/pdf-generator.service';
 import receiptPdfService, { ReceiptPdfPayload } from '@/services/receipt-pdf.service';
 import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.service';
 import { getThermalContentHeightPx, getThermalPdfOptions } from '@/services/thermal-react-pdf-renderer.service';
+import { buildThermalInvoiceHtml, buildThermalReceiptHtml } from '@/services/thermal-document-template';
 
 env.JWT_SECRET = env.JWT_SECRET ?? 'thermal-print-render-test-secret';
 env.FRONTEND_BASE_URL = 'http://frontend-react:5173';
 
-test('production compose passes FRONTEND_BASE_URL into the invoice container for thermal rendering', async () => {
+test('production compose retains FRONTEND_BASE_URL for the unchanged A4 invoice renderer', async () => {
   const compose = await readFile(join(process.cwd(), 'docker-compose.prod.yml'), 'utf8');
   assert.match(compose, /^\s+FRONTEND_BASE_URL:\s+\$\{FRONTEND_BASE_URL\}\s*$/m);
 });
@@ -36,34 +36,40 @@ const receiptPayload: ReceiptPdfPayload = {
   status: 'ISSUED', issuedAt: new Date('2026-10-08T00:00:00.000Z'),
 };
 
-test('invoice and receipt PDF downloads render their shared React print route at both thermal widths', async () => {
+test('thermal invoice and receipt PDF generation uses self-contained HTML at both paper widths', async () => {
   const originalRender = thermalReactPdfRenderer.render;
-  const requests: Array<{ url: string; width: string }> = [];
-  thermalReactPdfRenderer.render = async (url, width) => {
-    requests.push({ url, width });
+  const originalFrontendUrl = env.FRONTEND_BASE_URL;
+  const requests: Array<{ html: string; width: string }> = [];
+  thermalReactPdfRenderer.render = async (html, width) => {
+    requests.push({ html, width });
     return Buffer.from('%PDF-react-thermal');
   };
+  env.FRONTEND_BASE_URL = '';
 
   try {
     for (const width of ['58mm', '80mm'] as const) {
       await pdfGeneratorService.renderThermalInvoicePdf(invoicePayload, width);
-      await receiptPdfService.renderReceiptPdf(receiptPayload, width);
+      await receiptPdfService.renderReceiptPdf(receiptPayload, width, invoicePayload);
     }
     assert.equal(requests.length, 4);
     for (let index = 0; index < requests.length; index += 1) {
       const request = requests[index];
       const expectedWidth = index < 2 ? '58mm' : '80mm';
       const isReceipt = index % 2 === 1;
-      const parsed = new URL(request.url);
       assert.equal(request.width, expectedWidth);
-      assert.equal(parsed.searchParams.get('width'), expectedWidth);
-      assert.equal(parsed.pathname.endsWith(isReceipt ? '/receipt/print' : '/print'), true);
-      if (!isReceipt) assert.equal(parsed.searchParams.get('format'), 'thermal');
-      const claims = invoicePrintTokenService.verify(parsed.searchParams.get('token') ?? undefined, invoicePayload.invoiceNumber);
-      assert.equal(claims.document, isReceipt ? 'receipt' : 'invoice');
-      if (isReceipt) assert.equal(claims.receiptId, receiptPayload.receiptId);
+      assert.match(request.html, new RegExp(`@page \\{ size: ${expectedWidth}`));
+      assert.match(request.html, new RegExp(`data-thermal-document="${isReceipt ? 'receipt' : 'invoice'}"`));
+      assert.match(request.html, new RegExp(`font: ${expectedWidth === '58mm' ? '15px' : '16\\.5px'}/`), 'paper width should select its stable width-specific typography profile');
+      assert.match(request.html, /data:image\/png;base64,/);
+      assert.match(request.html, /'Courier New', Courier, monospace/, 'thermal output should use a compact monochrome POS typeface');
+      assert.match(request.html, /Quality products/);
+      assert.match(request.html, /Scan to visit our store/);
+      assert.match(request.html, /border-top: 1px dashed/);
+      assert.match(request.html, /Pet Supplies sample/);
+      assert.doesNotMatch(request.html, /https?:\/\//, 'thermal templates must not depend on remote services or assets');
     }
   } finally {
+    env.FRONTEND_BASE_URL = originalFrontendUrl;
     thermalReactPdfRenderer.render = originalRender;
   }
 });
@@ -140,36 +146,11 @@ test('thermal PDF cache deduplicates identical renders and keys updates and pape
   }
 });
 
-test('Puppeteer outputs one correctly sized page for short thermal docs and retains long invoice content', async () => {
-  const server = createServer((request, response) => {
-    const url = new URL(request.url ?? '/', 'http://localhost');
-    const width = url.searchParams.get('width') === '80mm' ? '80mm' : '58mm';
-    const kind = url.searchParams.get('kind') === 'receipt' ? 'receipt' : 'invoice';
-    const count = url.searchParams.get('many') === 'true' ? 80 : 3;
-    const paperWidth = width === '58mm' ? '52mm' : '70mm';
-    const margin = width === '58mm' ? '3mm' : '5mm';
-    const rows = Array.from({ length: count }, (_, index) => `<div class="row">Item ${index + 1} <span>MMK 190,000</span></div>`).join('');
-    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    response.end(`<!doctype html><html><head><meta charset="utf-8"><style>
-      html,body { margin:0; width:${width}; height:auto; min-height:0; overflow:visible; }
-      body { min-height:1200px; font:10px Arial,sans-serif; }
-      #root,#root>div { min-height:1200px; }
-      .thermal-receipt { width:${paperWidth}; padding:2mm; box-sizing:border-box; }
-      .row { min-height:18px; display:flex; justify-content:space-between; break-inside:avoid; }
-      @media print {
-        html:has(body.thermal-printing),body.thermal-printing,body.thermal-printing #root,body.thermal-printing #root>div { width:${width}!important; height:auto!important; min-height:0!important; margin:0!important; padding:0!important; overflow:visible!important; }
-        body.thermal-printing [data-print-hide] { display:none!important; }
-        body.thermal-printing .thermal-receipt { position:absolute!important; inset:0 auto auto ${margin}!important; width:${paperWidth}!important; }
-      }
-    </style></head><body><div id="root"><div><article class="thermal-receipt"><h1>${kind} ${width}</h1>${rows}</article></div></div><script>window.__THERMAL_READY__=true</script></body></html>`);
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  assert.ok(address && typeof address === 'object');
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-  const readPdf = async (url: string) => {
-    const { buffer, diagnostics } = await thermalReactPdfRenderer.renderWithDiagnostics(url, new URL(url).searchParams.get('width') as '58mm' | '80mm');
+test('Puppeteer renders self-contained thermal templates at both widths without blank pages', async () => {
+  const readPdf = async (html: string, width: '58mm' | '80mm') => {
+    const { buffer, diagnostics } = await thermalReactPdfRenderer.renderWithDiagnostics(html, width);
     const source = buffer.toString('latin1');
+    assert.match(source, /\/OpenAction\s+\[\d+\s+\d+\s+R\s+\/FitH\s+null\]/, 'thermal PDFs should open fitted to the viewer width');
     const objects = new Map<number, string>();
     for (const match of source.matchAll(/(\d+)\s+0\s+obj\b([\s\S]*?)\r?\nendobj/g)) objects.set(Number(match[1]), match[2]);
     const pageObjects = [...objects.values()].filter((body) => /\/Type\s*\/Page\b/.test(body));
@@ -193,26 +174,45 @@ test('Puppeteer outputs one correctly sized page for short thermal docs and reta
     return { pageCount: pageDetails.length, pageDetails, diagnostics };
   };
 
-  try {
-    for (const kind of ['invoice', 'receipt']) {
-      for (const width of ['58mm', '80mm'] as const) {
-        const result = await readPdf(`${baseUrl}/?kind=${kind}&width=${width}`);
-        assert.equal(result.pageCount, 1, `${kind} ${width} should fit on one content-sized page`);
-        assert.ok(result.pageDetails[0].textOperatorCount > 0, `${kind} ${width} page must contain printable text`);
-        assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1, `${kind} should use ${width} paper width`);
-        assert.ok(result.pageDetails[0].heightPt > 0 && result.pageDetails[0].heightPt < 300, `${kind} should not retain the 1200px viewport height`);
-        assert.ok(result.diagnostics.contentText.includes(kind), 'the rendered thermal document text should be measured');
-        assert.ok(result.diagnostics.document.scrollHeight <= result.diagnostics.contentBounds.bottom + 2, 'print document extent should end with the thermal content, not the old viewport');
-      }
+  for (const width of ['58mm', '80mm'] as const) {
+    const invoice = { ...invoicePayload, customerName: 'Rendered customer', shippingAddress: { city: 'Yangon' } };
+    const receipt = { ...receiptPayload, customerName: 'Rendered customer' };
+    for (const [kind, html] of [
+      ['invoice', buildThermalInvoiceHtml(invoice, width)],
+      ['receipt', buildThermalReceiptHtml(receipt, width, invoice)],
+    ] as const) {
+      const result = await readPdf(html, width);
+      assert.equal(result.pageCount, 1, `${kind} ${width} should fit on one content-sized page`);
+      assert.ok(result.pageDetails[0].textOperatorCount > 0, `${kind} ${width} page must contain printable text`);
+      assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1, `${kind} should use ${width} paper width`);
+      assert.ok(result.diagnostics.contentBounds.right <= Number.parseInt(width, 10) * 96 / 25.4 + 1, `${kind} ${width} content should stay inside the physical paper width`);
+      assert.ok(result.pageDetails[0].heightPt > 0 && result.pageDetails[0].heightPt < 800, `${kind} should use content height`);
+      assert.match(result.diagnostics.contentText, /Rendered customer/);
+      assert.match(result.diagnostics.contentText, /Pet Supplies sample/);
+      assert.match(result.diagnostics.contentText, /× 1/);
+      assert.match(result.diagnostics.contentText, /190,000/);
     }
-    for (const width of ['58mm', '80mm'] as const) {
-      const result = await readPdf(`${baseUrl}/?kind=invoice&width=${width}&many=true`);
-      assert.equal(result.pageCount, 1, `long ${width} invoice content remains on the custom roll page`);
-      assert.ok(result.pageDetails[0].textOperatorCount > 0, 'long invoice page must contain extracted text operators');
-      assert.ok(result.pageDetails[0].heightPt > 1000, 'long invoice should grow to include all product rows');
-      assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1);
-    }
-  } finally {
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    const longInvoice = {
+      ...invoicePayload,
+      lineItems: Array.from({ length: 80 }, (_, index) => ({
+        name: `Long product ${index + 1} with a descriptive name`, quantity: 1, total: '190000',
+      })),
+    };
+    const longResult = await readPdf(buildThermalInvoiceHtml(longInvoice, width), width);
+    assert.equal(longResult.pageCount, 1, `long ${width} invoice stays on one dynamic-height page`);
+    assert.ok(longResult.pageDetails[0].heightPt > 300, 'long invoice should grow to include every item');
+    assert.match(longResult.diagnostics.contentText, /Long product 80 with a descriptive name/);
   }
+});
+
+test('thermal templates safely escape invoice and product text and include local assets only', () => {
+  const malicious = { ...invoicePayload, customerName: '<script>alert("x")</script>&', lineItems: [{
+    name: '<img src=x onerror=alert(1)>', quantity: 1, total: '12',
+  }] };
+  const html = buildThermalInvoiceHtml(malicious, '58mm');
+  assert.match(html, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;&amp;/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<script>alert|<img src=x/);
+  assert.doesNotMatch(html, /https?:\/\//);
 });

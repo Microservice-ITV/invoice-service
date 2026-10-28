@@ -463,9 +463,10 @@ test('thermal receipt downloads render real invoice data at each requested paper
   try {
     const service = new ReceiptService();
     for (const width of ['58mm', '80mm'] as const) {
-      const result = await service.downloadReceiptPdf('invoice-1', { role: 'admin' }, width);
+      const result = await service.downloadReceiptPdf('invoice-1', { role: 'seller', shopId: 'shop-1' }, width);
       assert.equal(result?.buffer.toString(), '%PDF-thermal');
     }
+    assert.equal(await service.downloadReceiptPdf('invoice-1', { role: 'seller', shopId: 'shop-2' }, '80mm'), null);
     assert.deepEqual(rendered.map((item) => item.width), ['58mm', '80mm']);
     assert.deepEqual(rendered[0].payload.shippingAddress, { address_line_1: 'Real Street', city: 'Yangon' });
     assert.deepEqual(rendered[0].payload.lineItems, [{ name: 'Real product', quantity: 2, total: '40.00' }]);

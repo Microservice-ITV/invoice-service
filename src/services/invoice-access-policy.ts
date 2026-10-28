@@ -3,6 +3,7 @@ export interface InvoiceAccessActor {
   customerId?: string;
   role?: string;
   shopId?: string;
+  shopIds?: string[];
 }
 
 export interface InvoiceAccessResource {
@@ -16,5 +17,8 @@ export const canAccessInvoice = (
 ): boolean => {
   if (actor.role === 'admin') return true;
   if (actor.customerId && actor.customerId === invoice.customerId) return true;
-  return Boolean(actor.shopId && actor.shopId === invoice.shopId);
+  return Boolean(
+    (actor.shopId && actor.shopId === invoice.shopId)
+    || actor.shopIds?.includes(invoice.shopId),
+  );
 };

@@ -195,10 +195,9 @@ test('customer requests with a shop id stay customer scoped', async () => {
   assert.equal(req.user.role, 'customer');
 });
 
-test('shop-scoped requests resolve after access context authorizes the shop', async () => {
+test('staff invoice listing resolves all active memberships without requiring an active shop', async () => {
   const headers: Record<string, string | undefined> = {
     authorization: `Bearer ${createToken('user-456')}`,
-    'x-shop-id': 'shop-123',
     'x-user-id': 'user-456',
   };
 
@@ -223,12 +222,12 @@ test('shop-scoped requests resolve after access context authorizes the shop', as
     requestedUrl = String(input);
     return new Response(JSON.stringify({
       data: {
-        active_shop: { shop_id: 'shop-123', role: { code: 'shop_owner' } },
-        shops: [{
-          shop_id: 'shop-123',
-          membership_status: 'active',
-          role: { code: 'shop_owner' },
-        }],
+        active_shop: null,
+        shops: [
+          { shop_id: 'shop-a', membership_status: 'active', role: { code: 'shop_owner' } },
+          { shop_id: 'shop-b', membership_status: 'active', role: { code: 'shop_admin' } },
+          { shop_id: 'shop-inactive', membership_status: 'inactive', role: { code: 'shop_admin' } },
+        ],
       },
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
@@ -246,5 +245,128 @@ test('shop-scoped requests resolve after access context authorizes the shop', as
   assert.match(requestedUrl, /\/api\/v1\/me\/access-context$/);
   assert.equal(nextCalled, true);
   assert.equal(req.user.role, 'shopAdmin');
-  assert.equal(req.user.shopId, 'shop-123');
+  assert.equal(req.user.shopId, 'shop-a');
+  assert.deepEqual(req.user.shopIds, ['shop-a', 'shop-b']);
+});
+
+test('staff invoice listing rejects a requested shop outside active memberships', async () => {
+  const headers: Record<string, string | undefined> = {
+    authorization: `Bearer ${createToken('user-456')}`,
+    'x-shop-id': 'shop-outside-membership',
+  };
+  const req = {
+    header: (name: string) => headers[name.toLowerCase()],
+    originalUrl: '/api/v1/invoices/shop-invoices',
+    path: '/invoices/shop-invoices',
+    method: 'GET',
+  } as any;
+  let statusCode = 0;
+  const res = {
+    status(code: number) { statusCode = code; return this; },
+    json() {},
+  } as any;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: { shops: [{ shop_id: 'shop-a', membership_status: 'active' }] },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  let nextCalled = false;
+  try {
+    await auth(req, res, () => { nextCalled = true; });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(statusCode, 403);
+  assert.equal(nextCalled, false);
+});
+
+test('staff invoice detail reads resolve all memberships when no active shop is selected', async () => {
+  const headers: Record<string, string | undefined> = {
+    authorization: `Bearer ${createToken('staff-user')}`,
+    'x-user-role': 'shopAdmin',
+  };
+  const req = {
+    header: (name: string) => headers[name.toLowerCase()],
+    originalUrl: '/api/v1/invoices/by-number/INV-REAL',
+    path: '/invoices/by-number/INV-REAL',
+    method: 'GET',
+  } as any;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: {
+      active_shop: null,
+      shops: [
+        { shop_id: 'shop-a', membership_status: 'active', role: { code: 'staff' } },
+        { shop_id: 'shop-b', membership_status: 'active', role: { code: 'staff' } },
+      ],
+    },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  let nextCalled = false;
+  try {
+    await auth(req, { status() { return this; }, json() {} } as any, () => { nextCalled = true; });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(nextCalled, true);
+  assert.equal(req.user.role, 'shopAdmin');
+  assert.deepEqual(req.user.shopIds, ['shop-a', 'shop-b']);
+});
+
+test('single-shop staff invoice detail resolves the authenticated shop membership', async () => {
+  const headers: Record<string, string | undefined> = {
+    authorization: `Bearer ${createToken('staff-user')}`,
+    'x-user-role': 'shopAdmin',
+  };
+  const req = {
+    header: (name: string) => headers[name.toLowerCase()],
+    originalUrl: '/api/v1/invoices/by-number/INV-REAL',
+    path: '/invoices/by-number/INV-REAL',
+    method: 'GET',
+  } as any;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: {
+      active_shop: { shop_id: 'shop-only' },
+      shops: [{ shop_id: 'shop-only', membership_status: 'active', role: { code: 'staff' } }],
+    },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  let nextCalled = false;
+  try {
+    await auth(req, { status() { return this; }, json() {} } as any, () => { nextCalled = true; });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(nextCalled, true);
+  assert.equal(req.user.shopId, 'shop-only');
+  assert.deepEqual(req.user.shopIds, ['shop-only']);
+});
+
+test('staff invoice detail rejects shop context outside verified memberships', async () => {
+  const headers: Record<string, string | undefined> = {
+    authorization: `Bearer ${createToken('staff-user')}`,
+    'x-user-role': 'shopAdmin',
+    'x-shop-id': 'shop-outside',
+  };
+  const req = {
+    header: (name: string) => headers[name.toLowerCase()],
+    originalUrl: '/api/v1/invoices/by-number/INV-REAL',
+    path: '/invoices/by-number/INV-REAL',
+    method: 'GET',
+  } as any;
+  let statusCode = 0;
+  const response = {
+    status(code: number) { statusCode = code; return this; },
+    json() {},
+  } as any;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: { shops: [{ shop_id: 'shop-a', membership_status: 'active', role: { code: 'staff' } }] },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  let nextCalled = false;
+  try {
+    await auth(req, response, () => { nextCalled = true; });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(statusCode, 403);
+  assert.equal(nextCalled, false);
 });

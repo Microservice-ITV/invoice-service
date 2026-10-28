@@ -1,8 +1,7 @@
 import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
-import env from '@/config/env';
-import invoicePrintTokenService from '@/services/invoice-print-token.service';
 import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.service';
+import { buildThermalReceiptHtml, type ThermalInvoiceData } from '@/services/thermal-document-template';
 
 export interface ReceiptPdfPayload {
   receiptId: string;
@@ -27,7 +26,7 @@ export interface ReceiptPdfPayload {
   status: string;
   issuedAt: Date;
   shippingAddress?: Record<string, unknown> | null;
-  lineItems?: Array<{ name: string; quantity: number; total: string }>;
+  lineItems?: Array<{ name: string; quantity: number; unitPrice?: string; total: string }>;
 }
 
 // Exported so receipt.service can verify stored references against the exact
@@ -35,8 +34,8 @@ export interface ReceiptPdfPayload {
 export const RECEIPT_PDF_MARKER = 'receipt-v1';
 
 /**
- * Stores receipt PDFs using the same React print route as browser thermal
- * previews. Thermal downloads pass a width and are rendered on demand.
+ * Stores the existing receipt PDF artifact. Thermal downloads are rendered
+ * from the already-authorized receipt and invoice snapshots at the requested width.
  *
  * Storage note: `storageService.uploadPdf` strips a leading `invoice-pdfs/`
  * from the key and always returns `invoice-pdfs/<objectKey>`, so the returned
@@ -59,18 +58,11 @@ export class ReceiptPdfService {
     width: '58mm' | '80mm' = '80mm',
     currentInvoiceData: unknown = null,
   ): Promise<Buffer> {
-    const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, '');
-    if (!frontendBaseUrl) throw new Error('FRONTEND_BASE_URL is required to render thermal receipt PDFs');
-    const token = invoicePrintTokenService.issue({
-      sub: payload.customerId,
-      invoiceId: payload.invoiceId,
-      invoiceNumber: payload.invoiceNumber,
-      role: 'customer',
-      document: 'receipt',
-      receiptId: payload.receiptId,
-    });
-    const url = `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/receipt/print?token=${encodeURIComponent(token)}&width=${encodeURIComponent(width)}`;
-    return thermalReactPdfRenderer.render(url, width, {
+    const invoice = currentInvoiceData && typeof currentInvoiceData === 'object'
+      ? currentInvoiceData as Pick<ThermalInvoiceData, 'customerName' | 'lineItems'>
+      : null;
+    const html = buildThermalReceiptHtml(payload, width, invoice);
+    return thermalReactPdfRenderer.render(html, width, {
       document: 'receipt',
       payload,
       currentInvoiceData,

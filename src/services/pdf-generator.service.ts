@@ -7,6 +7,7 @@ import invoicePrintTokenService from "@/services/invoice-print-token.service";
 import { InvoiceStatus } from "@/types/invoice";
 import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.service';
 import pdfBrowserService from '@/services/pdf-browser.service';
+import { buildThermalInvoiceHtml } from '@/services/thermal-document-template';
 
 export const REACT_PRINT_PDF_MARKER = "react-print-v19";
 const INTER_FONT_DIRECTORY = join(process.cwd(), "assets", "fonts", "inter");
@@ -53,8 +54,10 @@ export interface InvoicePdfPayload {
 }
 
 export class PdfGeneratorService {
+  /** Build a thermal invoice directly from the already-authorized invoice snapshot. */
   async renderThermalInvoicePdf(payload: InvoicePdfPayload, width: '58mm' | '80mm'): Promise<Buffer> {
-    return thermalReactPdfRenderer.render(this.buildThermalPrintRouteUrl(payload, width), width, {
+    const html = buildThermalInvoiceHtml(payload, width);
+    return thermalReactPdfRenderer.render(html, width, {
       document: 'invoice',
       payload,
       printedYear: new Date().getFullYear(),
@@ -208,16 +211,6 @@ export class PdfGeneratorService {
     });
 
     return `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/print?token=${encodeURIComponent(token)}`;
-  }
-
-  private buildThermalPrintRouteUrl(payload: InvoicePdfPayload, width: '58mm' | '80mm'): string {
-    const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, '');
-    if (!frontendBaseUrl) throw new Error('FRONTEND_BASE_URL is required to render thermal invoice PDFs');
-    const token = invoicePrintTokenService.issue({
-      sub: payload.customerId, invoiceId: payload.invoiceId, invoiceNumber: payload.invoiceNumber, role: 'customer',
-      document: 'invoice',
-    });
-    return `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/print?token=${encodeURIComponent(token)}&format=thermal&width=${encodeURIComponent(width)}`;
   }
 }
 
