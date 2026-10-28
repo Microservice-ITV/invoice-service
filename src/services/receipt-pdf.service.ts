@@ -54,7 +54,11 @@ export class ReceiptPdfService {
     return pdfUrl;
   }
 
-  async renderReceiptPdf(payload: ReceiptPdfPayload, width: '58mm' | '80mm' = '80mm'): Promise<Buffer> {
+  async renderReceiptPdf(
+    payload: ReceiptPdfPayload,
+    width: '58mm' | '80mm' = '80mm',
+    currentInvoiceData: unknown = null,
+  ): Promise<Buffer> {
     const frontendBaseUrl = env.FRONTEND_BASE_URL?.trim().replace(/\/+$/, '');
     if (!frontendBaseUrl) throw new Error('FRONTEND_BASE_URL is required to render thermal receipt PDFs');
     const token = invoicePrintTokenService.issue({
@@ -66,7 +70,12 @@ export class ReceiptPdfService {
       receiptId: payload.receiptId,
     });
     const url = `${frontendBaseUrl}/account/invoices/${encodeURIComponent(payload.invoiceNumber)}/receipt/print?token=${encodeURIComponent(token)}&width=${encodeURIComponent(width)}`;
-    return thermalReactPdfRenderer.render(url, width);
+    return thermalReactPdfRenderer.render(url, width, {
+      document: 'receipt',
+      payload,
+      currentInvoiceData,
+      printedYear: new Date().getFullYear(),
+    });
   }
 
 }

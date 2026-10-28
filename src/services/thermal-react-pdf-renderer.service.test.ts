@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import test from 'node:test';
 import { inflateSync } from 'node:zlib';
 import env from '@/config/env';
@@ -11,6 +13,11 @@ import { getThermalContentHeightPx, getThermalPdfOptions } from '@/services/ther
 
 env.JWT_SECRET = env.JWT_SECRET ?? 'thermal-print-render-test-secret';
 env.FRONTEND_BASE_URL = 'http://frontend-react:5173';
+
+test('production compose passes FRONTEND_BASE_URL into the invoice container for thermal rendering', async () => {
+  const compose = await readFile(join(process.cwd(), 'docker-compose.prod.yml'), 'utf8');
+  assert.match(compose, /^\s+FRONTEND_BASE_URL:\s+\$\{FRONTEND_BASE_URL\}\s*$/m);
+});
 
 const invoicePayload: InvoicePdfPayload = {
   invoiceId: 'invoice-1', invoiceNumber: 'INV-20261008-000035', orderReference: null,
@@ -61,6 +68,36 @@ test('invoice and receipt PDF downloads render their shared React print route at
   }
 });
 
+test('A4 invoice PDF download returns a readable PDF from the shared print route', async () => {
+  const originalFrontendUrl = env.FRONTEND_BASE_URL;
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end(`<!doctype html><html><head><meta charset="utf-8"><style>
+      body { margin: 0; }
+      .invoice-document { width: 100%; font-family: Inter, sans-serif; }
+      .invoice-document section { break-inside: avoid; }
+    </style></head><body><article class="invoice-document"><h1>Invoice ${invoicePayload.invoiceNumber}</h1>
+      <section><p>Customer and invoice details</p></section><section><p>MMK 190,000</p></section>
+    </article><script>window.__INVOICE_READY__=true</script></body></html>`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  env.FRONTEND_BASE_URL = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const buffer = await pdfGeneratorService.renderInvoicePdf(invoicePayload);
+    const pdf = buffer.toString('latin1');
+    assert.ok(pdf.startsWith('%PDF-'));
+    assert.match(pdf, /\/Type\s*\/Page\b/);
+    assert.match(pdf, /\/MediaBox\s*\[\s*0\s+0\s+595\./);
+    assert.match(pdf, /%%EOF/);
+  } finally {
+    env.FRONTEND_BASE_URL = originalFrontendUrl;
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test('thermal PDF dimensions honor the selected width and use the full content height without margins', () => {
   for (const width of ['58mm', '80mm'] as const) {
     const options = getThermalPdfOptions(width, 480);
@@ -74,6 +111,33 @@ test('thermal PDF dimensions honor the selected width and use the full content h
 test('thermal PDF height follows final descendant bounds and ignores viewport or wrapper height', () => {
   assert.equal(getThermalContentHeightPx({ top: 0, left: 3, right: 208, bottom: 717.58, height: 717.58 }), 718);
   assert.equal(getThermalContentHeightPx({ top: -2, left: 3, right: 208, bottom: 717.58, height: 719.58 }), 720);
+});
+
+test('thermal PDF cache deduplicates identical renders and keys updates and paper width separately', async () => {
+  const originalRender = thermalReactPdfRenderer.renderWithDiagnostics;
+  let renderCount = 0;
+  thermalReactPdfRenderer.renderWithDiagnostics = async () => ({
+    buffer: Buffer.from(`thermal-pdf-${++renderCount}`),
+    diagnostics: {} as never,
+  });
+
+  try {
+    const currentData = { invoiceId: 'cache-test-invoice', updatedAt: 'revision-1' };
+    const [first, concurrent] = await Promise.all([
+      thermalReactPdfRenderer.render('http://print.local/invoice', '58mm', currentData),
+      thermalReactPdfRenderer.render('http://print.local/invoice', '58mm', currentData),
+    ]);
+    assert.equal(first.toString(), 'thermal-pdf-1');
+    assert.equal(concurrent.toString(), 'thermal-pdf-1');
+    assert.equal((await thermalReactPdfRenderer.render('http://print.local/invoice', '58mm', currentData)).toString(), 'thermal-pdf-1');
+    assert.equal(renderCount, 1);
+
+    await thermalReactPdfRenderer.render('http://print.local/invoice', '58mm', { ...currentData, updatedAt: 'revision-2' });
+    await thermalReactPdfRenderer.render('http://print.local/invoice', '80mm', currentData);
+    assert.equal(renderCount, 3);
+  } finally {
+    thermalReactPdfRenderer.renderWithDiagnostics = originalRender;
+  }
 });
 
 test('Puppeteer outputs one correctly sized page for short thermal docs and retains long invoice content', async () => {

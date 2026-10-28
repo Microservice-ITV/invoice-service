@@ -129,7 +129,7 @@ export class ReceiptService {
       const invoiceData = context.invoice as typeof context.invoice & { shippingAddress?: Record<string, unknown> | null; lineItems?: Array<{ name: string; quantity: number; total: string }> };
       payload.shippingAddress = invoiceData.shippingAddress ?? null;
       payload.lineItems = invoiceData.lineItems ?? [];
-      return { receipt, buffer: await receiptPdfService.renderReceiptPdf(payload, width) };
+      return { receipt, buffer: await receiptPdfService.renderReceiptPdf(payload, width, invoiceData) };
     }
     if (receipt.pdfUrl && hasCurrentReceiptPdf(receipt.pdfUrl)) {
       try {
