@@ -4,6 +4,12 @@ import { InvoiceStatus, RefundMethod } from '@/types/invoice';
 import { canAccessInvoice } from '@/services/invoice-access-policy';
 import invoicePrintTokenService from '@/services/invoice-print-token.service';
 
+export const getThermalInvoiceDownloadFilename = (invoiceNumber: string, width: '58mm' | '80mm'): string => {
+  const invoiceSuffix = invoiceNumber.trim().replace(/^DNI-/i, '').replace(/^INV-/i, '');
+  const safeSuffix = invoiceSuffix.replace(/[^a-zA-Z0-9._-]/g, '-');
+  return `INV-${safeSuffix || 'invoice'}-thermal-${width}.pdf`;
+};
+
 const invoiceStatusValues: InvoiceStatus[] = [
   'UNPAID',
   'PENDING_VERIFICATION',
@@ -322,7 +328,7 @@ export class InvoiceController {
       if (!result) { res.status(404).json({ success: false, message: 'Invoice PDF not found' }); return; }
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}-thermal-${width}.pdf"`);
+      res.setHeader('Content-Disposition', `attachment; filename="${getThermalInvoiceDownloadFilename(result.invoice.invoiceNumber, width)}"`);
       res.send(result.buffer);
     } catch (error) { next(error instanceof Error ? error : new Error('Failed to download thermal invoice PDF')); }
   }
