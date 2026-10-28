@@ -37,7 +37,7 @@ const invoice = {
   deliveryFee: { toString: () => '10.00' },
   discountAmount: { toString: () => '0.00' },
   grandTotal: { toString: () => '110.00' },
-  pdfUrl: 'invoice-pdfs/shop-a/react-print-v15/DNI-INV-000001-123abc.pdf',
+  pdfUrl: 'invoice-pdfs/shop-a/react-print-v19/DNI-INV-000001-123abc.pdf',
 };
 
 test('generated invoice event carries the stored invoice and PDF snapshot', () => {

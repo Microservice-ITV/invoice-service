@@ -1,4 +1,3 @@
-import puppeteer from "puppeteer";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import storageService from "@/services/storage.service";
@@ -7,8 +6,9 @@ import env from "@/config/env";
 import invoicePrintTokenService from "@/services/invoice-print-token.service";
 import { InvoiceStatus } from "@/types/invoice";
 import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.service';
+import pdfBrowserService from '@/services/pdf-browser.service';
 
-const REACT_PRINT_PDF_MARKER = "react-print-v15";
+export const REACT_PRINT_PDF_MARKER = "react-print-v19";
 const INTER_FONT_DIRECTORY = join(process.cwd(), "assets", "fonts", "inter");
 const INTER_FONT_FILES = [
   { filename: "Inter-Regular.woff2", weight: 400 },
@@ -54,7 +54,11 @@ export interface InvoicePdfPayload {
 
 export class PdfGeneratorService {
   async renderThermalInvoicePdf(payload: InvoicePdfPayload, width: '58mm' | '80mm'): Promise<Buffer> {
-    return thermalReactPdfRenderer.render(this.buildThermalPrintRouteUrl(payload, width), width);
+    return thermalReactPdfRenderer.render(this.buildThermalPrintRouteUrl(payload, width), width, {
+      document: 'invoice',
+      payload,
+      printedYear: new Date().getFullYear(),
+    });
   }
   async buildAndUploadInvoicePdf(payload: InvoicePdfPayload): Promise<string> {
     const pdfBuffer = await this.renderInvoicePdf(payload);
@@ -67,18 +71,9 @@ export class PdfGeneratorService {
   }
 
   async renderInvoicePdf(payload: InvoicePdfPayload): Promise<Buffer> {
-    const executablePath = puppeteer.executablePath();
-    const browser = await puppeteer.launch({
-      headless: true,
-      executablePath,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    });
+    const context = await pdfBrowserService.createContext();
     try {
-      const page = await browser.newPage();
+      const page = await context.newPage();
 
       page.on("console", (msg) => {
         logger.error(
@@ -164,18 +159,25 @@ export class PdfGeneratorService {
         format: "A4",
         printBackground: true,
         preferCSSPageSize: true,
-        margin: { top: "14mm", right: "14mm", bottom: "14mm", left: "14mm" },
+        margin: { top: "9mm", right: "9mm", bottom: "9mm", left: "9mm" },
       });
       return Buffer.from(pdfBuffer);
     } finally {
-      await browser.close();
+      await pdfBrowserService.releaseContext(context);
     }
   }
 
   private async getEmbeddedInterFontStyles(): Promise<string> {
     const fontFaces = await Promise.all(
       INTER_FONT_FILES.map(async ({ filename, weight }) => {
-        const fontData = await readFile(join(INTER_FONT_DIRECTORY, filename));
+        let fontData: Buffer;
+        try {
+          fontData = await readFile(join(INTER_FONT_DIRECTORY, filename));
+        } catch {
+          // Source runs keep the bundled fonts under src/assets; Docker images
+          // copy the same files to the application root for production.
+          fontData = await readFile(join(process.cwd(), 'src', 'assets', 'fonts', 'inter', filename));
+        }
         const dataUri = `data:font/woff2;base64,${fontData.toString("base64")}`;
         return `@font-face{font-family:'Inter';src:url('${dataUri}') format('woff2');font-style:normal;font-weight:${weight};font-display:block;}`;
       }),

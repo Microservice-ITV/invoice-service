@@ -9,7 +9,7 @@ import orderSnapshotService, {
   OrderSnapshotError,
 } from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
-import pdfGeneratorService from '@/services/pdf-generator.service';
+import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
 import invoiceNotificationPublisher, {
   type InvoiceNotificationType,
@@ -211,10 +211,8 @@ const normalizePdfAddress = (
  */
 export const requireMmkInvoiceCurrency = (_value?: string | null): string => 'MMK';
 
-const REACT_PRINT_PDF_MARKER = '/react-print-v15/';
-
 export const hasCurrentInvoicePdf = (pdfUrl?: string | null): boolean =>
-  Boolean(pdfUrl?.includes(REACT_PRINT_PDF_MARKER));
+  Boolean(pdfUrl?.includes(`/${REACT_PRINT_PDF_MARKER}/`));
 
 const moneyToMinorUnits = (value: string | number): bigint => {
   const text = String(value).trim();
@@ -1636,7 +1634,7 @@ export class InvoiceService {
     const invoice = await invoiceRepository.findById(invoiceId);
     if (!invoice || !invoice.pdfUrl || invoice.pdfStatus !== 'READY') return null;
 
-    const prefix = `invoice-pdfs/${invoice.shopId}/react-print-v15/${invoice.invoiceNumber}-`;
+    const prefix = `invoice-pdfs/${invoice.shopId}/${REACT_PRINT_PDF_MARKER}/${invoice.invoiceNumber}-`;
     if (
       !pdfUrl.startsWith(prefix)
       || !/^\d+-[a-z0-9]+\.pdf$/i.test(pdfUrl.slice(prefix.length))

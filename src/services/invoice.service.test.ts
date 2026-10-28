@@ -45,7 +45,7 @@ import invoiceNotificationPublisher, {
 test('notification PDF retrieval returns the exact stored invoice PDF and rejects unrelated references', async () => {
   const originalFindById = invoiceRepository.findById;
   const originalDownloadPdf = storageService.downloadPdf;
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf';
   const downloaded: string[] = [];
   const invoice = {
     id: 'invoice-1',
@@ -101,7 +101,7 @@ test('invoice notification events include the real payment status and use stable
     deliveryFee: { toString: () => '5.00' },
     discountAmount: { toString: () => '0.00' },
     grandTotal: { toString: () => '105.00' },
-    pdfUrl: 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf',
+    pdfUrl: 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf',
   };
   const cod = buildInvoiceNotificationEvent('invoice.generated', invoice);
   const paid = buildInvoiceNotificationEvent('invoice.paid', { ...invoice, status: 'PAID' });
@@ -124,7 +124,7 @@ test('invoice notification waits for the stored PDF and publishing failure does 
   const originalBuildPdf = pdfGeneratorService.buildAndUploadInvoicePdf;
   const originalPublish = invoiceNotificationPublisher.publish;
   const events: string[] = [];
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v15/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf';
   const invoice = {
     id: 'invoice-1',
     invoiceNumber: 'DNI-INV-1',
@@ -231,8 +231,12 @@ const makePaymentPayload = (currency: string) => ({
 
 test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(
-    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v15/invoice.pdf'),
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v19/invoice.pdf'),
     true,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v15/invoice.pdf'),
+    false,
   );
   assert.equal(
     hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v14/invoice.pdf'),
@@ -285,10 +289,11 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
   const originalBuildAndUploadInvoicePdf = pdfGeneratorService.buildAndUploadInvoicePdf;
   const originalDownloadPdf = storageService.downloadPdf;
   const stalePdf = Buffer.from('stale-pdf');
-  const currentPdf = Buffer.from('current-pdf');
-  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v14/invoice.pdf';
-  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v15/invoice.pdf';
+  const currentPdf = Buffer.from('current-pdf: Updated Customer: Updated Product');
+  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v18/invoice.pdf';
+  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v19/invoice.pdf';
   const downloadedUrls: string[] = [];
+  const generatedPayloads: Parameters<typeof pdfGeneratorService.buildAndUploadInvoicePdf>[0][] = [];
   let savedPdfUrl = stalePdfUrl;
   const invoice = {
     id: 'invoice-1',
@@ -298,7 +303,7 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     shopId: 'shop-1',
     shopName: null,
     customerId: 'customer-1',
-    customerName: null,
+    customerName: 'Updated Customer',
     customerEmail: null,
     customerPhone: null,
     billingAddress: null,
@@ -307,7 +312,7 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     shopContactEmail: null,
     shopContactPhone: null,
     shopAddress: null,
-    lineItems: [],
+    lineItems: [{ name: 'Updated Product', quantity: 1, unitPrice: '100.00', total: '100.00' }],
     subtotal: new Prisma.Decimal('100.00'),
     taxAmount: new Prisma.Decimal('0.00'),
     deliveryFee: new Prisma.Decimal('0.00'),
@@ -340,7 +345,10 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     savedPdfUrl = pdfUrl;
     return { ...invoice, pdfUrl };
   };
-  pdfGeneratorService.buildAndUploadInvoicePdf = async () => currentPdfUrl;
+  pdfGeneratorService.buildAndUploadInvoicePdf = async (payload) => {
+    generatedPayloads.push(payload);
+    return currentPdfUrl;
+  };
   storageService.downloadPdf = async (url) => {
     downloadedUrls.push(url);
     return url === currentPdfUrl ? currentPdf : stalePdf;
@@ -353,6 +361,9 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     });
 
     assert.equal(result?.buffer, currentPdf);
+    assert.match(result?.buffer.toString() ?? '', /Updated Customer: Updated Product/);
+    assert.equal(generatedPayloads[0]?.customerName, 'Updated Customer');
+    assert.equal(generatedPayloads[0]?.lineItems?.[0]?.name, 'Updated Product');
     assert.deepEqual(downloadedUrls, [currentPdfUrl]);
   } finally {
     invoiceRepository.findById = originalFindById;

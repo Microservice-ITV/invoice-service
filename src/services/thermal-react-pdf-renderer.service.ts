@@ -1,6 +1,10 @@
-import puppeteer from 'puppeteer';
+import { createHash } from 'node:crypto';
+import pdfBrowserService from '@/services/pdf-browser.service';
 
 export type ThermalPaperWidth = '58mm' | '80mm';
+export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v6';
+const THERMAL_PDF_CACHE_TTL_MS = 3 * 60 * 1000;
+const THERMAL_PDF_CACHE_MAX_ENTRIES = 40;
 export interface ThermalRenderDiagnostics {
   document: { scrollHeight: number; clientHeight: number };
   body: { scrollHeight: number; clientHeight: number; minHeight: string; height: string };
@@ -32,19 +36,48 @@ export const getThermalPdfOptions = (width: ThermalPaperWidth, contentHeightPx: 
 
 /** Render the React thermal document currently displayed by the print route. */
 export class ThermalReactPdfRenderer {
-  async render(url: string, width: ThermalPaperWidth): Promise<Buffer> {
-    return (await this.renderWithDiagnostics(url, width)).buffer;
+  private readonly pdfCache = new Map<string, { buffer: Buffer; expiresAt: number }>();
+  private readonly inFlightRenders = new Map<string, Promise<Buffer>>();
+
+  async render(url: string, width: ThermalPaperWidth, currentDocumentData?: unknown): Promise<Buffer> {
+    if (currentDocumentData === undefined) return (await this.renderWithDiagnostics(url, width)).buffer;
+
+    const cacheKey = createHash('sha256')
+      .update(JSON.stringify({ version: THERMAL_RENDER_CACHE_VERSION, width, currentDocumentData }) ?? '')
+      .digest('hex');
+    const now = Date.now();
+    for (const [key, entry] of this.pdfCache) {
+      if (entry.expiresAt <= now) this.pdfCache.delete(key);
+    }
+
+    const cached = this.pdfCache.get(cacheKey);
+    if (cached) {
+      this.pdfCache.delete(cacheKey);
+      this.pdfCache.set(cacheKey, cached);
+      return Buffer.from(cached.buffer);
+    }
+
+    let render = this.inFlightRenders.get(cacheKey);
+    if (!render) {
+      render = this.renderWithDiagnostics(url, width).then(({ buffer }) => {
+        if (this.pdfCache.size >= THERMAL_PDF_CACHE_MAX_ENTRIES) {
+          const oldestKey = this.pdfCache.keys().next().value;
+          if (oldestKey) this.pdfCache.delete(oldestKey);
+        }
+        this.pdfCache.set(cacheKey, { buffer: Buffer.from(buffer), expiresAt: Date.now() + THERMAL_PDF_CACHE_TTL_MS });
+        return buffer;
+      }).finally(() => this.inFlightRenders.delete(cacheKey));
+      this.inFlightRenders.set(cacheKey, render);
+    }
+
+    return Buffer.from(await render);
   }
 
   async renderWithDiagnostics(url: string, width: ThermalPaperWidth): Promise<ThermalRenderResult> {
-    const browser = await puppeteer.launch({
-      headless: true,
-      executablePath: puppeteer.executablePath(),
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    const context = await pdfBrowserService.createContext();
 
     try {
-      const page = await browser.newPage();
+      const page = await context.newPage();
       // Thermal layouts are width-driven. A tall screen viewport becomes extra
       // printable document extent when the receipt itself is absolutely
       // positioned, which Chromium paginates as blank roll pages.
@@ -108,7 +141,7 @@ export class ThermalReactPdfRenderer {
       const buffer = Buffer.from(await page.pdf(getThermalPdfOptions(width, contentHeight)));
       return { buffer, diagnostics };
     } finally {
-      await browser.close();
+      await pdfBrowserService.releaseContext(context);
     }
   }
 }
