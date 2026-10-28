@@ -15,6 +15,11 @@ test('seller can access only the selected authorized shop invoice', () => {
   assert.equal(canAccessInvoice(invoice, { role: 'shopAdmin' }), false);
 });
 
+test('seller can read invoices from any resolved membership while denying unrelated shops', () => {
+  assert.equal(canAccessInvoice(invoice, { role: 'shopAdmin', shopIds: ['shop-a', 'shop-b'] }), true);
+  assert.equal(canAccessInvoice(invoice, { role: 'shopAdmin', shopIds: ['shop-b', 'shop-c'] }), false);
+});
+
 test('platform admins may access any invoice', () => {
   assert.equal(canAccessInvoice(invoice, { role: 'admin' }), true);
 });

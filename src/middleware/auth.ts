@@ -150,7 +150,15 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
         && normalizeRole(req.header('x-user-role')) === 'customer'
       );
     const isInvoiceReadRoute = req.method === 'GET'
-      && /\/invoices\/[^/]+(?:\/pdf|\/receipt(?:\/pdf)?)?$/.test(requestPath);
+      && (/\/invoices\/[^/]+(?:\/(?:pdf|thermal-pdf|receipt(?:\/pdf)?))?$/.test(requestPath)
+        || requestPath.endsWith('/invoices/shop-invoices')
+        || (req.header('x-user-role') !== undefined
+          && normalizeRole(req.header('x-user-role')) !== 'customer'
+          && /\/invoices\/by-number\/[^/]+$/.test(requestPath)));
+    const isShopInvoiceListRoute = req.method === 'GET'
+      && requestPath.endsWith('/invoices/shop-invoices');
+    const isStaffInvoiceReadRoute = isInvoiceReadRoute
+      && normalizeRole(req.header('x-user-role')) !== 'customer';
 
     if (platformRole) {
       req.user = { id: claims.sub, customerId: claims.sub, role: platformRole, shopId: requestedShopId, token };
@@ -166,7 +174,13 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
 
     const context = await getAccessContext(token);
     let ownedShopIds: string[] = [];
-    if (needsOwnedShopLookup(context, requestedShopId, isInvoiceReadRoute)) {
+    const contextShopIds = collectAuthorizedShopIds(context, []);
+    const shouldResolveOwnedShops = isShopInvoiceListRoute
+      ? contextShopIds.length === 0
+      : isStaffInvoiceReadRoute
+        ? contextShopIds.length === 0
+        : needsOwnedShopLookup(context, requestedShopId, isInvoiceReadRoute);
+    if (shouldResolveOwnedShops) {
       try {
         ownedShopIds = await shopLookupService.getShopIdsForUser(claims.sub, token);
       } catch {
@@ -176,6 +190,48 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
     }
 
     const shopIds = collectAuthorizedShopIds(context, ownedShopIds);
+    if (isShopInvoiceListRoute) {
+      if (requestedShopId && !shopIds.includes(requestedShopId)) {
+        res.status(403).json({ success: false, message: 'User is not assigned to the requested shop' });
+        return;
+      }
+      if (shopIds.length === 0) {
+        res.status(403).json({ success: false, message: 'User is not assigned to a shop' });
+        return;
+      }
+      const activeShopId = context.active_shop?.shop_id;
+      req.user = {
+        id: claims.sub,
+        customerId: claims.sub,
+        role: 'shopAdmin',
+        shopId: requestedShopId ?? (activeShopId && shopIds.includes(activeShopId) ? activeShopId : shopIds[0]),
+        shopIds,
+        token,
+      };
+      next();
+      return;
+    }
+    if (isStaffInvoiceReadRoute) {
+      if (requestedShopId && !shopIds.includes(requestedShopId)) {
+        res.status(403).json({ success: false, message: 'User is not assigned to the requested shop' });
+        return;
+      }
+      if (shopIds.length === 0) {
+        res.status(403).json({ success: false, message: 'User is not assigned to a shop' });
+        return;
+      }
+      const activeShopId = context.active_shop?.shop_id;
+      req.user = {
+        id: claims.sub,
+        customerId: claims.sub,
+        role: 'shopAdmin',
+        shopId: requestedShopId ?? (activeShopId && shopIds.includes(activeShopId) ? activeShopId : shopIds[0]),
+        shopIds,
+        token,
+      };
+      next();
+      return;
+    }
     if (isInvoiceReadRoute && shopIds.length === 0) {
       req.user = { id: claims.sub, customerId: claims.sub, role: 'customer', token };
       next();

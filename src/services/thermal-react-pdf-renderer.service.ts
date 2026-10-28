@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import pdfBrowserService from '@/services/pdf-browser.service';
 
 export type ThermalPaperWidth = '58mm' | '80mm';
-export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v6';
+export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v9';
 const THERMAL_PDF_CACHE_TTL_MS = 3 * 60 * 1000;
 const THERMAL_PDF_CACHE_MAX_ENTRIES = 40;
 export interface ThermalRenderDiagnostics {
@@ -34,13 +34,53 @@ export const getThermalPdfOptions = (width: ThermalPaperWidth, contentHeightPx: 
   margin: { top: 0, right: 0, bottom: 0, left: 0 },
 });
 
-/** Render the React thermal document currently displayed by the print route. */
+/** Ask PDF viewers to fit the narrow thermal page to the available window width.
+ * This changes only the document's initial view; page dimensions and print scale
+ * stay unchanged for the selected 58mm/80mm roll.
+ */
+export const setThermalPdfInitialFitToWidth = (pdf: Buffer): Buffer => {
+  const source = pdf.toString('latin1');
+  const objectPattern = /(^|[\r\n])(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g;
+  const objects = [...source.matchAll(objectPattern)];
+  const catalog = objects.find((object) => /\/Type\s*\/Catalog\b/.test(object[4]));
+  const firstPage = objects.find((object) => /\/Type\s*\/Page\b/.test(object[4]));
+  const xrefMarkers = [...source.matchAll(/startxref\s+(\d+)/g)];
+  const previousXref = xrefMarkers[xrefMarkers.length - 1]?.[1];
+  if (!catalog || !firstPage || !previousXref) {
+    throw new Error('Unable to set initial view on the generated thermal PDF');
+  }
+
+  const catalogId = Number(catalog[2]);
+  const catalogGeneration = Number(catalog[3]);
+  const pageId = Number(firstPage[2]);
+  const pageGeneration = Number(firstPage[3]);
+  const body = catalog[4];
+  const openActionPattern = /\/OpenAction\s+(?:\[[^\]]*\]|\d+\s+\d+\s+R)/;
+  const withoutOpenAction = body.replace(openActionPattern, '');
+  const closingDictionary = withoutOpenAction.lastIndexOf('>>');
+  if (closingDictionary < 0) throw new Error('Generated thermal PDF catalog is malformed');
+  const updatedBody = `${withoutOpenAction.slice(0, closingDictionary)} /OpenAction [${pageId} ${pageGeneration} R /FitH null] ${withoutOpenAction.slice(closingDictionary)}`;
+
+  const separator = source.endsWith('\n') || source.endsWith('\r') ? '' : '\n';
+  const objectOffset = Buffer.byteLength(source + separator, 'latin1');
+  const objectText = `${catalogId} ${catalogGeneration} obj\n${updatedBody}\nendobj\n`;
+  const xrefOffset = objectOffset + Buffer.byteLength(objectText, 'latin1');
+  const objectCount = Math.max(
+    Number(source.match(/\/Size\s+(\d+)/)?.[1] ?? 0),
+    ...objects.map((object) => Number(object[2]) + 1),
+  );
+  const update = `${objectText}xref\n${catalogId} 1\n${String(objectOffset).padStart(10, '0')} ${String(catalogGeneration).padStart(5, '0')} n \ntrailer\n<< /Size ${objectCount} /Root ${catalogId} ${catalogGeneration} R /Prev ${previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+
+  return Buffer.concat([pdf, Buffer.from(`${separator}${update}`, 'latin1')]);
+};
+
+/** Render a self-contained thermal HTML document without loading the frontend SPA. */
 export class ThermalReactPdfRenderer {
   private readonly pdfCache = new Map<string, { buffer: Buffer; expiresAt: number }>();
   private readonly inFlightRenders = new Map<string, Promise<Buffer>>();
 
-  async render(url: string, width: ThermalPaperWidth, currentDocumentData?: unknown): Promise<Buffer> {
-    if (currentDocumentData === undefined) return (await this.renderWithDiagnostics(url, width)).buffer;
+  async render(html: string, width: ThermalPaperWidth, currentDocumentData?: unknown): Promise<Buffer> {
+    if (currentDocumentData === undefined) return (await this.renderWithDiagnostics(html, width)).buffer;
 
     const cacheKey = createHash('sha256')
       .update(JSON.stringify({ version: THERMAL_RENDER_CACHE_VERSION, width, currentDocumentData }) ?? '')
@@ -59,7 +99,7 @@ export class ThermalReactPdfRenderer {
 
     let render = this.inFlightRenders.get(cacheKey);
     if (!render) {
-      render = this.renderWithDiagnostics(url, width).then(({ buffer }) => {
+      render = this.renderWithDiagnostics(html, width).then(({ buffer }) => {
         if (this.pdfCache.size >= THERMAL_PDF_CACHE_MAX_ENTRIES) {
           const oldestKey = this.pdfCache.keys().next().value;
           if (oldestKey) this.pdfCache.delete(oldestKey);
@@ -73,7 +113,7 @@ export class ThermalReactPdfRenderer {
     return Buffer.from(await render);
   }
 
-  async renderWithDiagnostics(url: string, width: ThermalPaperWidth): Promise<ThermalRenderResult> {
+  async renderWithDiagnostics(html: string, width: ThermalPaperWidth): Promise<ThermalRenderResult> {
     const context = await pdfBrowserService.createContext();
 
     try {
@@ -82,17 +122,20 @@ export class ThermalReactPdfRenderer {
       // printable document extent when the receipt itself is absolutely
       // positioned, which Chromium paginates as blank roll pages.
       await page.setViewport({ width: width === '58mm' ? 219 : 302, height: 1, deviceScaleFactor: 1 });
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      if (!response?.ok()) throw new Error(`Thermal print page returned HTTP ${response?.status() ?? 'no response'} at ${url}`);
-      await page.waitForFunction('window.__THERMAL_READY__ === true', { timeout: 30000 });
-      const renderError = await page.evaluate('window.__THERMAL_ERROR__ || ""') as string;
-      if (renderError) throw new Error(`Thermal print route failed to load data: ${renderError}`);
-
+      // Keep this renderer independent from the public frontend and any remote
+      // resources accidentally introduced into a thermal template.
+      await page.setRequestInterception(true);
+      page.on('request', (request) => {
+        if (request.url().startsWith('data:') || request.url() === 'about:blank') {
+          void request.continue();
+        } else {
+          void request.abort();
+        }
+      });
+      await page.setContent(html, { waitUntil: 'load' });
       await page.emulateMediaType('print');
-      await page.evaluate(() => (globalThis as any).document.body.classList.add('thermal-printing'));
       await page.evaluate(async () => {
         const browserDocument = (globalThis as any).document;
-        await Promise.all([400, 500, 600, 700].map((weight) => browserDocument.fonts.load(`${weight} 10px Inter`)));
         await browserDocument.fonts.ready;
         await Promise.all(Array.from(browserDocument.images as any[], (image) => image.decode().catch(() => undefined)));
         const requestAnimationFrame = (globalThis as any).requestAnimationFrame;
@@ -138,7 +181,7 @@ export class ThermalReactPdfRenderer {
       // scrollHeight can be zero or viewport-sized. Descendant bounds include
       // out-of-flow content and give the actual final content edge.
       const contentHeight = getThermalContentHeightPx(diagnostics.contentBounds);
-      const buffer = Buffer.from(await page.pdf(getThermalPdfOptions(width, contentHeight)));
+      const buffer = setThermalPdfInitialFitToWidth(Buffer.from(await page.pdf(getThermalPdfOptions(width, contentHeight))));
       return { buffer, diagnostics };
     } finally {
       await pdfBrowserService.releaseContext(context);

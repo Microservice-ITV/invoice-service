@@ -396,9 +396,10 @@ test('thermal invoice download passes the requested paper width to Puppeteer ren
   try {
     const service = new InvoiceService();
     for (const width of ['58mm', '80mm'] as const) {
-      const result = await service.downloadThermalInvoicePdf('invoice-1', { role: 'admin' }, width);
+      const result = await service.downloadThermalInvoicePdf('invoice-1', { role: 'seller', shopId: 'shop-1' }, width);
       assert.equal(result?.buffer.toString(), '%PDF-thermal');
     }
+    assert.equal(await service.downloadThermalInvoicePdf('invoice-1', { role: 'seller', shopId: 'shop-2' }, '80mm'), null);
     assert.deepEqual(widths, ['58mm', '80mm']);
   } finally {
     invoiceRepository.findById = originalFindById;
