@@ -1,5 +1,7 @@
 import puppeteer, { Browser, BrowserContext } from 'puppeteer';
 
+const BROWSER_IDLE_CLOSE_MS = 15_000;
+
 /**
  * Reuse Chromium across nearby PDF requests while isolating every render in
  * its own browser context. The idle timeout closes Chromium after bursts so
@@ -75,7 +77,8 @@ export class PdfBrowserService {
       } catch {
         if (this.browserPromise === closing) this.browserPromise = null;
       }
-    }, 10_000);
+    }, BROWSER_IDLE_CLOSE_MS);
+    this.idleTimer.unref?.();
   }
 }
 

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import pdfBrowserService from '@/services/pdf-browser.service';
 
 export type ThermalPaperWidth = '58mm' | '80mm';
-export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v10';
+export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v11';
 const THERMAL_PDF_CACHE_TTL_MS = 3 * 60 * 1000;
 const THERMAL_PDF_CACHE_MAX_ENTRIES = 40;
 export interface ThermalRenderDiagnostics {
@@ -15,6 +15,8 @@ export interface ThermalRenderDiagnostics {
   contentBounds: { top: number; left: number; right: number; bottom: number; height: number };
   contentText: string;
   pageBreakAvoidCount: number;
+  horizontalOverflowCount: number;
+  siblingOverlapCount: number;
 }
 
 export interface ThermalRenderResult {
@@ -159,6 +161,24 @@ export class ThermalReactPdfRenderer {
           top: Math.min(combined.top, item.top), left: Math.min(combined.left, item.left),
           right: Math.max(combined.right, item.right), bottom: Math.max(combined.bottom, item.bottom),
         }), { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom });
+        const layoutElements = Array.from(root.querySelectorAll('.thermal-receipt, .metadata-pair, .meta-cell, .address, .item-row')) as any[];
+        const horizontalOverflowCount = layoutElements.filter((node) => node.scrollWidth > node.clientWidth + 1).length;
+        const siblingOverlapCount = Array.from(root.querySelectorAll('.metadata-pair, .meta-cell, .item-row'))
+          .reduce((count: number, parent: any) => {
+            const children = Array.from(parent.children as any[])
+              .map((child: any) => child.getBoundingClientRect())
+              .filter((child: any) => child.width > 0 && child.height > 0);
+            for (let leftIndex = 0; leftIndex < children.length; leftIndex += 1) {
+              for (let rightIndex = leftIndex + 1; rightIndex < children.length; rightIndex += 1) {
+                const left = children[leftIndex];
+                const right = children[rightIndex];
+                const overlapWidth = Math.min(left.right, right.right) - Math.max(left.left, right.left);
+                const overlapHeight = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top);
+                if (overlapWidth > 1 && overlapHeight > 1) count += 1;
+              }
+            }
+            return count;
+          }, 0);
         const style = getStyle(root);
         const bodyStyle = getStyle(doc.body);
         return {
@@ -170,6 +190,8 @@ export class ThermalReactPdfRenderer {
           },
           contentBounds: { ...bounds, height: bounds.bottom - bounds.top },
           contentText: (root as any).innerText,
+          horizontalOverflowCount,
+          siblingOverlapCount,
           pageBreakAvoidCount: Array.from(root.querySelectorAll('*')).filter((node: any) => {
             const childStyle = getStyle(node);
             return childStyle.breakInside === 'avoid' || childStyle.pageBreakInside === 'avoid';
