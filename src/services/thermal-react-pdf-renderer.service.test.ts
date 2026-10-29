@@ -40,6 +40,8 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
   const originalRender = thermalReactPdfRenderer.render;
   const originalFrontendUrl = env.FRONTEND_BASE_URL;
   const requests: Array<{ html: string; width: string }> = [];
+  const invoiceWithOrder = { ...invoicePayload, orderReference: 'ORDER-123' };
+  const receiptWithOrder = { ...receiptPayload, orderReference: 'ORDER-123' };
   thermalReactPdfRenderer.render = async (html, width) => {
     requests.push({ html, width });
     return Buffer.from('%PDF-react-thermal');
@@ -48,8 +50,8 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
 
   try {
     for (const width of ['58mm', '80mm'] as const) {
-      await pdfGeneratorService.renderThermalInvoicePdf(invoicePayload, width);
-      await receiptPdfService.renderReceiptPdf(receiptPayload, width, invoicePayload);
+      await pdfGeneratorService.renderThermalInvoicePdf(invoiceWithOrder, width);
+      await receiptPdfService.renderReceiptPdf(receiptWithOrder, width, invoiceWithOrder);
     }
     assert.equal(requests.length, 4);
     for (let index = 0; index < requests.length; index += 1) {
@@ -60,6 +62,25 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
       assert.match(request.html, new RegExp(`@page \\{ size: ${expectedWidth}`));
       assert.match(request.html, new RegExp(`data-thermal-document="${isReceipt ? 'receipt' : 'invoice'}"`));
       assert.match(request.html, new RegExp(`font: ${expectedWidth === '58mm' ? '15px' : '16\\.5px'}/`), 'paper width should select its stable width-specific typography profile');
+      assert.match(request.html, /\.metadata \{ display: grid; gap: 1px; \}/, 'metadata fields should retain their stacked list spacing');
+      assert.match(request.html, /\.meta-row, \.total-row \{ display: grid; grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1\.55fr\);/, 'each metadata field should keep its left-label/right-value row');
+      assert.match(request.html, new RegExp(`\\.meta-row \\.meta-label, \\.meta-row \\.meta-value \\{ font-size: ${expectedWidth === '58mm' ? '8px' : '10.5px'}`), 'metadata should use width-specific typography');
+      assert.doesNotMatch(request.html, /metadata-pair|meta-cell|grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1fr\)/, 'metadata should not use a side-by-side layout');
+      const expectedMetadataLabels = isReceipt
+        ? ['Receipt No:', 'Invoice No:', 'Date:', 'Order Ref:']
+        : ['Invoice No:', 'Date:', 'Order:'];
+      let previousMetadataPosition = -1;
+      for (const label of expectedMetadataLabels) {
+        const position = request.html.indexOf(`<span class="meta-label">${label}</span>`);
+        assert.ok(position > previousMetadataPosition, `${label} should appear as a separate stacked metadata row`);
+        const rowEnd = request.html.indexOf('</div>', position);
+        const valuePosition = request.html.indexOf('<span class="meta-value', position);
+        assert.ok(valuePosition > position && valuePosition < rowEnd, `${label} value should appear to its right in the same row`);
+        previousMetadataPosition = position;
+      }
+      assert.doesNotMatch(request.html, /<h3 class="section-title">Items<\/h3>/, 'item list should not have a standalone Items heading');
+      assert.match(request.html, new RegExp(`\\.address \\{ font-size: ${expectedWidth === '58mm' ? '10px' : '11\\.5px'}`));
+      assert.match(request.html, new RegExp(`\\.item-name, \\.item-qty \\{ font-size: ${expectedWidth === '58mm' ? '11\\.5px' : '13\\.5px'}`));
       assert.match(request.html, /data:image\/png;base64,/);
       assert.match(request.html, /'Courier New', Courier, monospace/, 'thermal output should use a compact monochrome POS typeface');
       assert.match(request.html, /Quality products/);
@@ -190,6 +211,8 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
       assert.ok(result.pageDetails[0].textOperatorCount > 0, `${kind} ${width} page must contain printable text`);
       assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1, `${kind} should use ${width} paper width`);
       assert.ok(result.diagnostics.contentBounds.right <= Number.parseInt(width, 10) * 96 / 25.4 + 1, `${kind} ${width} content should stay inside the physical paper width`);
+      assert.equal(result.diagnostics.horizontalOverflowCount, 0, `${kind} ${width} should not clip layout boxes`);
+      assert.equal(result.diagnostics.siblingOverlapCount, 0, `${kind} ${width} should not overlap metadata or item columns`);
       assert.ok(result.pageDetails[0].heightPt > 0 && result.pageDetails[0].heightPt < 800, `${kind} should use content height`);
       assert.match(result.diagnostics.contentText, /Rendered customer/);
       assert.match(result.diagnostics.contentText, /Pet Supplies sample/);
@@ -199,14 +222,34 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
 
     const longInvoice = {
       ...invoicePayload,
+      shippingAddress: {
+        address_line_1: 'Apartment 1208, Building 45, Very Long Residential Complex Road, Mingaladon Township',
+        township: 'Northern District with an intentionally long neighborhood name',
+        city: 'Yangon', region: 'Yangon Region', postal_code: '11021', country: 'Myanmar',
+      },
       lineItems: Array.from({ length: 80 }, (_, index) => ({
-        name: `Long product ${index + 1} with a descriptive name`, quantity: 1, total: '190000',
+        name: `Long product ${index + 1} with an intentionally extended descriptive item name for thermal wrapping`, quantity: 1, total: '190000',
       })),
     };
     const longResult = await readPdf(buildThermalInvoiceHtml(longInvoice, width), width);
     assert.equal(longResult.pageCount, 1, `long ${width} invoice stays on one dynamic-height page`);
     assert.ok(longResult.pageDetails[0].heightPt > 300, 'long invoice should grow to include every item');
-    assert.match(longResult.diagnostics.contentText, /Long product 80 with a descriptive name/);
+    assert.match(longResult.diagnostics.contentText, /Long product 80 with an intentionally extended descriptive item name for thermal wrapping/);
+    assert.match(longResult.diagnostics.contentText, /Very Long Residential Complex Road/);
+    assert.equal(longResult.diagnostics.horizontalOverflowCount, 0, `long ${width} invoice should wrap without clipping`);
+    assert.equal(longResult.diagnostics.siblingOverlapCount, 0, `long ${width} invoice should not overlap metadata or item columns`);
+
+    const longReceipt = {
+      ...receiptPayload,
+      receiptNumber: `REC-${'LONG-'.repeat(8)}000035`,
+      invoiceNumber: `INV-${'NUMBER-'.repeat(5)}000035`,
+    };
+    const longReceiptResult = await readPdf(buildThermalReceiptHtml(longReceipt, width, longInvoice), width);
+    assert.equal(longReceiptResult.pageCount, 1, `long ${width} receipt should remain a single content-sized page`);
+    assert.match(longReceiptResult.diagnostics.contentText, /REC-LONG-LONG-LONG/);
+    assert.match(longReceiptResult.diagnostics.contentText, /Long product 80 with an intentionally extended descriptive item name for thermal wrapping/);
+    assert.equal(longReceiptResult.diagnostics.horizontalOverflowCount, 0, `long ${width} receipt should wrap without clipping`);
+    assert.equal(longReceiptResult.diagnostics.siblingOverlapCount, 0, `long ${width} receipt should not overlap metadata or item columns`);
   }
 });
 

@@ -82,6 +82,7 @@ COPY --from=build --chown=app:app /app/prisma.config.ts ./prisma.config.ts
 COPY --chown=app:app package.json package-lock.json ./
 
 COPY --chown=app:app src/assets/fonts ./assets/fonts
+COPY --chown=app:app src/assets/dni_website_qr.png ./src/assets/dni_website_qr.png
 
 COPY --chown=app:app --chmod=755 \
     docker/node/docker-entrypoint.prod.sh \

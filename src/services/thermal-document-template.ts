@@ -122,36 +122,39 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
   const sideMargin = width === '58mm' ? '3mm' : '5mm';
   const qrSize = width === '58mm' ? '12mm' : '15mm';
   const type = width === '58mm'
-    ? { body: '15px', line: '1.22', brand: '14.5px', tagline: '5.5px', title: '15px', meta: '10.5px', section: '12.5px', customer: '14.5px', item: '12.5px', itemLabel: '10px', amount: '10px', total: '13.5px', qrCaption: '9.5px', footer: '12px', small: '9px', itemAmountWidth: '22mm', itemGap: '.7mm' }
-    : { body: '16.5px', line: '1.22', brand: '20px', tagline: '7px', title: '19px', meta: '13px', section: '14.5px', customer: '16px', item: '15px', itemLabel: '11.5px', amount: '12px', total: '16px', qrCaption: '11px', footer: '14px', small: '10.5px', itemAmountWidth: '25mm', itemGap: '1.5mm' };
+    ? { body: '15px', line: '1.22', brand: '14.5px', tagline: '5.5px', title: '15px', meta: '10.5px', metadata: '8px', section: '12.5px', sectionPadding: '.7mm 1mm', sectionTitleGap: '.5mm', shippingPadding: '.35mm 1mm', address: '10px', addressLine: '1.15', customer: '14.5px', item: '11.5px', itemLabel: '10px', itemRowPadding: '.6mm 0', amount: '10px', total: '13.5px', qrCaption: '9.5px', footer: '12px', small: '9px', itemAmountWidth: '22mm', itemGap: '.7mm' }
+    : { body: '16.5px', line: '1.22', brand: '20px', tagline: '7px', title: '19px', meta: '13px', metadata: '10.5px', section: '14.5px', sectionPadding: '1mm 1.5mm', sectionTitleGap: '.8mm', shippingPadding: '.65mm 1.5mm', address: '11.5px', addressLine: '1.2', customer: '16px', item: '13.5px', itemLabel: '11.5px', itemRowPadding: '.8mm 0', amount: '12px', total: '16px', qrCaption: '11px', footer: '14px', small: '10.5px', itemAmountWidth: '25mm', itemGap: '1.5mm' };
   return `
     @page { size: ${paperWidth} auto; margin: 0; }
     * { box-sizing: border-box; }
     html, body { width: ${paperWidth}; min-height: 0; height: auto; margin: 0; padding: 0; overflow: visible; }
     body { color: #000; background: #fff; font: ${type.body}/${type.line} 'Courier New', Courier, monospace; }
     .thermal-receipt { width: ${contentWidth}; margin: 0; padding: 6mm 0; color: #000; background: #fff; overflow: visible; }
-    header, section, footer { padding: 1mm 1.5mm; }
+    header, section, footer { padding: ${type.sectionPadding}; }
     .center { text-align: center; }
     .brand { display: flex; align-items: center; justify-content: center; gap: 2mm; margin: 0 0 1mm; }
     .brand-mark { width: 8mm; height: 8mm; flex: none; }
     .brand-copy { min-width: 0; text-align: left; }
     .store-name { margin: 0; font-size: ${type.brand}; line-height: 1.1; font-weight: 700; letter-spacing: -.3px; }
     .tagline { margin: 1px 0 0; font-size: ${type.tagline}; line-height: 1.2; letter-spacing: .35px; text-transform: uppercase; }
-    .document-title { margin: 1mm 0 2mm; font-size: ${type.title}; line-height: 1.15; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; }
+    .document-title { margin: 1mm 0 1.5mm; font-size: ${type.title}; line-height: 1.15; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; }
     .metadata { display: grid; gap: 1px; }
     .meta-row, .total-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr); gap: 1.5mm; align-items: baseline; }
     .meta-label, .label { color: #222; font-size: ${type.meta}; }
     .meta-value, .value { min-width: 0; text-align: left; font-size: ${type.meta}; overflow-wrap: anywhere; }
+    .meta-row .meta-label, .meta-row .meta-value { font-size: ${type.metadata}; }
     .total-row .value { text-align: right; }
     .bold { font-weight: 700; }
     .divider { border-top: 1px dashed #333; margin: 1.5mm 0; }
-    .section-title { margin: 0 0 1mm; font-size: ${type.section}; font-weight: 700; }
+    .section-title { margin: 0 0 ${type.sectionTitleGap}; font-size: ${type.section}; font-weight: 700; }
     .customer { font-size: ${type.customer}; overflow-wrap: anywhere; }
     .muted { color: #444; }
-    .address { overflow-wrap: anywhere; line-height: 1.25; }
+    .shipping-section { padding: ${type.shippingPadding}; }
+    .shipping-section .section-title { margin-bottom: ${type.sectionTitleGap}; }
+    .address { font-size: ${type.address}; overflow-wrap: anywhere; line-height: ${type.addressLine}; }
     .items-heading, .item-row { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(${type.itemAmountWidth},auto); align-items: baseline; column-gap: ${type.itemGap}; }
     .items-heading { border-bottom: 1px dashed #333; padding: 0 0 1mm; margin-bottom: 1px; font-size: ${type.itemLabel}; font-weight: 700; text-transform: none; }
-    .item-row { padding: 1mm 0; border-bottom: 1px dashed #777; break-inside: avoid; page-break-inside: avoid; }
+    .item-row { padding: ${type.itemRowPadding}; border-bottom: 1px dashed #777; break-inside: avoid; page-break-inside: avoid; }
     .item-name { min-width: 0; overflow-wrap: anywhere; }
     .item-qty, .item-amount { text-align: right; white-space: nowrap; }
     .item-name, .item-qty { font-size: ${type.item}; }
@@ -225,9 +228,9 @@ export const buildThermalInvoiceHtml = (invoice: ThermalInvoiceData, width: Ther
       <header><div class="center">${brandHeader('Invoice')}</div><div class="metadata">${rows}</div></header>
       <div class="divider"></div>
       <section><h3 class="section-title">Bill To</h3><div class="customer">${escapeHtml(clean(invoice.customerName) || 'Customer')}</div>${invoice.customerPhone ? `<div class="customer muted">${escapeHtml(invoice.customerPhone)}</div>` : ''}</section>
-      <section><h3 class="section-title">Shipping Address</h3><div class="address">${shippingAddress.length ? shippingAddress.map(escapeHtml).join(', ') : '—'}</div></section>
+      <section class="shipping-section"><h3 class="section-title">Shipping Address</h3><div class="address">${shippingAddress.length ? shippingAddress.map(escapeHtml).join(', ') : '—'}</div></section>
       <div class="divider"></div>
-      <section><h3 class="section-title">Items</h3>${itemContent}</section>
+      <section>${itemContent}</section>
       <div class="divider"></div>
       <section class="totals">${totals}</section>
       ${thermalQrFooter(qr, 'This invoice is for your records.')}
@@ -257,7 +260,7 @@ export const buildThermalReceiptHtml = (
     totalRow('Total Collected:', receipt.grandTotal, currency, true),
   ].join('');
   const itemContent = items.length
-    ? `<h3 class="section-title">Items</h3><div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Price</span></div>${itemRows(items, currency)}`
+    ? `<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Price</span></div>${itemRows(items, currency)}`
     : '';
   const qr = qrImageDataUri();
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${baseStyles(width)}</style></head><body>
