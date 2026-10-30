@@ -65,18 +65,27 @@ export class ThermalPdfWorker {
     return this.invalidateStaleReadyArtifact(job);
   }
 
-  private async invalidateStaleReadyArtifact<T extends { id: string; status: string; templateVersion: string | null } | null>(job: T): Promise<T> {
-    if (!job || job.status !== 'READY' || job.templateVersion === THERMAL_RENDER_CACHE_VERSION) return job;
+  private async invalidateStaleReadyArtifact(
+      job: Awaited<ReturnType<typeof prisma.thermalPdfJob.findUnique>>
+    ) {
+      if (!job || job.status !== 'READY' || job.templateVersion === THERMAL_RENDER_CACHE_VERSION) {
+        return job;
+      }
 
-    await prisma.thermalPdfJob.updateMany({
-      where: { id: job.id, status: 'READY', templateVersion: job.templateVersion },
-      data: {
-        status: 'PENDING', artifactRef: null, lastError: null,
-        nextAttemptAt: new Date(), leaseToken: null, leaseUntil: null,
-      },
-    });
-    return prisma.thermalPdfJob.findUnique({ where: { id: job.id } }) as Promise<T>;
-  }
+      await prisma.thermalPdfJob.updateMany({
+        where: { id: job.id, status: 'READY', templateVersion: job.templateVersion },
+        data: {
+          status: 'PENDING',
+          artifactRef: null,
+          lastError: null,
+          nextAttemptAt: new Date(),
+          leaseToken: null,
+          leaseUntil: null,
+        },
+      });
+
+      return prisma.thermalPdfJob.findUnique({ where: { id: job.id } });
+    }
 
   start(pollMs = POLL_MS): void {
     if (!this.stopped) return;
