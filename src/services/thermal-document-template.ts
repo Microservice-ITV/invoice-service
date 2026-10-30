@@ -5,6 +5,7 @@ export type ThermalDocumentWidth = '58mm' | '80mm';
 
 export interface ThermalLineItem {
   name?: string | null;
+  sku?: string | null;
   variantName?: string | null;
   quantity: number;
   unitPrice?: string | number | null;
@@ -152,13 +153,20 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
     .shipping-section { padding: ${type.shippingPadding}; }
     .shipping-section .section-title { margin-bottom: ${type.sectionTitleGap}; }
     .address { font-size: ${type.address}; overflow-wrap: anywhere; line-height: ${type.addressLine}; }
-    .items-heading, .item-row { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(${type.itemAmountWidth},auto); align-items: baseline; column-gap: ${type.itemGap}; }
+    .items-heading, .item-wide-row { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(${type.itemAmountWidth},max-content); align-items: baseline; column-gap: ${type.itemGap}; }
     .items-heading { border-bottom: 1px dashed #333; padding: 0 0 1mm; margin-bottom: 1px; font-size: ${type.itemLabel}; font-weight: 700; text-transform: none; }
-    .item-row { padding: ${type.itemRowPadding}; border-bottom: 1px dashed #777; break-inside: avoid; page-break-inside: avoid; }
-    .item-name { min-width: 0; overflow-wrap: anywhere; }
+    .item-block { padding: ${type.itemRowPadding}; border-bottom: 1px dashed #777; break-inside: avoid; page-break-inside: avoid; }
+    .item-wide-row, .item-narrow-details { break-inside: avoid; page-break-inside: avoid; }
+    .item-wide-row .item-name { display: block; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; overflow-wrap: normal; word-break: normal; }
+    .item-name { display: block; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; overflow-wrap: normal; word-break: normal; }
     .item-qty, .item-amount { text-align: right; white-space: nowrap; }
     .item-name, .item-qty { font-size: ${type.item}; }
     .item-amount { min-width: ${type.itemAmountWidth}; font-size: ${type.amount}; font-weight: 700; }
+    .item-narrow-name { font-size: ${type.item}; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-narrow-details { display: flex; justify-content: space-between; align-items: baseline; gap: ${type.itemGap}; }
+    .item-unit { min-width: 0; white-space: nowrap; font-size: ${type.amount}; }
+    .item-total { white-space: nowrap; text-align: right; font-size: ${type.amount}; font-weight: 700; }
+    .item-secondary { display: flex; flex-wrap: wrap; column-gap: 2mm; overflow-wrap: anywhere; color: #444; font-size: ${type.small}; line-height: 1.2; }
     .totals { display: grid; gap: 1mm; padding-top: 1mm; }
     .double-divider { border-top: 1px dashed #333; margin: 1mm 0; }
     .grand-total .label, .grand-total .value { color: #000; font-size: ${type.total}; font-weight: 700; }
@@ -179,12 +187,17 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
   `;
 };
 
-const itemRows = (items: ThermalLineItem[], currency: string): string => items.map((item) => `
-  <div class="item-row">
-    <span class="item-name">${escapeHtml([clean(item.name) || 'Product', clean(item.variantName)].filter(Boolean).join(' · '))}</span>
-    <span class="item-qty">× ${escapeHtml(item.quantity)}</span>
-    <span class="item-amount">${formatAmount(item.total, currency)}</span>
-  </div>`).join('');
+const itemRows = (items: ThermalLineItem[], currency: string, width: ThermalDocumentWidth): string => items.map((item) => {
+  const name = escapeHtml(clean(item.name));
+  const secondary = [
+    ...(item.sku ? [`<span>SKU: ${escapeHtml(item.sku)}</span>`] : []),
+    ...(item.variantName ? [`<span>${escapeHtml(item.variantName)}</span>`] : []),
+  ].join('');
+  if (width === '58mm') {
+    return `<div class="item-block"><div class="item-name item-narrow-name">${name}</div><div class="item-narrow-details"><span class="item-unit">${escapeHtml(item.quantity)} × ${formatAmount(item.unitPrice, currency)}</span><span class="item-total">${formatAmount(item.total, currency)}</span></div>${secondary ? `<div class="item-secondary">${secondary}</div>` : ''}</div>`;
+  }
+  return `<div class="item-block"><div class="item-wide-row"><span class="item-name">${name}</span><span class="item-qty">×${escapeHtml(item.quantity)}</span><span class="item-total">${formatAmount(item.total, currency)}</span></div><div class="item-secondary"><span>Unit: ${formatAmount(item.unitPrice, currency)}</span>${secondary}</div></div>`;
+}).join('');
 
 const metaRow = (label: string, value: unknown, strong = false): string => `
   <div class="meta-row"><span class="meta-label">${escapeHtml(label)}</span><span class="meta-value${strong ? ' bold' : ''}">${escapeHtml(value)}</span></div>`;
@@ -220,7 +233,7 @@ export const buildThermalInvoiceHtml = (invoice: ThermalInvoiceData, width: Ther
   ].join('');
   const qr = qrImageDataUri();
   const itemContent = items.length
-    ? `<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Price</span></div>${itemRows(items, currency)}`
+    ? `${width === '80mm' ? '<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Total</span></div>' : ''}${itemRows(items, currency, width)}`
     : '<div class="muted">No line items</div>';
   const documentTitle = `Invoice ${clean(invoice.invoiceNumber) || clean(invoice.invoiceId)}`;
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(documentTitle)}</title><style>${baseStyles(width)}</style></head><body>
@@ -260,7 +273,7 @@ export const buildThermalReceiptHtml = (
     totalRow('Total Collected:', receipt.grandTotal, currency, true),
   ].join('');
   const itemContent = items.length
-    ? `<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Price</span></div>${itemRows(items, currency)}`
+    ? `${width === '80mm' ? '<div class="items-heading"><span>Item</span><span class="item-qty">Qty</span><span class="item-amount">Total</span></div>' : ''}${itemRows(items, currency, width)}`
     : '';
   const qr = qrImageDataUri();
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${baseStyles(width)}</style></head><body>

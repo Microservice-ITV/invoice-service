@@ -10,6 +10,7 @@ import { startPaymentCompletedConsumer } from '@/rabbitmq/consumers/payment-comp
 import { startPaymentCollectedConsumer } from '@/rabbitmq/consumers/payment-collected.consumer';
 import { startOrderPaidConsumer } from '@/rabbitmq/consumers/order-paid.consumer';
 import logger from '@/utils/logger';
+import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 
 const startServer = async (): Promise<void> => {
   try {
@@ -25,6 +26,7 @@ const startServer = async (): Promise<void> => {
 
     await getRabbitChannel();
     await initializeConsumers();
+    thermalPdfWorker.start();
     logger.info('RabbitMQ consumer initialized');
 
     const server = app.listen(env.PORT, () => {
@@ -35,6 +37,7 @@ const startServer = async (): Promise<void> => {
       logger.warn(`Received ${signal}, shutting down invoice service`);
       server.close(async () => {
         try {
+          await thermalPdfWorker.stop();
           await prisma.$disconnect();
           await closeRabbitConnection();
           logger.info('Invoice service shut down gracefully');

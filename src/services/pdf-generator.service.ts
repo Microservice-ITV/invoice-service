@@ -46,6 +46,7 @@ export interface InvoicePdfPayload {
   customerEmail?: string | null;
   lineItems?: Array<{
     sku?: string | null;
+    variantName?: string | null;
     name: string;
     quantity: number;
     unitPrice: string;

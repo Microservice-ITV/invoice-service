@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import pdfBrowserService from '@/services/pdf-browser.service';
 
 export type ThermalPaperWidth = '58mm' | '80mm';
-export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v11';
+export const THERMAL_RENDER_CACHE_VERSION = 'thermal-layout-v12';
 const THERMAL_PDF_CACHE_TTL_MS = 3 * 60 * 1000;
 const THERMAL_PDF_CACHE_MAX_ENTRIES = 40;
 export interface ThermalRenderDiagnostics {
@@ -161,9 +161,9 @@ export class ThermalReactPdfRenderer {
           top: Math.min(combined.top, item.top), left: Math.min(combined.left, item.left),
           right: Math.max(combined.right, item.right), bottom: Math.max(combined.bottom, item.bottom),
         }), { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom });
-        const layoutElements = Array.from(root.querySelectorAll('.thermal-receipt, .metadata-pair, .meta-cell, .address, .item-row')) as any[];
+        const layoutElements = Array.from(root.querySelectorAll('.thermal-receipt, .metadata-pair, .meta-cell, .address, .item-block, .item-wide-row, .item-narrow-details')) as any[];
         const horizontalOverflowCount = layoutElements.filter((node) => node.scrollWidth > node.clientWidth + 1).length;
-        const siblingOverlapCount = Array.from(root.querySelectorAll('.metadata-pair, .meta-cell, .item-row'))
+        const siblingOverlapCount = Array.from(root.querySelectorAll('.metadata-pair, .meta-cell, .item-wide-row, .item-narrow-details'))
           .reduce((count: number, parent: any) => {
             const children = Array.from(parent.children as any[])
               .map((child: any) => child.getBoundingClientRect())

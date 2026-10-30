@@ -38,6 +38,7 @@ import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-sna
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
+import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 import invoiceNotificationPublisher, {
   buildInvoiceNotificationEvent,
 } from '@/rabbitmq/publishers/invoice-notification.publisher';
@@ -374,9 +375,10 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
   }
 });
 
-test('thermal invoice download passes the requested paper width to Puppeteer rendering', async () => {
+test('thermal invoice download returns processing while a durable artifact is pending', async () => {
   const originalFindById = invoiceRepository.findById;
-  const originalRender = pdfGeneratorService.renderThermalInvoicePdf;
+  const originalStatus = thermalPdfWorker.getStatus;
+  const originalEnqueue = thermalPdfWorker.enqueue;
   const widths: string[] = [];
   invoiceRepository.findById = async () => ({
     id: 'invoice-1', invoiceNumber: 'INV-20261008-000001', orderReference: 'ORD-1', orderId: 'order-1',
@@ -389,21 +391,21 @@ test('thermal invoice download passes the requested paper width to Puppeteer ren
     grandTotal: { toString: () => '10' }, lineItems: [{ name: 'Product', quantity: 1, total: '10', unitPrice: '10' }],
     paymentMethod: 'CASH', status: 'PAID', createdAt: new Date(),
   } as never);
-  pdfGeneratorService.renderThermalInvoicePdf = async (_payload, width) => {
-    widths.push(width);
-    return Buffer.from('%PDF-thermal');
-  };
+  thermalPdfWorker.getStatus = async (_id, width) => { widths.push(width); return null; };
+  thermalPdfWorker.enqueue = async () => undefined;
   try {
     const service = new InvoiceService();
     for (const width of ['58mm', '80mm'] as const) {
       const result = await service.downloadThermalInvoicePdf('invoice-1', { role: 'seller', shopId: 'shop-1' }, width);
-      assert.equal(result?.buffer.toString(), '%PDF-thermal');
+      assert.equal(result?.processing, true);
+      if (result?.processing) assert.equal(result.status, 'PENDING');
     }
     assert.equal(await service.downloadThermalInvoicePdf('invoice-1', { role: 'seller', shopId: 'shop-2' }, '80mm'), null);
-    assert.deepEqual(widths, ['58mm', '80mm']);
+    assert.deepEqual(widths, ['58mm', '58mm', '80mm', '80mm']);
   } finally {
     invoiceRepository.findById = originalFindById;
-    pdfGeneratorService.renderThermalInvoicePdf = originalRender;
+    thermalPdfWorker.getStatus = originalStatus;
+    thermalPdfWorker.enqueue = originalEnqueue;
   }
 });
 
@@ -416,6 +418,7 @@ const withSnapshotDependencies = async <T>(
   const originalClaimPdfGeneration = invoiceRepository.claimPdfGeneration;
   const originalIssueReceipt = receiptService.issueForInvoice;
   const originalUpdateReceiptStatus = receiptService.updateReceiptStatus;
+  const originalEnqueueThermalPdf = thermalPdfWorker.enqueue;
   orderSnapshotService.getInvoiceSnapshot = async () => snapshot;
   shopLookupService.getShopInvoiceSnapshot = async () => ({
     name: 'Shop One',
@@ -429,6 +432,7 @@ const withSnapshotDependencies = async <T>(
   // in receipt.service.test.ts, so here it defaults to a no-op.
   receiptService.issueForInvoice = async () => null;
   receiptService.updateReceiptStatus = async () => null;
+  thermalPdfWorker.enqueue = async () => undefined;
 
   try {
     return await run();
@@ -438,6 +442,7 @@ const withSnapshotDependencies = async <T>(
     invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
     receiptService.issueForInvoice = originalIssueReceipt;
     receiptService.updateReceiptStatus = originalUpdateReceiptStatus;
+    thermalPdfWorker.enqueue = originalEnqueueThermalPdf;
   }
 };
 
@@ -1104,6 +1109,7 @@ test('invoice replay records a snapshot failure and continues processing later o
   const originalFindByOrderId = invoiceRepository.findByOrderId;
   const originalCreate = invoiceRepository.createPaidInvoiceFromPayment;
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  const originalEnqueue = thermalPdfWorker.enqueue;
   invoiceRepository.findByOrderId = async () => null;
   invoiceRepository.createPaidInvoiceFromPayment = async (data) => (
     { id: `invoice-${data.orderId}` } as Awaited<ReturnType<typeof originalCreate>>
@@ -1112,6 +1118,7 @@ test('invoice replay records a snapshot failure and continues processing later o
     if (orderId === 'order-fails') throw new Error('snapshot unavailable');
     return { ...makeOrderSnapshot('MMK'), orderId };
   };
+  thermalPdfWorker.enqueue = async () => undefined;
 
   try {
     const result = await createInvoiceServiceWithoutPdfGeneration()
@@ -1123,6 +1130,7 @@ test('invoice replay records a snapshot failure and continues processing later o
     invoiceRepository.findByOrderId = originalFindByOrderId;
     invoiceRepository.createPaidInvoiceFromPayment = originalCreate;
     orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+    thermalPdfWorker.enqueue = originalEnqueue;
   }
 });
 

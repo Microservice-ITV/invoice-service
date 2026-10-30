@@ -23,6 +23,7 @@ import receiptPdfService, { RECEIPT_PDF_MARKER } from '@/services/receipt-pdf.se
 import invoiceRepository from '@/repositories/invoice.repository';
 import storageService from '@/services/storage.service';
 import prisma from '@/config/database';
+import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 
 const makePaidInvoice = (overrides: Partial<ReceiptIssueInvoice> = {}): ReceiptIssueInvoice => ({
   id: 'invoice-1',
@@ -78,13 +79,16 @@ const makeReceipt = (overrides: Partial<Receipt> = {}): Receipt => ({
   ...overrides,
 });
 
-/** Stub that makes background PDF generation a deterministic no-op. */
-const disableReceiptPdfGeneration = (service: ReceiptService): void => {
-  Object.defineProperty(service, 'generateReceiptPdf', { value: async () => true });
+/** Stub that keeps eligible receipt job-enqueue assertions isolated from MySQL. */
+const disableReceiptJobEnqueue = (): (() => void) => {
+  const original = thermalPdfWorker.enqueueReceipt;
+  thermalPdfWorker.enqueueReceipt = async () => undefined;
+  return () => { thermalPdfWorker.enqueueReceipt = original; };
 };
 
 test('receipt eligibility: non-PAID invoices are never issued a receipt', async () => {
   const originalIssue = receiptRepository.issueForInvoice;
+  const restoreJobs = disableReceiptJobEnqueue();
   let issueCalls = 0;
   receiptRepository.issueForInvoice = async () => {
     issueCalls += 1;
@@ -93,7 +97,6 @@ test('receipt eligibility: non-PAID invoices are never issued a receipt', async 
 
   try {
     const service = new ReceiptService();
-    disableReceiptPdfGeneration(service);
     const statuses: Array<ReceiptIssueInvoice['status']> = [
       'UNPAID',
       'PENDING_VERIFICATION',
@@ -108,12 +111,16 @@ test('receipt eligibility: non-PAID invoices are never issued a receipt', async 
     }
     assert.equal(issueCalls, 0, 'repository must never be called for non-PAID invoices');
   } finally {
+    restoreJobs();
     receiptRepository.issueForInvoice = originalIssue;
   }
 });
 
 test('receipt eligibility: a PAID invoice is issued a receipt built from its persisted data', async () => {
   const originalIssue = receiptRepository.issueForInvoice;
+  const originalEnqueue = thermalPdfWorker.enqueueReceipt;
+  let enqueueCalls = 0;
+  thermalPdfWorker.enqueueReceipt = async () => { enqueueCalls += 1; };
   const captured: IssueReceiptInput[] = [];
   receiptRepository.issueForInvoice = async (input) => {
     captured.push(input);
@@ -122,7 +129,6 @@ test('receipt eligibility: a PAID invoice is issued a receipt built from its per
 
   try {
     const service = new ReceiptService();
-    disableReceiptPdfGeneration(service);
     const invoice = makePaidInvoice();
     const result = await service.issueForInvoice(invoice);
 
@@ -138,13 +144,16 @@ test('receipt eligibility: a PAID invoice is issued a receipt built from its per
     assert.equal(captured[0].currency, 'MMK');
     assert.equal(captured[0].paymentGatewayRef, 'txn-real-1');
     assert.equal(result?.id, 'receipt-1');
+    assert.equal(enqueueCalls, 1, 'a persisted eligible receipt confirms its durable jobs');
   } finally {
+    thermalPdfWorker.enqueueReceipt = originalEnqueue;
     receiptRepository.issueForInvoice = originalIssue;
   }
 });
 
 test('duplicate issuance returns the already-persisted receipt instead of creating another', async () => {
   const originalIssue = receiptRepository.issueForInvoice;
+  const restoreJobs = disableReceiptJobEnqueue();
   const existing = makeReceipt();
   let createCalls = 0;
   // Mirrors the repository contract: the unique invoiceId row already exists.
@@ -155,7 +164,6 @@ test('duplicate issuance returns the already-persisted receipt instead of creati
 
   try {
     const service = new ReceiptService();
-    disableReceiptPdfGeneration(service);
     const first = await service.issueForInvoice(makePaidInvoice());
     const second = await service.issueForInvoice(makePaidInvoice());
 
@@ -164,6 +172,7 @@ test('duplicate issuance returns the already-persisted receipt instead of creati
     assert.equal(first?.id, second?.id);
     assert.equal(createCalls, 2, 'repository is responsible for the uniqueness guarantee');
   } finally {
+    restoreJobs();
     receiptRepository.issueForInvoice = originalIssue;
   }
 });
@@ -203,6 +212,7 @@ test('concurrent issuance resolves to one receipt via the unique invoiceId const
       receiptSequence: {
         upsert: async () => ({ lastNumber: 1 }),
       },
+      thermalPdfJob: { createMany: async () => ({ count: 2 }) },
     };
     return fn(tx);
   };
@@ -333,6 +343,7 @@ test('receipt access: unauthorized callers get null and no issuance happens', as
   const originalFindById = invoiceRepository.findById;
   const originalFindReceipt = receiptRepository.findByInvoiceId;
   const originalIssue = receiptRepository.issueForInvoice;
+  const originalEnqueue = thermalPdfWorker.enqueueReceipt;
 
   const paidInvoice = { ...makePaidInvoice(), status: 'PAID' } as never;
   invoiceRepository.findById = async () => paidInvoice;
@@ -345,7 +356,7 @@ test('receipt access: unauthorized callers get null and no issuance happens', as
 
   try {
     const service = new ReceiptService();
-    disableReceiptPdfGeneration(service);
+    thermalPdfWorker.enqueueReceipt = async () => {};
 
     // Missing invoice → null.
     invoiceRepository.findById = async () => null;
@@ -382,18 +393,17 @@ test('receipt access: unauthorized callers get null and no issuance happens', as
     invoiceRepository.findById = originalFindById;
     receiptRepository.findByInvoiceId = originalFindReceipt;
     receiptRepository.issueForInvoice = originalIssue;
+    thermalPdfWorker.enqueueReceipt = originalEnqueue;
   }
 });
 
 
-test('downloadReceiptPdf refuses access before touching storage and regenerates stale PDFs', async () => {
+test('downloadReceiptPdf refuses access before touching storage and serves prepared artifacts', async () => {
   const originalFindById = invoiceRepository.findById;
   const originalFindReceipt = receiptRepository.findByInvoiceId;
   const originalFindReceiptById = receiptRepository.findById;
   const originalDownload = storageService.downloadPdf;
-  const originalClaim = receiptRepository.claimPdfGeneration;
-  const originalMarkReady = receiptRepository.markPdfReady;
-  const originalBuild = receiptPdfService.buildAndUploadReceiptPdf;
+  const originalStatus = thermalPdfWorker.getReceiptStatus;
 
   const paidInvoice = { ...makePaidInvoice(), status: 'PAID' } as never;
   const downloads: string[] = [];
@@ -415,65 +425,50 @@ test('downloadReceiptPdf refuses access before touching storage and regenerates 
     assert.equal(denied, null);
     assert.equal(downloads.length, 0);
 
-    // Authorized caller with a current stored PDF → served directly.
-    const currentUrl = `invoice-pdfs/receipts/shop-1/${RECEIPT_PDF_MARKER}/RCP-1.pdf`;
-    receiptRepository.findByInvoiceId = async () => makeReceipt({ pdfUrl: currentUrl, pdfStatus: 'READY' });
+    receiptRepository.findByInvoiceId = async () => makeReceipt();
+    const currentUrl = 'thermal/receipts/shop-1/RCP-1/80mm/token.pdf';
+    thermalPdfWorker.getReceiptStatus = async () => ({ status: 'READY', artifactRef: currentUrl } as never);
     const served = await service.downloadReceiptPdf('invoice-1', { role: 'admin' });
-    assert.equal(served?.buffer.toString(), '%PDF-receipt');
-    assert.deepEqual(downloads, [currentUrl]);
-
-    // Stale/missing stored PDF → regenerated, then downloaded from the new key.
-    downloads.length = 0;
-    receiptRepository.findByInvoiceId = async () => makeReceipt({ pdfUrl: null, pdfStatus: 'FAILED' });
-    receiptRepository.findById = async () => makeReceipt({ pdfUrl: currentUrl, pdfStatus: 'READY' });
-    receiptRepository.claimPdfGeneration = async () => true;
-    receiptRepository.markPdfReady = async (_id, pdfUrl) => makeReceipt({ pdfUrl, pdfStatus: 'READY' });
-    receiptPdfService.buildAndUploadReceiptPdf = async () => currentUrl;
-
-    const regenerated = await service.downloadReceiptPdf('invoice-1', { role: 'admin' });
-    assert.equal(regenerated?.receipt.pdfUrl, currentUrl);
+    assert.equal(served?.processing, false);
+    if (served?.processing === false) assert.equal(served.buffer.toString(), '%PDF-receipt');
     assert.deepEqual(downloads, [currentUrl]);
   } finally {
     invoiceRepository.findById = originalFindById;
     receiptRepository.findByInvoiceId = originalFindReceipt;
     receiptRepository.findById = originalFindReceiptById;
     storageService.downloadPdf = originalDownload;
-    receiptRepository.claimPdfGeneration = originalClaim;
-    receiptRepository.markPdfReady = originalMarkReady;
-    receiptPdfService.buildAndUploadReceiptPdf = originalBuild;
+    thermalPdfWorker.getReceiptStatus = originalStatus;
   }
 });
 
 test('thermal receipt downloads render real invoice data at each requested paper width', async () => {
   const originalFindInvoice = invoiceRepository.findById;
   const originalFindReceipt = receiptRepository.findByInvoiceId;
-  const originalRender = receiptPdfService.renderReceiptPdf;
-  const rendered: Array<{ payload: { lineItems?: Array<{ name: string }>; shippingAddress?: Record<string, unknown> | null }; width: string }> = [];
-  invoiceRepository.findById = async () => ({
-    ...makePaidInvoice(),
-    shippingAddress: { address_line_1: 'Real Street', city: 'Yangon' },
-    lineItems: [{ name: 'Real product', quantity: 2, total: '40.00' }],
-  } as never);
+  const originalStatus = thermalPdfWorker.getReceiptStatus;
+  const originalDownload = storageService.downloadPdf;
+  const widths: string[] = [];
+  storageService.downloadPdf = async () => Buffer.from('%PDF-thermal');
+  invoiceRepository.findById = async () => makePaidInvoice() as never;
   receiptRepository.findByInvoiceId = async () => makeReceipt();
-  receiptPdfService.renderReceiptPdf = async (payload, width = '80mm') => {
-    rendered.push({ payload, width });
-    return Buffer.from('%PDF-thermal');
+  thermalPdfWorker.getReceiptStatus = async (_id, width) => {
+    widths.push(width);
+    return { status: 'READY', artifactRef: `thermal/${width}.pdf` } as never;
   };
 
   try {
     const service = new ReceiptService();
     for (const width of ['58mm', '80mm'] as const) {
       const result = await service.downloadReceiptPdf('invoice-1', { role: 'seller', shopId: 'shop-1' }, width);
-      assert.equal(result?.buffer.toString(), '%PDF-thermal');
+      assert.equal(result?.processing, false);
+      if (result?.processing === false) assert.equal(result.buffer.toString(), '%PDF-thermal');
     }
     assert.equal(await service.downloadReceiptPdf('invoice-1', { role: 'seller', shopId: 'shop-2' }, '80mm'), null);
-    assert.deepEqual(rendered.map((item) => item.width), ['58mm', '80mm']);
-    assert.deepEqual(rendered[0].payload.shippingAddress, { address_line_1: 'Real Street', city: 'Yangon' });
-    assert.deepEqual(rendered[0].payload.lineItems, [{ name: 'Real product', quantity: 2, total: '40.00' }]);
+    assert.deepEqual(widths, ['58mm', '80mm']);
   } finally {
     invoiceRepository.findById = originalFindInvoice;
     receiptRepository.findByInvoiceId = originalFindReceipt;
-    receiptPdfService.renderReceiptPdf = originalRender;
+    thermalPdfWorker.getReceiptStatus = originalStatus;
+    storageService.downloadPdf = originalDownload;
   }
 });
 

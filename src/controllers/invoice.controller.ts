@@ -326,6 +326,10 @@ export class InvoiceController {
       if (!width) { res.status(400).json({ success: false, message: 'width must be 58mm or 80mm' }); return; }
       const result = await invoiceService.downloadThermalInvoicePdf(req.params.id, req.user, width);
       if (!result) { res.status(404).json({ success: false, message: 'Invoice PDF not found' }); return; }
+      if (result.processing) {
+        res.status(202).json({ success: false, status: result.status, message: 'Thermal PDF is processing', attempts: result.attempts, error: result.error, retryAt: result.retryAt });
+        return;
+      }
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${getThermalInvoiceDownloadFilename(result.invoice.invoiceNumber, width)}"`);
