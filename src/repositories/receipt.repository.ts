@@ -84,7 +84,7 @@ export class ReceiptRepository {
         }
 
         const receiptNumber = await this.createReceiptNumber(tx);
-        return await tx.receipt.create({
+        const receipt = await tx.receipt.create({
           data: {
             receiptNumber,
             invoiceId: input.invoiceId,
@@ -107,6 +107,11 @@ export class ReceiptRepository {
             status: ReceiptStatus.ISSUED,
           },
         });
+        await tx.thermalPdfJob.createMany({
+          data: ['58mm', '80mm'].map((width) => ({ receiptId: receipt.id, width })),
+          skipDuplicates: true,
+        });
+        return receipt;
       }, { timeout: 15_000 });
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {

@@ -82,6 +82,17 @@ export class ReceiptController {
         res.status(404).json({ success: false, message: 'Receipt not found' });
         return;
       }
+      if (result.processing) {
+        res.status(202).json({
+          success: false,
+          status: result.status,
+          message: 'Thermal receipt PDF is processing',
+          attempts: result.attempts,
+          error: result.error,
+          retryAt: result.retryAt,
+        });
+        return;
+      }
 
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/pdf');

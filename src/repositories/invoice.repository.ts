@@ -37,6 +37,7 @@ export class InvoiceRepository {
         orderItemId: typeof item.orderItemId === 'string' ? item.orderItemId : matchingItem?.orderItemId,
         name: typeof item.name === 'string' ? item.name : matchingItem?.productName ?? 'Product information unavailable',
         sku: typeof item.sku === 'string' ? item.sku : matchingItem?.productSku ?? null,
+        variantName: typeof item.variantName === 'string' ? item.variantName : null,
         imageUrl: typeof item.imageUrl === 'string' ? item.imageUrl : null,
         quantity: typeof item.quantity === 'number' ? item.quantity : matchingItem?.quantity ?? 0,
         unitPrice: typeof item.unitPrice === 'string' ? item.unitPrice : matchingItem?.unitPrice.toString() ?? '0.00',
@@ -366,6 +367,10 @@ export class InvoiceRepository {
           invoiceId: invoice.id,
         },
       });
+      await tx.thermalPdfJob.createMany({
+        data: ['58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
+        skipDuplicates: true,
+      });
       return invoice;
       }, { timeout: 15_000 });
     } catch (error) {
@@ -566,6 +571,11 @@ export class InvoiceRepository {
           requestHash: data.requestHash,
           invoiceId: invoice.id,
         },
+      });
+
+      await tx.thermalPdfJob.createMany({
+        data: ['58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
+        skipDuplicates: true,
       });
 
       return invoice;

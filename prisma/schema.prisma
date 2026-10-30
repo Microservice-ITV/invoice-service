@@ -82,6 +82,7 @@ model Invoice {
   items              InvoiceItem[]
   idempotency        InvoiceIdempotency?
   receipt            Receipt?
+  thermalPdfJobs     ThermalPdfJob[]
 
   @@index([orderId])
   @@index([orderId, shopId])
@@ -91,6 +92,37 @@ model Invoice {
   @@index([shopId], map: "invoices_shopId_idx")
 
   @@map("invoices")
+}
+
+enum ThermalPdfJobStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model ThermalPdfJob {
+  id            String   @id @default(uuid()) @db.Char(36)
+  invoiceId     String?  @db.Char(36)
+  receiptId     String?  @db.Char(36)
+  width         String   @db.VarChar(4)
+  status        ThermalPdfJobStatus @default(PENDING)
+  attempts      Int      @default(0)
+  nextAttemptAt DateTime @default(now())
+  leaseToken    String?  @db.Char(36)
+  leaseUntil    DateTime?
+  artifactRef   String?  @db.VarChar(255)
+  templateVersion String? @db.VarChar(64)
+  lastError     String?  @db.Text
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  invoice       Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  receipt       Receipt? @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, width])
+  @@unique([receiptId, width])
+  @@index([status, nextAttemptAt])
+  @@map("thermal_pdf_jobs")
 }
 model InvoiceItem {
   id                 String   @id @default(uuid()) @db.Char(36)
@@ -194,6 +226,7 @@ model Receipt {
 
   invoiceId         String        @unique @db.Char(36)
   invoice           Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  thermalPdfJobs    ThermalPdfJob[]
   invoiceNumber     String        @db.VarChar(50)
 
   orderId           String        @db.Char(36)

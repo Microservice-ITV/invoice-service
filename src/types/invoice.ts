@@ -10,6 +10,7 @@ export interface InvoiceLineItem {
   orderItemId?: string;
   name: string;
   sku?: string | null;
+  variantName?: string | null;
   imageUrl?: string | null;
   quantity: number;
   unitPrice: string;

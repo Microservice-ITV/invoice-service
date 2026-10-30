@@ -25,7 +25,7 @@ const invoicePayload: InvoicePdfPayload = {
   subtotal: '190000', taxAmount: '0', deliveryFee: '0', discountAmount: '0', grandTotal: '190000',
   paymentMethod: 'CARD', status: 'PAID', createdAt: new Date('2026-10-08T00:00:00.000Z'),
   customerName: 'Real customer', shippingAddress: { city: 'Yangon' },
-  lineItems: [{ name: 'Pet Supplies sample', quantity: 1, unitPrice: '190000', total: '190000' }],
+  lineItems: [{ name: 'Pet Supplies sample', sku: 'PET-35', variantName: 'Large pack', quantity: 1, unitPrice: '190000', total: '190000' }],
 };
 const receiptPayload: ReceiptPdfPayload = {
   receiptId: 'receipt-1', receiptNumber: 'REC-20261008-000035', invoiceId: invoicePayload.invoiceId,
@@ -87,6 +87,17 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
       assert.match(request.html, /Scan to visit our store/);
       assert.match(request.html, /border-top: 1px dashed/);
       assert.match(request.html, /Pet Supplies sample/);
+      assert.match(request.html, /SKU: PET-35/);
+      assert.match(request.html, /Large pack/);
+      if (expectedWidth === '58mm') {
+        assert.match(request.html, /class="item-narrow-details"/);
+        assert.doesNotMatch(request.html, /class="items-heading"/);
+        assert.match(request.html, /1 × MMK 190,000/);
+      } else {
+        assert.match(request.html, /class="items-heading"/);
+        assert.match(request.html, /class="item-wide-row"/);
+        assert.match(request.html, /Unit: MMK 190,000/);
+      }
       assert.doesNotMatch(request.html, /https?:\/\//, 'thermal templates must not depend on remote services or assets');
     }
   } finally {
@@ -216,8 +227,10 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
       assert.ok(result.pageDetails[0].heightPt > 0 && result.pageDetails[0].heightPt < 800, `${kind} should use content height`);
       assert.match(result.diagnostics.contentText, /Rendered customer/);
       assert.match(result.diagnostics.contentText, /Pet Supplies sample/);
-      assert.match(result.diagnostics.contentText, /× 1/);
+      if (width === '58mm') assert.match(result.diagnostics.contentText, /1 \u00d7 MMK 190,000/);
+      else assert.match(result.diagnostics.contentText, /\u00d71/);
       assert.match(result.diagnostics.contentText, /190,000/);
+      if (width === '80mm') assert.match(result.diagnostics.contentText, /Unit: MMK 190,000/);
     }
 
     const longInvoice = {
@@ -228,13 +241,21 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
         city: 'Yangon', region: 'Yangon Region', postal_code: '11021', country: 'Myanmar',
       },
       lineItems: Array.from({ length: 80 }, (_, index) => ({
-        name: `Long product ${index + 1} with an intentionally extended descriptive item name for thermal wrapping`, quantity: 1, total: '190000',
+        name: `Long product ${index + 1} with an intentionally extended descriptive item name for thermal wrapping`,
+        sku: index === 0 ? 'LONG-001' : null,
+        variantName: index === 0 ? 'Family-size container' : null,
+        quantity: index % 4 + 1,
+        unitPrice: `${1000 + index}`,
+        total: `${(index % 4 + 1) * (1000 + index)}`,
       })),
     };
     const longResult = await readPdf(buildThermalInvoiceHtml(longInvoice, width), width);
     assert.equal(longResult.pageCount, 1, `long ${width} invoice stays on one dynamic-height page`);
     assert.ok(longResult.pageDetails[0].heightPt > 300, 'long invoice should grow to include every item');
     assert.match(longResult.diagnostics.contentText, /Long product 80 with an intentionally extended descriptive item name for thermal wrapping/);
+    if (width === '80mm') assert.match(longResult.diagnostics.contentText, /Unit: MMK 1,000/);
+    assert.match(longResult.diagnostics.contentText, /SKU: LONG-001/);
+    assert.match(longResult.diagnostics.contentText, /Family-size container/);
     assert.match(longResult.diagnostics.contentText, /Very Long Residential Complex Road/);
     assert.equal(longResult.diagnostics.horizontalOverflowCount, 0, `long ${width} invoice should wrap without clipping`);
     assert.equal(longResult.diagnostics.siblingOverlapCount, 0, `long ${width} invoice should not overlap metadata or item columns`);

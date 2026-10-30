@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
+import prisma from '@/config/database';
 import { InvoiceLineItem, InvoiceStatus, PartialInvoiceRequest, RefundMethod } from '@/types/invoice';
 import invoiceRepository from '@/repositories/invoice.repository';
 import orderSnapshotService, {
@@ -18,6 +19,7 @@ import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-
 import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
 import receiptService from '@/services/receipt.service';
 import logger from '@/utils/logger';
+import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 
 export class AppError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -422,6 +424,7 @@ export class InvoiceService {
       if (existing.requestHash !== requestHash) {
         throw new ConflictError('Idempotency key was used with a different request');
       }
+      await thermalPdfWorker.enqueue(existing.invoice.id);
       return existing.invoice;
     }
 
@@ -487,7 +490,7 @@ export class InvoiceService {
       throw new ValidationError('Partial invoice subtotal is invalid');
     }
 
-    return invoiceRepository.createPartialInvoice({
+    const invoice = await invoiceRepository.createPartialInvoice({
       orderId: normalizedRequest.orderId,
       shopId,
       shopName: shopSnapshot?.name ?? null,
@@ -511,6 +514,8 @@ export class InvoiceService {
       idempotencyKey: trimmedIdempotencyKey,
       requestHash,
     });
+    await thermalPdfWorker.enqueue(invoice.id);
+    return invoice;
   }
 
   async createInvoiceFromPayment(payload: {
@@ -1170,6 +1175,7 @@ export class InvoiceService {
       });
 
       invoices.push(invoice);
+      await thermalPdfWorker.enqueue(invoice.id);
       void this.generatePdfAndPublishNotification(invoice.id, invoice, 'invoice.generated');
 
       if (invoice.status === 'PAID') {
@@ -1428,19 +1434,21 @@ export class InvoiceService {
   async downloadThermalInvoicePdf(id: string, actor: InvoiceAccessActor, width: '58mm' | '80mm') {
     const invoice = await invoiceRepository.findById(id);
     if (!invoice || !canAccessInvoice(invoice, actor)) return null;
-    const buffer = await pdfGeneratorService.renderThermalInvoicePdf({
-      invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber, orderReference: invoice.orderReference ?? null,
-      orderId: invoice.orderId, shopId: invoice.shopId, customerId: invoice.customerId,
-      shopName: invoice.shopName, shopContactName: invoice.shopContactName, shopContactEmail: invoice.shopContactEmail,
-      shopContactPhone: invoice.shopContactPhone, shopAddress: invoice.shopAddress, customerName: invoice.customerName,
-      customerEmail: invoice.customerEmail, customerPhone: invoice.customerPhone,
-      billingAddress: normalizePdfAddress(invoice.billingAddress), shippingAddress: normalizePdfAddress(invoice.shippingAddress),
-      currency: invoice.currency, subtotal: invoice.subtotal.toString(), taxAmount: invoice.taxAmount.toString(),
-      deliveryFee: invoice.deliveryFee?.toString() ?? '0.00', discountAmount: invoice.discountAmount.toString(),
-      grandTotal: invoice.grandTotal.toString(), lineItems: this.normalizeLineItems(invoice.lineItems),
-      paymentMethod: invoice.paymentMethod, status: invoice.status, createdAt: invoice.createdAt,
-    }, width);
-    return { invoice, buffer };
+    let job = await thermalPdfWorker.getStatus(invoice.id, width);
+    if (!job) {
+      await thermalPdfWorker.enqueue(invoice.id);
+      job = await thermalPdfWorker.getStatus(invoice.id, width);
+    }
+    if (!job || job.status !== 'READY' || !job.artifactRef) {
+      return { invoice, processing: true as const, status: job?.status ?? 'PENDING', attempts: job?.attempts ?? 0, error: job?.lastError ?? null, retryAt: job?.nextAttemptAt ?? null };
+    }
+    try {
+      return { invoice, processing: false as const, buffer: await storageService.downloadPdf(job.artifactRef) };
+    } catch (error) {
+      logger.warn('Prepared thermal PDF artifact could not be downloaded', { invoiceId: invoice.id, width, error: error instanceof Error ? error.message : String(error) });
+      await prisma.thermalPdfJob.updateMany({ where: { id: job.id, status: 'READY' }, data: { status: 'PENDING', artifactRef: null, nextAttemptAt: new Date(), lastError: 'Stored artifact unavailable' } });
+      return { invoice, processing: true as const, status: 'PENDING', attempts: job.attempts, error: null, retryAt: new Date() };
+    }
   }
 
   async uploadPaymentSlip(id: string, customerId: string, paymentSlipDataUrl: string) {
