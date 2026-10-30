@@ -1,6 +1,25 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+const loadMyanmarFont = (): string => {
+  const fontPaths = [
+    join(process.cwd(), 'assets', 'fonts', 'myanmar', 'NotoSansMyanmar.ttf'),
+    join(process.cwd(), 'src', 'assets', 'fonts', 'myanmar', 'NotoSansMyanmar.ttf'),
+  ];
+
+  for (const fontPath of fontPaths) {
+    try {
+      return readFileSync(fontPath).toString('base64');
+    } catch {
+      // Try the next supported font location.
+    }
+  }
+
+  throw new Error('Noto Sans Myanmar font file was not found');
+};
+
+const MYANMAR_FONT_BASE64 = loadMyanmarFont();
+
 export type ThermalDocumentWidth = '58mm' | '80mm';
 
 export interface ThermalLineItem {
@@ -129,7 +148,24 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
     @page { size: ${paperWidth} auto; margin: 0; }
     * { box-sizing: border-box; }
     html, body { width: ${paperWidth}; min-height: 0; height: auto; margin: 0; padding: 0; overflow: visible; }
-    body { color: #000; background: #fff; font: ${type.body}/${type.line} 'Courier New', Courier, monospace; }
+    @font-face {
+      font-family: 'Noto Sans Myanmar';
+      src: url('data:font/ttf;base64,${MYANMAR_FONT_BASE64}') format('truetype');
+      font-style: normal;
+      font-weight: 100 900;
+      font-display: block;
+    }
+
+    body {
+      color: #000;
+      background: #fff;
+      font: ${type.body}/${type.line} 'Noto Sans Myanmar', 'Courier New', Courier, monospace;
+    }
+
+    .thermal-receipt,
+    .thermal-receipt * {
+      font-family: 'Noto Sans Myanmar', 'Courier New', Courier, monospace;
+    }
     .thermal-receipt { width: ${contentWidth}; margin: 0; padding: 6mm 0; color: #000; background: #fff; overflow: visible; }
     header, section, footer { padding: ${type.sectionPadding}; }
     .center { text-align: center; }
@@ -190,13 +226,28 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
 const itemRows = (items: ThermalLineItem[], currency: string, width: ThermalDocumentWidth): string => items.map((item) => {
   const name = escapeHtml(clean(item.name));
   const secondary = [
-    ...(item.sku ? [`<span>SKU: ${escapeHtml(item.sku)}</span>`] : []),
-    ...(item.variantName ? [`<span>${escapeHtml(item.variantName)}</span>`] : []),
-  ].join('');
-  if (width === '58mm') {
-    return `<div class="item-block"><div class="item-name item-narrow-name">${name}</div><div class="item-narrow-details"><span class="item-unit">${escapeHtml(item.quantity)} × ${formatAmount(item.unitPrice, currency)}</span><span class="item-total">${formatAmount(item.total, currency)}</span></div>${secondary ? `<div class="item-secondary">${secondary}</div>` : ''}</div>`;
-  }
-  return `<div class="item-block"><div class="item-wide-row"><span class="item-name">${name}</span><span class="item-qty">×${escapeHtml(item.quantity)}</span><span class="item-total">${formatAmount(item.total, currency)}</span></div><div class="item-secondary"><span>Unit: ${formatAmount(item.unitPrice, currency)}</span>${secondary}</div></div>`;
+    item.variantName ? `<span>${escapeHtml(item.variantName)}</span>` : '',
+    ].filter(Boolean).join('');
+
+    if (width === '58mm') {
+      return `<div class="item-block">
+        <div class="item-name item-narrow-name">${name}</div>
+        <div class="item-narrow-details">
+          <span class="item-unit">Qty: ${escapeHtml(item.quantity)}</span>
+          <span class="item-total">${formatAmount(item.total, currency)}</span>
+        </div>
+        ${secondary ? `<div class="item-secondary">${secondary}</div>` : ''}
+      </div>`;
+    }
+
+    return `<div class="item-block">
+      <div class="item-wide-row">
+        <span class="item-name">${name}</span>
+        <span class="item-qty">×${escapeHtml(item.quantity)}</span>
+        <span class="item-total">${formatAmount(item.total, currency)}</span>
+      </div>
+      ${secondary ? `<div class="item-secondary">${secondary}</div>` : ''}
+    </div>`;
 }).join('');
 
 const metaRow = (label: string, value: unknown, strong = false): string => `
