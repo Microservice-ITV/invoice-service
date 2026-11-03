@@ -289,7 +289,15 @@ export class InvoiceController {
         return;
       }
 
-      res.json({ success: true, data: invoice });
+      res.json({
+        success: true,
+        data: {
+          ...invoice,
+          // Email hidden on print/PDF Bill to for now — restore `customerEmail: invoice.customerEmail`.
+          // customerEmail: invoice.customerEmail,
+          customerEmail: null,
+        },
+      });
     } catch (error) {
       res.status(401).json({
         success: false,

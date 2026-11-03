@@ -232,8 +232,12 @@ const makePaymentPayload = (currency: string) => ({
 
 test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(
-    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v19/invoice.pdf'),
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v20/invoice.pdf'),
     true,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v19/invoice.pdf'),
+    false,
   );
   assert.equal(
     hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v15/invoice.pdf'),
@@ -292,7 +296,7 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
   const stalePdf = Buffer.from('stale-pdf');
   const currentPdf = Buffer.from('current-pdf: Updated Customer: Updated Product');
   const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v18/invoice.pdf';
-  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v19/invoice.pdf';
+  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v20/invoice.pdf';
   const downloadedUrls: string[] = [];
   const generatedPayloads: Parameters<typeof pdfGeneratorService.buildAndUploadInvoicePdf>[0][] = [];
   let savedPdfUrl = stalePdfUrl;

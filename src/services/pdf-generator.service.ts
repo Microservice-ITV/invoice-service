@@ -9,7 +9,9 @@ import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.servi
 import pdfBrowserService from '@/services/pdf-browser.service';
 import { buildThermalInvoiceHtml } from '@/services/thermal-document-template';
 
-export const REACT_PRINT_PDF_MARKER = "react-print-v19";
+// Bump when print layout changes so downloads regenerate instead of serving a
+// stale Spaces artifact (v20: hide customer email on Bill to).
+export const REACT_PRINT_PDF_MARKER = "react-print-v20";
 const INTER_FONT_DIRECTORY = join(process.cwd(), "assets", "fonts", "inter");
 const INTER_FONT_FILES = [
   { filename: "Inter-Regular.woff2", weight: 400 },
