@@ -46,7 +46,7 @@ import invoiceNotificationPublisher, {
 test('notification PDF retrieval returns the exact stored invoice PDF and rejects unrelated references', async () => {
   const originalFindById = invoiceRepository.findById;
   const originalDownloadPdf = storageService.downloadPdf;
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf';
   const downloaded: string[] = [];
   const invoice = {
     id: 'invoice-1',
@@ -102,7 +102,7 @@ test('invoice notification events include the real payment status and use stable
     deliveryFee: { toString: () => '5.00' },
     discountAmount: { toString: () => '0.00' },
     grandTotal: { toString: () => '105.00' },
-    pdfUrl: 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf',
+    pdfUrl: 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf',
   };
   const cod = buildInvoiceNotificationEvent('invoice.generated', invoice);
   const paid = buildInvoiceNotificationEvent('invoice.paid', { ...invoice, status: 'PAID' });
@@ -125,7 +125,7 @@ test('invoice notification waits for the stored PDF and publishing failure does 
   const originalBuildPdf = pdfGeneratorService.buildAndUploadInvoicePdf;
   const originalPublish = invoiceNotificationPublisher.publish;
   const events: string[] = [];
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v19/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf';
   const invoice = {
     id: 'invoice-1',
     invoiceNumber: 'DNI-INV-1',
