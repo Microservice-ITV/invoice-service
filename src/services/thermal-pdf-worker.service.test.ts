@@ -18,6 +18,7 @@ import pdfGeneratorService from '@/services/pdf-generator.service';
 import receiptPdfService from '@/services/receipt-pdf.service';
 import storageService from '@/services/storage.service';
 import { ThermalPdfWorker } from '@/services/thermal-pdf-worker.service';
+import { THERMAL_RENDER_CACHE_VERSION } from '@/services/thermal-react-pdf-renderer.service';
 
 const invoice = {
   id: 'invoice-1', invoiceNumber: 'INV-1', orderReference: 'ORDER-1', orderId: 'order-1',
@@ -33,6 +34,36 @@ const invoice = {
 const invoiceJob = (width: '58mm' | '80mm', overrides: Record<string, unknown> = {}) => ({
   id: `job-${width}`, invoiceId: 'invoice-1', receiptId: null, width, attempts: 0,
   status: 'PENDING', invoice, receipt: null, ...overrides,
+});
+
+test('worker invalidates ready PDFs rendered with an older thermal template', async () => {
+  const origFindUnique = prisma.thermalPdfJob.findUnique;
+  const origUpdate = prisma.thermalPdfJob.updateMany;
+  const staleJob = {
+    id: 'job-58mm', status: 'READY', templateVersion: 'thermal-layout-v13',
+    artifactRef: 'thermal/invoice-1/58mm/stale.pdf',
+  };
+  let updateWhere: Record<string, unknown> | undefined;
+  let updateData: Record<string, unknown> | undefined;
+  (prisma.thermalPdfJob as any).findUnique = async () => staleJob;
+  (prisma.thermalPdfJob as any).updateMany = async (args: unknown) => {
+    const update = args as { where: Record<string, unknown>; data: Record<string, unknown> };
+    updateWhere = update.where;
+    updateData = update.data;
+    staleJob.status = String(update.data.status);
+    return { count: 1 };
+  };
+  try {
+    assert.notEqual(THERMAL_RENDER_CACHE_VERSION, staleJob.templateVersion);
+    const status = await new ThermalPdfWorker().getStatus('invoice-1', '58mm');
+    assert.equal(status?.status, 'PENDING');
+    assert.equal(updateWhere?.status, 'READY');
+    assert.equal(updateData?.status, 'PENDING');
+    assert.equal(updateData?.artifactRef, null);
+  } finally {
+    prisma.thermalPdfJob.findUnique = origFindUnique;
+    prisma.thermalPdfJob.updateMany = origUpdate;
+  }
 });
 
 test('worker prepares both invoice widths and writes storage references', async () => {

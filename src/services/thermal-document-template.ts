@@ -142,8 +142,8 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
   const sideMargin = width === '58mm' ? '3mm' : '5mm';
   const qrSize = width === '58mm' ? '12mm' : '15mm';
   const type = width === '58mm'
-    ? { body: '15px', line: '1.22', brand: '14.5px', tagline: '5.5px', title: '15px', meta: '10.5px', metadata: '8px', section: '12.5px', sectionPadding: '.7mm 1mm', sectionTitleGap: '.5mm', shippingPadding: '.35mm 1mm', address: '10px', addressLine: '1.15', customer: '14.5px', item: '11.5px', itemLabel: '10px', itemRowPadding: '.6mm 0', amount: '10px', total: '13.5px', qrCaption: '9.5px', footer: '12px', small: '9px', itemAmountWidth: '22mm', itemGap: '.7mm' }
-    : { body: '16.5px', line: '1.22', brand: '20px', tagline: '7px', title: '19px', meta: '13px', metadata: '10.5px', section: '14.5px', sectionPadding: '1mm 1.5mm', sectionTitleGap: '.8mm', shippingPadding: '.65mm 1.5mm', address: '11.5px', addressLine: '1.2', customer: '16px', item: '13.5px', itemLabel: '11.5px', itemRowPadding: '.8mm 0', amount: '12px', total: '16px', qrCaption: '11px', footer: '14px', small: '10.5px', itemAmountWidth: '25mm', itemGap: '1.5mm' };
+    ? { body: '15px', line: '1.22', brand: '14.5px', tagline: '5.5px', title: '15px', meta: '10.5px', metadata: '8px', section: '12.5px', sectionPadding: '.7mm 1mm', sectionTitleGap: '.5mm', shippingPadding: '.35mm 1mm', address: '10px', addressLine: '1.15', customer: '13px', item: '11.5px', itemLabel: '10px', itemRowPadding: '.6mm 0', amount: '10px', total: '13.5px', qrCaption: '9.5px', footer: '12px', small: '9px', itemAmountWidth: '22mm', itemGap: '.7mm' }
+    : { body: '16.5px', line: '1.22', brand: '20px', tagline: '7px', title: '19px', meta: '13px', metadata: '10.5px', section: '14.5px', sectionPadding: '1mm 1.5mm', sectionTitleGap: '.8mm', shippingPadding: '.65mm 1.5mm', address: '11.5px', addressLine: '1.2', customer: '14px', item: '13.5px', itemLabel: '11.5px', itemRowPadding: '.8mm 0', amount: '12px', total: '16px', qrCaption: '11px', footer: '14px', small: '10.5px', itemAmountWidth: '25mm', itemGap: '1.5mm' };
   return `
     @page { size: ${paperWidth} auto; margin: 0; }
     * { box-sizing: border-box; }
@@ -184,14 +184,14 @@ const baseStyles = (width: ThermalDocumentWidth): string => {
     .bold { font-weight: 700; }
     .divider { border-top: 1px dashed #333; margin: 1.5mm 0; }
     .section-title { margin: 0 0 ${type.sectionTitleGap}; font-size: ${type.section}; font-weight: 700; }
-    .customer { font-size: ${type.customer}; overflow-wrap: anywhere; }
+    .customer { font-size: ${type.customer}; font-weight: 400; overflow-wrap: anywhere; }
     .muted { color: #444; }
     .shipping-section { padding: ${type.shippingPadding}; }
     .shipping-section .section-title { margin-bottom: ${type.sectionTitleGap}; }
     .address { font-size: ${type.address}; overflow-wrap: anywhere; line-height: ${type.addressLine}; }
     .items-heading, .item-wide-row { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(${type.itemAmountWidth},max-content); align-items: baseline; column-gap: ${type.itemGap}; }
     .items-heading { border-bottom: 1px dashed #333; padding: 0 0 1mm; margin-bottom: 1px; font-size: ${type.itemLabel}; font-weight: 700; text-transform: none; }
-    .item-block { padding: ${type.itemRowPadding}; border-bottom: 1px dashed #777; break-inside: avoid; page-break-inside: avoid; }
+    .item-block { padding: ${type.itemRowPadding}; break-inside: avoid; page-break-inside: avoid; }
     .item-wide-row, .item-narrow-details { break-inside: avoid; page-break-inside: avoid; }
     .item-wide-row .item-name { display: block; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; overflow-wrap: normal; word-break: normal; }
     .item-name { display: block; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; overflow-wrap: normal; word-break: normal; }
