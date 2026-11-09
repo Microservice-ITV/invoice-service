@@ -80,7 +80,13 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
       }
       assert.doesNotMatch(request.html, /<h3 class="section-title">Items<\/h3>/, 'item list should not have a standalone Items heading');
       assert.match(request.html, new RegExp(`\\.address \\{ font-size: ${expectedWidth === '58mm' ? '10px' : '11\\.5px'}`));
+      assert.match(request.html, new RegExp(`\\.customer \\{ font-size: ${expectedWidth === '58mm' ? '13px' : '14px'}; font-weight: 400;`), 'customer names should use a smaller regular weight at each paper width');
       assert.match(request.html, new RegExp(`\\.item-name, \\.item-qty \\{ font-size: ${expectedWidth === '58mm' ? '11\\.5px' : '13\\.5px'}`));
+      const itemBlockStyles = request.html.match(/\.item-block \{[^}]*\}/)?.[0];
+      assert.ok(itemBlockStyles, 'product item styles should be present');
+      assert.doesNotMatch(itemBlockStyles, /border-bottom/, 'product rows should not have a dashed bottom border');
+      assert.match(request.html, /\.divider \{ border-top: 1px dashed/, 'section separators should remain');
+      assert.match(request.html, /\.double-divider \{ border-top: 1px dashed/, 'totals separator should remain');
       assert.match(request.html, /data:image\/png;base64,/);
       assert.match(request.html, /'Courier New', Courier, monospace/, 'thermal output should use a compact monochrome POS typeface');
       assert.match(request.html, /Quality products/);
