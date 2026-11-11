@@ -73,6 +73,7 @@ test('invoice snapshots can be resolved by checkout ID', async () => {
       orderId: 'actual-order-id',
       checkoutId: 'guest-checkout-id',
       customerId: 'guest-customer-id',
+      sellerMessagesByShopId: { 'shop-1': 'Leave at the front desk' },
       items: [],
       currency: 'MMK',
       subtotal: '0.00',
@@ -87,6 +88,7 @@ test('invoice snapshots can be resolved by checkout ID', async () => {
 
     assert.equal(snapshot.orderId, 'actual-order-id');
     assert.equal(snapshot.checkoutId, 'guest-checkout-id');
+    assert.equal(snapshot.sellerMessagesByShopId?.['shop-1'], 'Leave at the front desk');
     assert.match(requestedUrl, /\/internal\/orders\/checkouts\/guest-checkout-id\/invoice-snapshot$/);
   } finally {
     globalThis.fetch = originalFetch;

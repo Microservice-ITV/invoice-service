@@ -1337,7 +1337,7 @@ export class InvoiceService {
 
   async getInvoiceById(id: string) {
     const invoice = await invoiceRepository.findDocumentById(id);
-    return invoice ? this.populateMissingLineItemImages(invoice) : null;
+    return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
   }
 
   async getCustomerInvoiceByNumber(invoiceNumber: string, customerId: string) {
@@ -1346,37 +1346,37 @@ export class InvoiceService {
       return null;
     }
 
-    return this.populateMissingLineItemImages(invoice);
+    return this.populateInvoiceSnapshotData(invoice);
   }
 
   async getInvoiceByNumber(invoiceNumber: string) {
     const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
-    return invoice ? this.populateMissingLineItemImages(invoice) : null;
+    return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
   }
 
-  private async populateMissingLineItemImages<T extends {
+  private async populateInvoiceSnapshotData<T extends {
     orderId: string;
+    shopId: string;
     lineItems: InvoiceLineItem[] | null;
-  }>(invoice: T): Promise<T> {
+  }>(invoice: T): Promise<T & { sellerMessage: string | null }> {
     const lineItems = invoice.lineItems ?? [];
-    if (lineItems.length === 0 || lineItems.every((item) => item.imageUrl?.trim())) {
-      return invoice;
-    }
-
     let snapshot: Awaited<ReturnType<typeof orderSnapshotService.getInvoiceSnapshot>>;
     try {
       snapshot = await orderSnapshotService.getInvoiceSnapshot(invoice.orderId);
     } catch (error) {
-      logger.warn('Unable to hydrate historical invoice images; returning persisted invoice data', {
+      logger.warn('Unable to hydrate optional invoice snapshot data; returning persisted invoice data', {
         orderId: invoice.orderId,
         error: error instanceof Error ? error.message : String(error),
       });
       return {
         ...invoice,
-        lineItems: lineItems.map((item) => ({
-          ...item,
-          imageUrl: item.imageUrl?.trim() || null,
-        })),
+        sellerMessage: null,
+        lineItems: invoice.lineItems === null
+          ? null
+          : lineItems.map((item) => ({
+            ...item,
+            imageUrl: item.imageUrl?.trim() || null,
+          })),
       };
     }
 
@@ -1389,12 +1389,15 @@ export class InvoiceService {
 
     return {
       ...invoice,
-      lineItems: lineItems.map((item) => ({
-        ...item,
-        imageUrl: item.imageUrl?.trim()
-          || (item.orderItemId ? imageUrlsByOrderItemId.get(item.orderItemId) : undefined)
-          || null,
-      })),
+      sellerMessage: snapshot.sellerMessagesByShopId?.[invoice.shopId] ?? null,
+      lineItems: invoice.lineItems === null
+        ? null
+        : lineItems.map((item) => ({
+          ...item,
+          imageUrl: item.imageUrl?.trim()
+            || (item.orderItemId ? imageUrlsByOrderItemId.get(item.orderItemId) : undefined)
+            || null,
+        })),
     };
   }
 
