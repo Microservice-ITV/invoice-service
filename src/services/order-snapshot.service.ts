@@ -26,6 +26,7 @@ export interface OrderInvoiceSnapshot {
   shippingAddress?: InvoiceSnapshotAddress | null;
   paymentStatus?: string | null;
   paymentMethod?: string | null;
+  sellerMessagesByShopId?: Record<string, string | null> | null;
   items: OrderInvoiceSnapshotItem[];
   currency: string | null;
   subtotal: string;

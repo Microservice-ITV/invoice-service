@@ -46,7 +46,7 @@ import invoiceNotificationPublisher, {
 test('notification PDF retrieval returns the exact stored invoice PDF and rejects unrelated references', async () => {
   const originalFindById = invoiceRepository.findById;
   const originalDownloadPdf = storageService.downloadPdf;
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v21/DNI-INV-1-123456789-123abc.pdf';
   const downloaded: string[] = [];
   const invoice = {
     id: 'invoice-1',
@@ -102,7 +102,7 @@ test('invoice notification events include the real payment status and use stable
     deliveryFee: { toString: () => '5.00' },
     discountAmount: { toString: () => '0.00' },
     grandTotal: { toString: () => '105.00' },
-    pdfUrl: 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf',
+    pdfUrl: 'invoice-pdfs/shop-1/react-print-v21/DNI-INV-1-123456789-123abc.pdf',
   };
   const cod = buildInvoiceNotificationEvent('invoice.generated', invoice);
   const paid = buildInvoiceNotificationEvent('invoice.paid', { ...invoice, status: 'PAID' });
@@ -125,7 +125,7 @@ test('invoice notification waits for the stored PDF and publishing failure does 
   const originalBuildPdf = pdfGeneratorService.buildAndUploadInvoicePdf;
   const originalPublish = invoiceNotificationPublisher.publish;
   const events: string[] = [];
-  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v20/DNI-INV-1-123456789-123abc.pdf';
+  const pdfUrl = 'invoice-pdfs/shop-1/react-print-v21/DNI-INV-1-123456789-123abc.pdf';
   const invoice = {
     id: 'invoice-1',
     invoiceNumber: 'DNI-INV-1',
@@ -201,6 +201,7 @@ const makeOrderSnapshot = (currency: string): OrderInvoiceSnapshot => ({
   customerPhone: '555-0100',
   paymentStatus: 'PAID',
   paymentMethod: 'CARD',
+  sellerMessagesByShopId: {},
   items: [{
     orderItemId: 'order-item-1',
     productId: 'product-1',
@@ -232,11 +233,15 @@ const makePaymentPayload = (currency: string) => ({
 
 test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(
-    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v20/invoice.pdf'),
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v21/invoice.pdf'),
     true,
   );
   assert.equal(
     hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v19/invoice.pdf'),
+    false,
+  );
+  assert.equal(
+    hasCurrentInvoicePdf('invoice-pdfs/shop-1/react-print-v20/invoice.pdf'),
     false,
   );
   assert.equal(
@@ -295,8 +300,8 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
   const originalDownloadPdf = storageService.downloadPdf;
   const stalePdf = Buffer.from('stale-pdf');
   const currentPdf = Buffer.from('current-pdf: Updated Customer: Updated Product');
-  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v18/invoice.pdf';
-  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v20/invoice.pdf';
+  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v20/invoice.pdf';
+  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v21/invoice.pdf';
   const downloadedUrls: string[] = [];
   const generatedPayloads: Parameters<typeof pdfGeneratorService.buildAndUploadInvoicePdf>[0][] = [];
   let savedPdfUrl = stalePdfUrl;
@@ -773,7 +778,7 @@ test('paid invoice creation stores the validated MMK source currency', async () 
   }
 });
 
-test('customer invoice detail hydrates missing product images from the order snapshot', async () => {
+test('customer invoice detail hydrates missing product images and the shop seller message from the order snapshot', async () => {
   const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
   invoiceRepository.findDocumentByInvoiceNumber = async () => ({
@@ -781,6 +786,7 @@ test('customer invoice detail hydrates missing product images from the order sna
     invoiceNumber: 'INV-1',
     customerId: 'customer-1',
     orderId: 'order-1',
+    shopId: 'shop-1',
     lineItems: [{
       orderItemId: 'order-item-1',
       name: 'Test product',
@@ -791,7 +797,10 @@ test('customer invoice detail hydrates missing product images from the order sna
       imageUrl: null,
     }],
   }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
-  orderSnapshotService.getInvoiceSnapshot = async () => makeOrderSnapshot('MMK');
+  orderSnapshotService.getInvoiceSnapshot = async () => ({
+    ...makeOrderSnapshot('MMK'),
+    sellerMessagesByShopId: { 'shop-1': 'Leave at the front desk' },
+  });
 
   try {
     const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
@@ -799,13 +808,14 @@ test('customer invoice detail hydrates missing product images from the order sna
       invoice?.lineItems?.[0]?.imageUrl,
       'https://products.example.test/images/test-product.png',
     );
+    assert.equal(invoice?.sellerMessage, 'Leave at the front desk');
   } finally {
     invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
     orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
   }
 });
 
-test('invoice detail skips order snapshot lookup when persisted images are available', async () => {
+test('invoice detail hydrates the seller message even when persisted images are available', async () => {
   const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
   let snapshotLookupCount = 0;
@@ -814,6 +824,7 @@ test('invoice detail skips order snapshot lookup when persisted images are avail
     invoiceNumber: 'INV-1',
     customerId: 'customer-1',
     orderId: 'order-1',
+    shopId: 'shop-1',
     lineItems: [{
       orderItemId: 'order-item-1',
       name: 'Test product',
@@ -826,13 +837,62 @@ test('invoice detail skips order snapshot lookup when persisted images are avail
   }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
   orderSnapshotService.getInvoiceSnapshot = async () => {
     snapshotLookupCount += 1;
-    throw new Error('Order Service should not be called');
+    return {
+      ...makeOrderSnapshot('MMK'),
+      sellerMessagesByShopId: { 'shop-1': 'Please call on arrival' },
+    };
   };
 
   try {
     const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
     assert.equal(invoice?.lineItems?.[0]?.imageUrl, 'https://products.example.test/images/persisted.png');
-    assert.equal(snapshotLookupCount, 0);
+    assert.equal(invoice?.sellerMessage, 'Please call on arrival');
+    assert.equal(snapshotLookupCount, 1);
+  } finally {
+    invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
+test('invoice detail selects the seller message for its own order and shop', async () => {
+  const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  const invoices = {
+    'INV-SHOP-1': {
+      id: 'invoice-shop-1',
+      invoiceNumber: 'INV-SHOP-1',
+      customerId: 'customer-1',
+      orderId: 'order-1',
+      shopId: 'shop-1',
+      lineItems: [],
+    },
+    'INV-SHOP-2': {
+      id: 'invoice-shop-2',
+      invoiceNumber: 'INV-SHOP-2',
+      customerId: 'customer-1',
+      orderId: 'order-1',
+      shopId: 'shop-2',
+      lineItems: [],
+    },
+  };
+  invoiceRepository.findDocumentByInvoiceNumber = async (invoiceNumber) => (
+    invoices[invoiceNumber as keyof typeof invoices] ?? null
+  ) as unknown as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
+  orderSnapshotService.getInvoiceSnapshot = async () => ({
+    ...makeOrderSnapshot('MMK'),
+    sellerMessagesByShopId: {
+      'shop-1': 'Message for shop one',
+      'shop-2': 'Message for shop two',
+    },
+  });
+
+  try {
+    const service = new InvoiceService();
+    const shopOneInvoice = await service.getInvoiceByNumber('INV-SHOP-1');
+    const shopTwoInvoice = await service.getInvoiceByNumber('INV-SHOP-2');
+
+    assert.equal(shopOneInvoice?.sellerMessage, 'Message for shop one');
+    assert.equal(shopTwoInvoice?.sellerMessage, 'Message for shop two');
   } finally {
     invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
     orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
@@ -865,6 +925,7 @@ test('invoice detail succeeds with a null image when optional snapshot hydration
     const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
     assert.equal(invoice?.invoiceNumber, 'INV-1');
     assert.equal(invoice?.lineItems?.[0]?.imageUrl, null);
+    assert.equal(invoice?.sellerMessage, null);
   } finally {
     invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
     orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
