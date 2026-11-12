@@ -53,7 +53,7 @@ A REST + event-driven service (port **5005**) that owns the **invoice** domain o
 | Creating invoices from `payment.completed` events, one invoice per shop in the order | `src/rabbitmq/consumers/payment-completed.consumer.ts` → `InvoiceService.createInvoiceFromPayment` |
 | Creating customer-initiated **partial (UNPAID)** invoices for selected order items | `POST /api/v1/invoices/partial` → `InvoiceService.createPartialInvoice` |
 | Manual payment-slip upload and admin/shop verification | `uploadPaymentSlip`, `verifyInvoice` |
-| Invoice numbering (`INV-YYYYMMDD-NNNNN`) | `InvoiceService.generateInvoiceNumber` |
+| Invoice and order-reference numbering (`INV-YYYYMMDD-NNNNNN`, `ORD-YYYYMMDD-NNNNNN`) | `InvoiceRepository` |
 | Invoice reads for customer / shop / admin, with shop-name enrichment | `listInvoices`, `populateMissingInvoiceShopNames` |
 | Void and refund **bookkeeping** (status + reason + amount only) | `voidInvoice`, `refundInvoice` |
 | PDF generation (Puppeteer → MinIO) with a persisted PDF lifecycle | `pdf-generator.service.ts`, `storage.service.ts`, `claimPdfGeneration` |
@@ -918,9 +918,17 @@ Guard implementation details:
 
 ### Invoice numbering
 
-`INV-<YYYYMMDD>-<5 random digits>` (`generateInvoiceNumber`): date stamp plus a random 5-digit sequence,
-**not** a database sequence, so numbers can collide in theory; the unique index on `invoiceNumber` is the
-only protection (`Not documented / not found in repository`: any retry-on-conflict logic).
+Invoice numbers (`INV-YYYYMMDD-NNNNNN`) and order references (`ORD-YYYYMMDD-NNNNNN`) use separate
+date-keyed counters in `invoice_number_sequences` and `order_reference_sequences`. Each counter is
+incremented with an atomic upsert inside the invoice transaction, so the two number streams start and
+advance independently. Existing order references are reused for subsequent invoices of that order.
+
+The `20261112000100_split_invoice_order_sequences` migration creates both counters and seeds each
+date/type from the greatest matching number already stored in `invoices` and
+`invoice_order_references`. It leaves historical documents, order-reference mappings, and the legacy
+`invoice_sequences` table untouched. During deployment, drain invoice writers before applying the
+migration and keep them paused until all service instances run the new code; this avoids mixed-version
+writers using different counters.
 
 ### Snapshot / display-name precedence
 

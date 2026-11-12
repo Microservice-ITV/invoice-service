@@ -198,13 +198,22 @@ model InvoiceIdempotency {
   @@map("invoice_idempotency")
 }
 
-model InvoiceSequence {
+model InvoiceNumberSequence {
   date       String   @id @db.Char(8)
   lastNumber Int      @default(0)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  @@map("invoice_sequences")
+  @@map("invoice_number_sequences")
+}
+
+model OrderReferenceSequence {
+  date       String   @id @db.Char(8)
+  lastNumber Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("order_reference_sequences")
 }
 
 model InvoiceOrderReference {
