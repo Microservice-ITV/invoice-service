@@ -3,7 +3,19 @@ import { Prisma } from '@prisma/client';
 import { InvoiceFilters, InvoiceLineItem, InvoiceStatus } from '@/types/invoice';
 import { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
 
+type InvoiceTransactionRunner = <T>(
+  operation: (tx: Prisma.TransactionClient) => Promise<T>,
+  options?: { timeout?: number },
+) => Promise<T>;
+
 export class InvoiceRepository {
+  constructor(
+    private readonly now: () => Date = () => new Date(),
+    private readonly runTransaction: InvoiceTransactionRunner = (operation, options) => (
+      prisma.$transaction(operation, options)
+    ),
+  ) {}
+
   private normalizeLineItems(
     lineItems: unknown,
     items: Array<{
@@ -46,12 +58,21 @@ export class InvoiceRepository {
     });
   }
 
-  private dateStamp(date = new Date()): string {
+  private dateStamp(date = this.now()): string {
     return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}${String(date.getUTCDate()).padStart(2, '0')}`;
   }
 
-  private async nextSequenceNumber(tx: Prisma.TransactionClient, date: string): Promise<number> {
-    const sequence = await tx.invoiceSequence.upsert({
+  private async nextInvoiceSequenceNumber(tx: Prisma.TransactionClient, date: string): Promise<number> {
+    const sequence = await tx.invoiceNumberSequence.upsert({
+      where: { date },
+      update: { lastNumber: { increment: 1 } },
+      create: { date, lastNumber: 1 },
+    });
+    return sequence.lastNumber;
+  }
+
+  private async nextOrderReferenceSequenceNumber(tx: Prisma.TransactionClient, date: string): Promise<number> {
+    const sequence = await tx.orderReferenceSequence.upsert({
       where: { date },
       update: { lastNumber: { increment: 1 } },
       create: { date, lastNumber: 1 },
@@ -61,13 +82,32 @@ export class InvoiceRepository {
 
   private async createInvoiceNumber(tx: Prisma.TransactionClient): Promise<string> {
     const date = this.dateStamp();
-    const sequence = await this.nextSequenceNumber(tx, date);
+    const sequence = await this.nextInvoiceSequenceNumber(tx, date);
     return `INV-${date}-${String(sequence).padStart(6, '0')}`;
   }
 
-  private async getOrCreateOrderReference(tx: Prisma.TransactionClient, orderId: string): Promise<string> {
+  private async getOrCreateOrderReference(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    preferredOrderReference?: string,
+  ): Promise<string> {
     const existing = await tx.invoiceOrderReference.findUnique({ where: { orderId } });
     if (existing) return existing.orderReference;
+
+    if (preferredOrderReference !== undefined) {
+      try {
+        const created = await tx.invoiceOrderReference.create({
+          data: { orderId, orderReference: preferredOrderReference },
+          select: { orderReference: true },
+        });
+        return created.orderReference;
+      } catch (error) {
+        if (!this.isUniqueConstraintError(error)) throw error;
+        const concurrent = await tx.invoiceOrderReference.findUnique({ where: { orderId } });
+        if (concurrent) return concurrent.orderReference;
+        throw error;
+      }
+    }
 
     const placeholder = `PENDING-${orderId}`;
     let created: { id: number };
@@ -83,7 +123,7 @@ export class InvoiceRepository {
       throw error;
     }
     const date = this.dateStamp();
-    const sequence = await this.nextSequenceNumber(tx, date);
+    const sequence = await this.nextOrderReferenceSequenceNumber(tx, date);
     const orderReference = `ORD-${date}-${String(sequence).padStart(6, '0')}`;
     const updated = await tx.invoiceOrderReference.update({
       where: { id: created.id },
@@ -227,7 +267,7 @@ export class InvoiceRepository {
     status?: InvoiceStatus;
   }) {
     try {
-      return await prisma.$transaction(async (tx) => {
+      return await this.runTransaction(async (tx) => {
       const existing = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
@@ -239,7 +279,7 @@ export class InvoiceRepository {
         return existing.invoice;
       }
 
-      const orderReference = data.orderReference ?? await this.getOrCreateOrderReference(tx, data.orderId);
+      const orderReference = await this.getOrCreateOrderReference(tx, data.orderId, data.orderReference);
       const invoiceNumber = await this.createInvoiceNumber(tx);
 
       const allocations: Array<{ id: string; quantity: number }> = [];
@@ -407,7 +447,7 @@ export class InvoiceRepository {
     requestHash: string;
   }) {
     try {
-      return await prisma.$transaction(async (tx) => {
+      return await this.runTransaction(async (tx) => {
       const existingIdempotency = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
