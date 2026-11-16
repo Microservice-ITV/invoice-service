@@ -22,6 +22,8 @@ export class InvoiceRepository {
       orderItemId: string;
       productSku: string | null;
       productName: string;
+      color?: string | null;
+      size?: string | null;
       quantity: number;
       unitPrice: { toString(): string };
       totalPrice: { toString(): string };
@@ -35,6 +37,8 @@ export class InvoiceRepository {
         orderItemId: item.orderItemId,
         name: item.productName,
         sku: item.productSku,
+        color: item.color ?? null,
+        size: item.size ?? null,
         quantity: item.quantity,
         unitPrice: item.unitPrice.toString(),
         total: item.totalPrice.toString(),
@@ -50,6 +54,8 @@ export class InvoiceRepository {
         name: typeof item.name === 'string' ? item.name : matchingItem?.productName ?? 'Product information unavailable',
         sku: typeof item.sku === 'string' ? item.sku : matchingItem?.productSku ?? null,
         variantName: typeof item.variantName === 'string' ? item.variantName : null,
+        color: typeof item.color === 'string' ? item.color : null,
+        size: typeof item.size === 'string' ? item.size : null,
         imageUrl: typeof item.imageUrl === 'string' ? item.imageUrl : null,
         quantity: typeof item.quantity === 'number' ? item.quantity : matchingItem?.quantity ?? 0,
         unitPrice: typeof item.unitPrice === 'string' ? item.unitPrice : matchingItem?.unitPrice.toString() ?? '0.00',
@@ -564,6 +570,8 @@ export class InvoiceRepository {
             orderItemId: item.orderItemId,
             name: item.productName ?? item.productSku ?? item.productId,
             sku: item.productSku,
+            color: item.color ?? null,
+            size: item.size ?? null,
             imageUrl: item.imageUrl ?? null,
             quantity: item.requestedQuantity,
             unitPrice: item.unitPrice,

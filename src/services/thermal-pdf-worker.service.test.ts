@@ -40,7 +40,7 @@ test('worker invalidates ready PDFs rendered with an older thermal template', as
   const origFindUnique = prisma.thermalPdfJob.findUnique;
   const origUpdate = prisma.thermalPdfJob.updateMany;
   const staleJob = {
-    id: 'job-58mm', status: 'READY', templateVersion: 'thermal-layout-v13',
+    id: 'job-58mm', status: 'READY', templateVersion: 'thermal-layout-v18',
     artifactRef: 'thermal/invoice-1/58mm/stale.pdf',
   };
   let updateWhere: Record<string, unknown> | undefined;

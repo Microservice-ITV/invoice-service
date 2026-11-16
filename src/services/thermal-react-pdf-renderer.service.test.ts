@@ -21,11 +21,11 @@ test('production compose retains FRONTEND_BASE_URL for the unchanged A4 invoice 
 
 const invoicePayload: InvoicePdfPayload = {
   invoiceId: 'invoice-1', invoiceNumber: 'INV-20261008-000035', orderReference: null,
-  orderId: 'order-1', shopId: 'shop-1', customerId: 'customer-1', currency: 'MMK',
+  orderId: 'order-1', shopId: 'shop-1', shopName: 'Northside Market', shopContactPhone: '+95 9 123456789', customerId: 'customer-1', currency: 'MMK',
   subtotal: '190000', taxAmount: '0', deliveryFee: '0', discountAmount: '0', grandTotal: '190000',
   paymentMethod: 'CARD', status: 'PAID', createdAt: new Date('2026-10-08T00:00:00.000Z'),
   customerName: 'Real customer', shippingAddress: { city: 'Yangon' },
-  lineItems: [{ name: 'Pet Supplies sample', sku: 'PET-35', variantName: 'Large pack', quantity: 1, unitPrice: '190000', total: '190000' }],
+  lineItems: [{ name: 'Pet Supplies sample', sku: 'PET-35', variantName: 'Large pack', color: 'Blue', size: 'Medium', quantity: 1, unitPrice: '190000', total: '190000' }],
 };
 const receiptPayload: ReceiptPdfPayload = {
   receiptId: 'receipt-1', receiptNumber: 'REC-20261008-000035', invoiceId: invoicePayload.invoiceId,
@@ -61,13 +61,12 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
       assert.equal(request.width, expectedWidth);
       assert.match(request.html, new RegExp(`@page \\{ size: ${expectedWidth}`));
       assert.match(request.html, new RegExp(`data-thermal-document="${isReceipt ? 'receipt' : 'invoice'}"`));
-      assert.match(request.html, new RegExp(`font: ${expectedWidth === '58mm' ? '15px' : '16\\.5px'}/`), 'paper width should select its stable width-specific typography profile');
-      assert.match(request.html, /\.metadata \{ display: grid; gap: 1px; \}/, 'metadata fields should retain their stacked list spacing');
-      assert.match(request.html, /\.meta-row, \.total-row \{ display: grid; grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1\.55fr\);/, 'each metadata field should keep its left-label/right-value row');
-      assert.match(request.html, new RegExp(`\\.meta-row \\.meta-label, \\.meta-row \\.meta-value \\{ font-size: ${expectedWidth === '58mm' ? '8px' : '10.5px'}`), 'metadata should use width-specific typography');
-      assert.doesNotMatch(request.html, /metadata-pair|meta-cell|grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1fr\)/, 'metadata should not use a side-by-side layout');
+      const isNarrow = expectedWidth === '58mm';
+      assert.match(request.html, new RegExp(`font: ${isNarrow ? '15px' : '16.5px'}\\/1\\.22`), 'PDF typography should match the HTML preview at the selected width');
+      assert.match(request.html, /\.metadata \{ display: grid; gap: 1px; \}/, 'metadata fields should retain the preview spacing');
+      assert.match(request.html, /\.meta-row, \.total-row \{ display: grid; grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1\.55fr\);/, 'metadata and totals should use the preview column layout');
       const expectedMetadataLabels = isReceipt
-        ? ['Receipt No:', 'Invoice No:', 'Date:', 'Order Ref:']
+        ? ['Receipt No:', 'Invoice No:', 'Date:', 'Order:']
         : ['Invoice No:', 'Date:', 'Order:'];
       let previousMetadataPosition = -1;
       for (const label of expectedMetadataLabels) {
@@ -79,21 +78,39 @@ test('thermal invoice and receipt PDF generation uses self-contained HTML at bot
         previousMetadataPosition = position;
       }
       assert.doesNotMatch(request.html, /<h3 class="section-title">Items<\/h3>/, 'item list should not have a standalone Items heading');
-      assert.match(request.html, new RegExp(`\\.address \\{ font-size: ${expectedWidth === '58mm' ? '10px' : '11\\.5px'}`));
-      assert.match(request.html, new RegExp(`\\.customer \\{ font-size: ${expectedWidth === '58mm' ? '13px' : '14px'}; font-weight: 400;`), 'customer names should use a smaller regular weight at each paper width');
-      assert.match(request.html, new RegExp(`\\.item-name, \\.item-qty \\{ font-size: ${expectedWidth === '58mm' ? '11\\.5px' : '13\\.5px'}`));
+      assert.match(request.html, new RegExp(`\\.address \\{ font-size: ${isNarrow ? '10px' : '11.5px'};`));
+      assert.match(request.html, new RegExp(`\\.customer \\{ font-size: ${isNarrow ? '13px' : '14px'}; font-weight: 400;`), 'customer names should remain smaller than document titles');
+      assert.match(request.html, new RegExp(`\\.document-title \\{ margin: 1mm 0 1.5mm; font-size: ${isNarrow ? '15px' : '19px'}; line-height: 1\\.15; font-weight: 700;`));
+      assert.match(request.html, /\.grand-total \.value \{ text-align: right; \}/);
+      assert.match(request.html, new RegExp(`\\.qr-caption \\{ margin: 0; font-size: ${isNarrow ? '9.5px' : '11px'}; \\}`));
+      assert.match(request.html, new RegExp(`\\.footer-title \\{ margin: 0; font-size: ${isNarrow ? '12px' : '14px'}; font-weight: 700; \\}`));
+      assert.match(request.html, new RegExp(`\\.item-name \\{ font-size: ${isNarrow ? '11.5px' : '13.5px'}`));
+      assert.match(request.html, new RegExp(`\\.item-qty \\{ font-size: ${isNarrow ? '11.5px' : '13.5px'}`));
       const itemBlockStyles = request.html.match(/\.item-block \{[^}]*\}/)?.[0];
       assert.ok(itemBlockStyles, 'product item styles should be present');
       assert.doesNotMatch(itemBlockStyles, /border-bottom/, 'product rows should not have a dashed bottom border');
-      assert.match(request.html, /\.divider \{ border-top: 1px dashed/, 'section separators should remain');
-      assert.match(request.html, /\.double-divider \{ border-top: 1px dashed/, 'totals separator should remain');
+      assert.match(request.html, /\.divider \{ border-top: 1px dashed/, 'section separators should match the preview');
+      assert.match(request.html, /\.double-divider \{ border-top: 1px dashed/, 'totals separator should match the preview');
       assert.match(request.html, /data:image\/png;base64,/);
       assert.match(request.html, /'Courier New', Courier, monospace/, 'thermal output should use a compact monochrome POS typeface');
-      assert.match(request.html, /Quality products/);
+      assert.match(request.html, /QUALITY PRODUCTS • BETTER EVERYDAY/i);
       assert.match(request.html, /Scan to visit our store/);
       assert.match(request.html, /border-top: 1px dashed/);
+      assert.match(request.html, /\.brand \{ display: flex; align-items: center; justify-content: center;/);
+      const expectedTaglineSize = expectedWidth === '58mm' ? '5.5px' : '7px';
+      assert.match(request.html, new RegExp(`\\.tagline \\{[^}]*font-size: ${expectedTaglineSize};`));
+      assert.doesNotMatch(request.html, /76\.16 each|190,000 each|item-unit-price/i);
       assert.match(request.html, /Pet Supplies sample/);
-      assert.match(request.html, /Large pack/);
+      assert.match(request.html, /Color:<\/strong> Blue/);
+      assert.match(request.html, /Size:<\/strong> M/);
+      assert.match(request.html, /Northside Market|Daily Need Items/);
+      assert.match(request.html, /QUALITY PRODUCTS • BETTER EVERYDAY/i);
+      assert.doesNotMatch(request.html, /Payment:|Status:|Payment Ref:|SKU: PET-35|Unit:/);
+      assert.match(
+        request.html,
+        /\.qr-row \{ display: flex; flex-direction: column; align-items: center;/,
+        'QR code should be horizontally centered',
+      );
       if (expectedWidth === '58mm') {
         assert.match(request.html, /class="item-narrow-details"/);
         assert.doesNotMatch(request.html, /class="items-heading"/);
@@ -228,7 +245,10 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
       if (kind === 'invoice') assert.equal(result.title, `Invoice ${invoice.invoiceNumber}`, 'generated PDF metadata title should use the invoice number instead of about:blank');
       assert.ok(result.pageDetails[0].textOperatorCount > 0, `${kind} ${width} page must contain printable text`);
       assert.ok(Math.abs(result.pageDetails[0].widthPt - Number.parseInt(width, 10) * 72 / 25.4) < 1, `${kind} should use ${width} paper width`);
-      assert.ok(result.diagnostics.contentBounds.right <= Number.parseInt(width, 10) * 96 / 25.4 + 1, `${kind} ${width} content should stay inside the physical paper width`);
+      assert.ok(
+        result.diagnostics.contentBounds.right <= Number.parseInt(width, 10) * 96 / 25.4 + 1,
+        `${kind} ${width} content should stay inside the physical paper width (right=${result.diagnostics.contentBounds.right}px)`,
+      );
       assert.equal(result.diagnostics.horizontalOverflowCount, 0, `${kind} ${width} should not clip layout boxes`);
       assert.equal(result.diagnostics.siblingOverlapCount, 0, `${kind} ${width} should not overlap metadata or item columns`);
       assert.ok(result.pageDetails[0].heightPt > 0 && result.pageDetails[0].heightPt < 800, `${kind} should use content height`);
@@ -237,7 +257,10 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
       if (width === '58mm') assert.match(result.diagnostics.contentText, /Qty:\s*1/);
       else assert.match(result.diagnostics.contentText, /\u00d71/);
       assert.match(result.diagnostics.contentText, /190,000/);
-      assert.doesNotMatch(result.diagnostics.contentText, /SKU:|Unit:/);
+      assert.match(result.diagnostics.contentText, /Color:\s*Blue/);
+      assert.match(result.diagnostics.contentText, /Size:\s*M/);
+      assert.doesNotMatch(result.diagnostics.contentText, /190,000\s+each|MMK 76\.16\s+each/i);
+      assert.doesNotMatch(result.diagnostics.contentText, /Payment:|Status:|Payment Ref:|SKU:\s*PET-35|Unit:/);
     }
 
     const longInvoice = {
@@ -276,7 +299,41 @@ test('Puppeteer renders self-contained thermal templates at both widths without 
     assert.match(longReceiptResult.diagnostics.contentText, /Long product 80 with an intentionally extended descriptive item name for thermal wrapping/);
     assert.equal(longReceiptResult.diagnostics.horizontalOverflowCount, 0, `long ${width} receipt should wrap without clipping`);
     assert.equal(longReceiptResult.diagnostics.siblingOverlapCount, 0, `long ${width} receipt should not overlap metadata or item columns`);
+
+    const myanmarInvoice = {
+      ...invoicePayload,
+      customerName: 'မင်္ဂလာပါ',
+      lineItems: [{ name: 'မြန်မာစာ ကုန်ပစ္စည်း အမည်ရှည်', quantity: 1, unitPrice: '190000', total: '190000' }],
+    };
+    const myanmarHtml = buildThermalInvoiceHtml(myanmarInvoice, width);
+    const myanmarResult = await readPdf(myanmarHtml, width);
+    assert.match(myanmarHtml, /font-family: 'Noto Sans Myanmar'/);
+    assert.match(myanmarHtml, /မြန်မာစာ ကုန်ပစ္စည်း အမည်ရှည်/);
+    assert.match(myanmarResult.diagnostics.contentText, /မြန်မာစာ ကုန်ပစ္စည်း အမည်ရှည်/);
+    assert.equal(myanmarResult.diagnostics.horizontalOverflowCount, 0, `Myanmar text should wrap within ${width}`);
   }
+});
+
+test('thermal templates use seller message fallback and keep product names wrapping without truncation', () => {
+  const configured = buildThermalInvoiceHtml({
+    ...invoicePayload,
+    sellerMessage: 'Please call before arrival\\nGate 2',
+    lineItems: [{
+      name: 'Extra long product name that should wrap naturally without ellipsis or truncation on the thermal slip',
+      quantity: 2,
+      total: '240000',
+      color: 'Black',
+    }],
+  }, '58mm');
+  assert.match(configured, /Please call before arrival/);
+  assert.match(configured, /Gate 2/);
+  assert.doesNotMatch(configured, /text-overflow:\s*ellipsis/i);
+  assert.match(configured, /white-space:\s*normal/i);
+  assert.match(configured, /overflow-wrap:\s*anywhere/i);
+  assert.match(configured, /Color:<\/strong> Black/);
+
+  const fallback = buildThermalInvoiceHtml({ ...invoicePayload, sellerMessage: '   \n  ' }, '58mm');
+  assert.match(fallback, /Customers may inspect the package before making payment/);
 });
 
 test('thermal templates safely escape invoice and product text and include local assets only', () => {

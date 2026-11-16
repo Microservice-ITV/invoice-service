@@ -4,6 +4,8 @@ import prisma from '@/config/database';
 import pdfGeneratorService from '@/services/pdf-generator.service';
 import receiptPdfService, { type ReceiptPdfPayload } from '@/services/receipt-pdf.service';
 import { THERMAL_RENDER_CACHE_VERSION } from '@/services/thermal-react-pdf-renderer.service';
+import orderSnapshotService from '@/services/order-snapshot.service';
+import productVariantLookupService from '@/services/product-variant-lookup.service';
 import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
 
@@ -18,12 +20,23 @@ type ThermalJob = Prisma.ThermalPdfJobGetPayload<{
 }>;
 type ThermalWidth = typeof WIDTHS[number];
 
-const asAddress = (value: Prisma.JsonValue | null): Record<string, unknown> | null =>
+const asAddress = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
 
-const asLineItems = (value: Prisma.JsonValue | null): Array<{ name: string; quantity: number; unitPrice: string; total: string; sku?: string | null }> =>
+type ThermalLineItem = {
+  name: string;
+  quantity: number;
+  unitPrice: string;
+  total: string;
+  sku?: string | null;
+  variantName?: string | null;
+  color?: string | null;
+  size?: string | null;
+};
+
+const asLineItems = (value: Prisma.JsonValue | null): ThermalLineItem[] =>
   Array.isArray(value) ? value.flatMap((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
     const item = entry as Record<string, Prisma.JsonValue>;
@@ -34,6 +47,9 @@ const asLineItems = (value: Prisma.JsonValue | null): Array<{ name: string; quan
       unitPrice: typeof item.unitPrice === 'string' ? item.unitPrice : '0.00',
       total: item.total,
       sku: typeof item.sku === 'string' ? item.sku : null,
+      variantName: typeof item.variantName === 'string' ? item.variantName : null,
+      color: typeof item.color === 'string' ? item.color : null,
+      size: typeof item.size === 'string' ? item.size : null,
     }];
   }) : [];
 
@@ -157,40 +173,56 @@ export class ThermalPdfWorker {
     try {
       if (!invoice || !['58mm', '80mm'].includes(width)) throw new Error('Thermal PDF job has no valid persisted document snapshot');
 
+      const snapshot = await orderSnapshotService.getInvoiceSnapshot(invoice.orderId).catch(() => null);
+      const sellerMessage = snapshot?.sellerMessagesByShopId?.[invoice.shopId] ?? null;
+      const snapshotShippingAddress = snapshot?.shippingAddress ?? invoice.shippingAddress ?? null;
+      const lineItems = await productVariantLookupService.enrich(
+        asLineItems(invoice.lineItems),
+        snapshot?.items ?? [],
+      );
+
       let pdf: Buffer;
       let destination: string;
       let document: 'invoice' | 'receipt';
       if (job.invoice) {
-        const lineItems = asLineItems(job.invoice.lineItems).map((item) => ({ ...item, sku: item.sku ?? null }));
         pdf = await pdfGeneratorService.renderThermalInvoicePdf({
           invoiceId: job.invoice.id, invoiceNumber: job.invoice.invoiceNumber, orderReference: job.invoice.orderReference,
           orderId: job.invoice.orderId, shopId: job.invoice.shopId, shopName: job.invoice.shopName,
           shopContactName: job.invoice.shopContactName, shopContactEmail: job.invoice.shopContactEmail,
           shopContactPhone: job.invoice.shopContactPhone, shopAddress: job.invoice.shopAddress,
           customerId: job.invoice.customerId, customerName: job.invoice.customerName, customerEmail: job.invoice.customerEmail,
-          customerPhone: job.invoice.customerPhone, billingAddress: asAddress(job.invoice.billingAddress), shippingAddress: asAddress(job.invoice.shippingAddress),
+          customerPhone: job.invoice.customerPhone, billingAddress: asAddress(job.invoice.billingAddress), shippingAddress: asAddress(snapshotShippingAddress),
           currency: job.invoice.currency, subtotal: job.invoice.subtotal.toString(), taxAmount: job.invoice.taxAmount.toString(),
           deliveryFee: job.invoice.deliveryFee.toString(), discountAmount: job.invoice.discountAmount.toString(), grandTotal: job.invoice.grandTotal.toString(),
-          paymentMethod: job.invoice.paymentMethod, status: job.invoice.status, createdAt: job.invoice.createdAt, lineItems,
+          paymentMethod: job.invoice.paymentMethod, status: job.invoice.status, createdAt: job.invoice.createdAt, sellerMessage, lineItems,
         }, width);
         destination = `thermal/${job.invoice.shopId}/${job.invoice.invoiceNumber}/${width}/${token}.pdf`;
         document = 'invoice';
       } else {
         const receipt = job.receipt;
         if (!receipt) throw new Error('Thermal receipt job has no persisted receipt snapshot');
-        const lineItems = asLineItems(invoice.lineItems);
         const payload: ReceiptPdfPayload = {
           receiptId: receipt.id, receiptNumber: receipt.receiptNumber,
           invoiceId: receipt.invoiceId, invoiceNumber: receipt.invoiceNumber,
           orderId: receipt.orderId, orderReference: receipt.orderReference,
           shopId: receipt.shopId, shopName: receipt.shopName,
           customerId: receipt.customerId, customerName: receipt.customerName, customerEmail: receipt.customerEmail,
+          customerPhone: invoice.customerPhone ?? snapshot?.customerPhone ?? null,
           currency: receipt.currency, subtotal: receipt.subtotal.toString(), deliveryFee: receipt.deliveryFee.toString(),
           taxAmount: receipt.taxAmount.toString(), discountAmount: receipt.discountAmount.toString(), grandTotal: receipt.grandTotal.toString(),
           paymentMethod: receipt.paymentMethod, paymentGatewayRef: receipt.paymentGatewayRef,
-          status: receipt.status, issuedAt: receipt.issuedAt, shippingAddress: asAddress(invoice.shippingAddress), lineItems,
+          status: receipt.status, issuedAt: receipt.issuedAt, shippingAddress: asAddress(snapshotShippingAddress), sellerMessage, lineItems,
         };
-        pdf = await receiptPdfService.renderReceiptPdf(payload, width, { customerName: receipt.customerName, lineItems });
+        pdf = await receiptPdfService.renderReceiptPdf(payload, width, {
+          shopName: invoice.shopName,
+          shopAddress: invoice.shopAddress,
+          shopContactPhone: invoice.shopContactPhone,
+          customerName: invoice.customerName ?? receipt.customerName,
+          customerPhone: invoice.customerPhone ?? snapshot?.customerPhone ?? null,
+          shippingAddress: asAddress(snapshotShippingAddress),
+          sellerMessage,
+          lineItems,
+        });
         destination = `thermal/receipts/${receipt.shopId}/${receipt.receiptNumber}/${width}/${token}.pdf`;
         document = 'receipt';
       }

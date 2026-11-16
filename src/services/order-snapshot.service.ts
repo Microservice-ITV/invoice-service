@@ -6,6 +6,9 @@ export interface OrderInvoiceSnapshotItem {
   productName: string | null;
   productSku: string | null;
   imageUrl?: string | null;
+  color?: string | null;
+  size?: string | null;
+  variantName?: string | null;
   quantity: number;
   unitPrice: string;
   lineTotal: string | null;
