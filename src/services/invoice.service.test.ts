@@ -815,6 +815,55 @@ test('customer invoice detail hydrates missing product images and the shop selle
   }
 });
 
+test('invoice API hydrates color and abbreviated size from the product variant matched by SKU', async () => {
+  const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
+  const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  const originalFetch = globalThis.fetch;
+  invoiceRepository.findDocumentByInvoiceNumber = async () => ({
+    id: 'invoice-1',
+    invoiceNumber: 'INV-1',
+    customerId: 'customer-1',
+    orderId: 'order-1',
+    shopId: 'shop-1',
+    lineItems: [{
+      orderItemId: 'order-item-1',
+      name: 'Test product',
+      sku: 'SKU-1',
+      quantity: 1,
+      unitPrice: '100.00',
+      total: '100.00',
+      imageUrl: null,
+    }],
+  }) as Awaited<ReturnType<typeof originalFindDocumentByInvoiceNumber>>;
+  const snapshot = makeOrderSnapshot('MMK');
+  snapshot.items = snapshot.items.map((item) => ({ ...item, productId: 'product-variant-api-test' }));
+  orderSnapshotService.getInvoiceSnapshot = async () => snapshot;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).endsWith('/products/product-variant-api-test')) {
+      return new Response(JSON.stringify({
+        data: {
+          variants: [{
+            sku: 'SKU-1',
+            color: { name: 'Blue', code: 'BLU' },
+            size: { name: 'Medium', code: 'M' },
+          }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const invoice = await new InvoiceService().getCustomerInvoiceByNumber('INV-1', 'customer-1');
+    assert.equal(invoice?.lineItems?.[0]?.color, 'Blue');
+    assert.equal(invoice?.lineItems?.[0]?.size, 'M');
+  } finally {
+    globalThis.fetch = originalFetch;
+    invoiceRepository.findDocumentByInvoiceNumber = originalFindDocumentByInvoiceNumber;
+    orderSnapshotService.getInvoiceSnapshot = originalGetInvoiceSnapshot;
+  }
+});
+
 test('invoice detail hydrates the seller message even when persisted images are available', async () => {
   const originalFindDocumentByInvoiceNumber = invoiceRepository.findDocumentByInvoiceNumber;
   const originalGetInvoiceSnapshot = orderSnapshotService.getInvoiceSnapshot;
@@ -1722,6 +1771,8 @@ test('approved slip verification issues a receipt; rejection does not', async ()
       id: 'invoice-slip',
       status: 'PENDING_VERIFICATION',
       shopId: 'shop-1',
+      paymentMethod: 'MANUAL_SLIP',
+      paymentSlipUrl: 'https://files.example.test/payment-slip.png',
     }) as Awaited<ReturnType<typeof originalFindById>>;
     invoiceRepository.transitionVerification = async (id, approved) => ({
       id,
@@ -1738,6 +1789,59 @@ test('approved slip verification issues a receipt; rejection does not', async ()
     assert.deepEqual(calls, [], 'rejected verification must not issue a receipt');
   } finally {
     receiptService.issueForInvoice = originalIssue;
+    invoiceRepository.findById = originalFindById;
+    invoiceRepository.transitionVerification = originalTransition;
+  }
+});
+
+test('verification rejects non-manual payments and manual invoices without an uploaded slip', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalTransition = invoiceRepository.transitionVerification;
+  const service = new InvoiceService();
+  let transitionCalls = 0;
+  invoiceRepository.transitionVerification = async () => {
+    transitionCalls += 1;
+    return null;
+  };
+
+  try {
+    for (const paymentMethod of ['COD', 'PREPAID', 'prepaid', 'CARD']) {
+      invoiceRepository.findById = async () => ({
+        id: `invoice-${paymentMethod.toLowerCase()}`,
+        status: 'PENDING_VERIFICATION',
+        shopId: 'shop-1',
+        paymentMethod,
+        paymentSlipUrl: 'https://files.example.test/payment-slip.png',
+      }) as Awaited<ReturnType<typeof originalFindById>>;
+
+      for (const approved of [true, false]) {
+        await assert.rejects(
+          service.verifyInvoice(`invoice-${paymentMethod.toLowerCase()}`, approved, 'seller-1'),
+          (error: unknown) =>
+            error instanceof Error &&
+            (error as Error & { statusCode?: number }).statusCode === 409,
+        );
+      }
+    }
+
+    invoiceRepository.findById = async () => ({
+      id: 'invoice-no-slip',
+      status: 'PENDING_VERIFICATION',
+      shopId: 'shop-1',
+      paymentMethod: 'MANUAL_SLIP',
+      paymentSlipUrl: null,
+    }) as Awaited<ReturnType<typeof originalFindById>>;
+
+    for (const approved of [true, false]) {
+      await assert.rejects(
+        service.verifyInvoice('invoice-no-slip', approved, 'seller-1'),
+        (error: unknown) =>
+          error instanceof Error &&
+          (error as Error & { statusCode?: number }).statusCode === 409,
+      );
+    }
+    assert.equal(transitionCalls, 0);
+  } finally {
     invoiceRepository.findById = originalFindById;
     invoiceRepository.transitionVerification = originalTransition;
   }

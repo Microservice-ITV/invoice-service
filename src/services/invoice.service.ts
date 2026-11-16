@@ -9,6 +9,7 @@ import orderSnapshotService, {
   OrderInvoiceSnapshotItem,
   OrderSnapshotError,
 } from '@/services/order-snapshot.service';
+import productVariantLookupService from '@/services/product-variant-lookup.service';
 import shopLookupService from '@/services/shop-lookup.service';
 import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
@@ -1127,6 +1128,8 @@ export class InvoiceService {
         orderItemId: item.orderItemId,
         name: item.productName?.trim() || item.productSku || item.productId,
         sku: item.productSku,
+        color: item.color ?? null,
+        size: item.size ?? null,
         imageUrl: item.imageUrl ?? null,
         quantity: item.requestedQuantity,
         unitPrice: item.unitPrice,
@@ -1203,6 +1206,14 @@ export class InvoiceService {
     const allowedStatuses: InvoiceStatus[] = ['PENDING_VERIFICATION'];
     if (!allowedStatuses.includes(invoice.status)) {
       throw new ConflictError(`Invoice cannot be verified while in ${invoice.status} status`);
+    }
+
+    if (normalizeString(invoice.paymentMethod).toUpperCase() !== 'MANUAL_SLIP') {
+      throw new ConflictError('Only manual payment slips can be verified');
+    }
+
+    if (!normalizeString(invoice.paymentSlipUrl)) {
+      throw new ConflictError('Invoice has no uploaded payment slip');
     }
 
     if (approved) {
@@ -1386,13 +1397,14 @@ export class InvoiceService {
         return imageUrl ? [[item.orderItemId, imageUrl] as const] : [];
       }),
     );
+    const enrichedLineItems = await productVariantLookupService.enrich(lineItems, snapshot.items);
 
     return {
       ...invoice,
       sellerMessage: snapshot.sellerMessagesByShopId?.[invoice.shopId] ?? null,
       lineItems: invoice.lineItems === null
         ? null
-        : lineItems.map((item) => ({
+        : enrichedLineItems.map((item) => ({
           ...item,
           imageUrl: item.imageUrl?.trim()
             || (item.orderItemId ? imageUrlsByOrderItemId.get(item.orderItemId) : undefined)

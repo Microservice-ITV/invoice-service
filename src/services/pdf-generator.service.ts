@@ -49,11 +49,14 @@ export interface InvoicePdfPayload {
   lineItems?: Array<{
     sku?: string | null;
     variantName?: string | null;
+    color?: string | null;
+    size?: string | null;
     name: string;
     quantity: number;
     unitPrice: string;
     total: string;
   }>;
+  sellerMessage?: string | null;
 }
 
 export class PdfGeneratorService {

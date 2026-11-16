@@ -11,6 +11,8 @@ export interface InvoiceLineItem {
   name: string;
   sku?: string | null;
   variantName?: string | null;
+  color?: string | null;
+  size?: string | null;
   imageUrl?: string | null;
   quantity: number;
   unitPrice: string;

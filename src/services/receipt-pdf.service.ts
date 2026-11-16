@@ -15,6 +15,7 @@ export interface ReceiptPdfPayload {
   customerId: string;
   customerName: string | null;
   customerEmail: string | null;
+  customerPhone?: string | null;
   currency: string;
   subtotal: string;
   deliveryFee: string;
@@ -26,7 +27,8 @@ export interface ReceiptPdfPayload {
   status: string;
   issuedAt: Date;
   shippingAddress?: Record<string, unknown> | null;
-  lineItems?: Array<{ name: string; quantity: number; unitPrice?: string; total: string }>;
+  sellerMessage?: string | null;
+  lineItems?: Array<{ name: string; quantity: number; unitPrice?: string; total: string; color?: string | null; size?: string | null; variantName?: string | null }>;
 }
 
 // Exported so receipt.service can verify stored references against the exact
@@ -59,7 +61,7 @@ export class ReceiptPdfService {
     currentInvoiceData: unknown = null,
   ): Promise<Buffer> {
     const invoice = currentInvoiceData && typeof currentInvoiceData === 'object'
-      ? currentInvoiceData as Pick<ThermalInvoiceData, 'customerName' | 'lineItems'>
+      ? currentInvoiceData as Pick<ThermalInvoiceData, 'shopName' | 'shopAddress' | 'shopContactPhone' | 'customerName' | 'customerPhone' | 'shippingAddress' | 'sellerMessage' | 'lineItems'>
       : null;
     const html = buildThermalReceiptHtml(payload, width, invoice);
     return thermalReactPdfRenderer.render(html, width, {
