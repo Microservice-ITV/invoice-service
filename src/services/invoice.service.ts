@@ -1469,7 +1469,7 @@ export class InvoiceService {
   async downloadThermalInvoicePdf(id: string, actor: InvoiceAccessActor, width: '58mm' | '80mm') {
     const invoice = await invoiceRepository.findById(id);
     if (!invoice || !canAccessInvoice(invoice, actor)) return null;
-    let job = await thermalPdfWorker.getStatus(invoice.id, width);
+    const job = await thermalPdfWorker.getStatus(invoice.id, width);
     if (!job) {
       await thermalPdfWorker.enqueue(invoice.id);
       return { invoice, processing: true as const, status: 'PENDING', attempts: 0, error: null, retryAt: new Date() };
