@@ -21,6 +21,31 @@ This service consumes the `payment.completed` event from RabbitMQ.
 }
 ```
 
+## `order.paid` Invoice Retries and Dead Letters
+
+Invoice creation failures on the `order.paid` queue receive at most five total
+attempts. Transient failures are handed to durable retry queues with delays of
+1, 2, 4, and 8 seconds; invalid or ineligible messages go directly to the
+durable dead-letter queue. After the fifth failed attempt, the event is also
+sent to the dead-letter queue.
+
+Queue names are derived from `RABBITMQ_ORDER_PAID_QUEUE`:
+
+- `<queue>.retry.1` through `<queue>.retry.4`
+- `<queue>.dlq`
+
+Retry queues dead-letter back to `RABBITMQ_EXCHANGE` using
+`RABBITMQ_ORDER_PAID_KEY`. DLQ messages contain the original body (including an
+exact base64 copy), order ID, error details, first and final failure
+timestamps, and attempt counts. The source delivery is acknowledged only after
+invoice creation succeeds or a confirmed retry/DLQ handoff completes.
+
+The existing source queue remains durable and is declared without additional
+arguments, so deploying this feature does not require changing or recreating
+production queues. The service declares only the new retry and DLQ queues at
+startup; RabbitMQ credentials must allow queue declaration and message
+publishing. No database migration or frontend change is required.
+
 ## Invoice Verification Payload
 
 ```json

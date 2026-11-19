@@ -14,11 +14,13 @@ process.env.MINIO_USE_SSL = 'false';
 process.env.PUBLIC_BASE_URL = 'http://localhost:9000';
 
 import prisma from '@/config/database';
-import pdfGeneratorService from '@/services/pdf-generator.service';
+import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
 import receiptPdfService from '@/services/receipt-pdf.service';
 import storageService from '@/services/storage.service';
 import { ThermalPdfWorker } from '@/services/thermal-pdf-worker.service';
 import { THERMAL_RENDER_CACHE_VERSION } from '@/services/thermal-react-pdf-renderer.service';
+import orderSnapshotService from '@/services/order-snapshot.service';
+import productVariantLookupService from '@/services/product-variant-lookup.service';
 
 const invoice = {
   id: 'invoice-1', invoiceNumber: 'INV-1', orderReference: 'ORDER-1', orderId: 'order-1',
@@ -31,7 +33,7 @@ const invoice = {
   lineItems: [{ name: 'Item', quantity: 1, unitPrice: '10.00', total: '10.00' }],
 };
 
-const invoiceJob = (width: '58mm' | '80mm', overrides: Record<string, unknown> = {}) => ({
+const invoiceJob = (width: 'A4' | '58mm' | '80mm', overrides: Record<string, unknown> = {}) => ({
   id: `job-${width}`, invoiceId: 'invoice-1', receiptId: null, width, attempts: 0,
   status: 'PENDING', invoice, receipt: null, ...overrides,
 });
@@ -98,6 +100,55 @@ test('worker prepares both invoice widths and writes storage references', async 
     assert.equal(stored.length, 2);
     assert.ok(stored.some((ref) => ref.includes('/58mm/')));
     assert.ok(stored.some((ref) => ref.includes('/80mm/')));
+  } finally { restore.reverse().forEach((fn) => fn()); }
+});
+
+test('worker generates and stores the A4 artifact in the durable invoice job', async () => {
+  const restore: Array<() => void> = [];
+  const job = invoiceJob('A4', {
+    invoice: { ...invoice, pdfUrl: null, pdfStatus: 'PENDING' },
+  });
+  const currentPdfUrl = `invoice-pdfs/shop-1/${REACT_PRINT_PDF_MARKER}/INV-1-ready.pdf`;
+  let invoiceStatus: string | undefined;
+  let storedJobVersion: string | undefined;
+  let renderCount = 0;
+  const origFind = prisma.thermalPdfJob.findFirst;
+  const origJobUpdate = prisma.thermalPdfJob.updateMany;
+  const origInvoiceClaim = prisma.invoice.updateMany;
+  const origInvoiceUpdate = prisma.invoice.update;
+  const origBuild = pdfGeneratorService.buildAndUploadInvoicePdf;
+  const origThermalRender = pdfGeneratorService.renderThermalInvoicePdf;
+  const origSnapshot = orderSnapshotService.getInvoiceSnapshot;
+  const origEnrich = productVariantLookupService.enrich;
+  restore.push(() => { prisma.thermalPdfJob.findFirst = origFind; });
+  restore.push(() => { prisma.thermalPdfJob.updateMany = origJobUpdate; });
+  restore.push(() => { prisma.invoice.updateMany = origInvoiceClaim; });
+  restore.push(() => { prisma.invoice.update = origInvoiceUpdate; });
+  restore.push(() => { pdfGeneratorService.buildAndUploadInvoicePdf = origBuild; });
+  restore.push(() => { pdfGeneratorService.renderThermalInvoicePdf = origThermalRender; });
+  restore.push(() => { orderSnapshotService.getInvoiceSnapshot = origSnapshot; });
+  restore.push(() => { productVariantLookupService.enrich = origEnrich; });
+  (prisma.thermalPdfJob as any).findFirst = async () => job;
+  (prisma.thermalPdfJob as any).updateMany = async (args: never) => {
+    const data = (args as unknown as { data: Record<string, unknown> }).data;
+    if (data.status === 'READY') storedJobVersion = String(data.templateVersion);
+    return { count: 1 } as never;
+  };
+  (prisma.invoice as any).updateMany = async () => ({ count: 1 });
+  (prisma.invoice as any).update = async (args: never) => {
+    const data = (args as unknown as { data: { pdfStatus: string } }).data;
+    invoiceStatus = data.pdfStatus;
+    return { ...invoice, pdfUrl: currentPdfUrl, pdfStatus: data.pdfStatus } as never;
+  };
+  pdfGeneratorService.buildAndUploadInvoicePdf = async () => { renderCount += 1; return currentPdfUrl; };
+  pdfGeneratorService.renderThermalInvoicePdf = async () => { assert.fail('A4 jobs must not use the thermal renderer'); };
+  orderSnapshotService.getInvoiceSnapshot = async () => null as never;
+  productVariantLookupService.enrich = async (lineItems) => lineItems as never;
+  try {
+    assert.equal(await new ThermalPdfWorker().processNextJob(), true);
+    assert.equal(renderCount, 1);
+    assert.equal(invoiceStatus, 'READY');
+    assert.equal(storedJobVersion, REACT_PRINT_PDF_MARKER);
   } finally { restore.reverse().forEach((fn) => fn()); }
 });
 
@@ -179,14 +230,19 @@ test('receipt jobs render from the persisted receipt and invoice snapshots', asy
     grandTotal: { toString: () => '10.00' }, paymentMethod: 'CARD', paymentGatewayRef: null,
     status: 'ISSUED', issuedAt: new Date(), invoice,
   };
-  (prisma.thermalPdfJob as any).findFirst = async () => ({ ...invoiceJob('58mm'), invoice: null, receiptId: 'receipt-1', receipt });
+  const renderedWidths: string[] = [];
+  (prisma.thermalPdfJob as any).findFirst = async () => {
+    const width = renderedWidths.length === 0 ? '58mm' : '80mm';
+    return { ...invoiceJob(width), invoice: null, receiptId: 'receipt-1', receipt };
+  };
   (prisma.thermalPdfJob as any).updateMany = async () => ({ count: 1 });
-  receiptPdfService.renderReceiptPdf = async (_payload, width) => { widthSeen = width ?? '80mm'; return Buffer.from('%PDF'); };
+  receiptPdfService.renderReceiptPdf = async (_payload, width) => { widthSeen = width ?? '80mm'; renderedWidths.push(widthSeen); return Buffer.from('%PDF'); };
   storageService.uploadPdf = async (ref) => ref;
   try {
     const worker = new ThermalPdfWorker();
     assert.equal(await worker.processNextJob(), true);
-    assert.equal(widthSeen, '58mm');
+    assert.equal(await worker.processNextJob(), true);
+    assert.deepEqual(renderedWidths, ['58mm', '80mm']);
   } finally {
     prisma.thermalPdfJob.findFirst = origFind;
     prisma.thermalPdfJob.updateMany = origUpdate;

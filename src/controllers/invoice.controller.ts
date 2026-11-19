@@ -317,6 +317,17 @@ export class InvoiceController {
         res.status(404).json({ success: false, message: 'Invoice PDF not found' });
         return;
       }
+      if ('processing' in result && result.processing) {
+        res.status(503).json({
+          success: false,
+          status: result.status,
+          message: 'The prepared invoice PDF is temporarily unavailable. Regeneration is queued; please retry shortly.',
+          attempts: result.attempts,
+          error: result.error,
+          retryAt: result.retryAt,
+        });
+        return;
+      }
 
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/pdf');
@@ -335,7 +346,7 @@ export class InvoiceController {
       const result = await invoiceService.downloadThermalInvoicePdf(req.params.id, req.user, width);
       if (!result) { res.status(404).json({ success: false, message: 'Invoice PDF not found' }); return; }
       if (result.processing) {
-        res.status(202).json({ success: false, status: result.status, message: 'Thermal PDF is processing', attempts: result.attempts, error: result.error, retryAt: result.retryAt });
+        res.status(503).json({ success: false, status: result.status, message: 'The prepared thermal invoice PDF is temporarily unavailable. Regeneration is queued; please retry shortly.', attempts: result.attempts, error: result.error, retryAt: result.retryAt });
         return;
       }
       res.setHeader('Cache-Control', 'no-store');

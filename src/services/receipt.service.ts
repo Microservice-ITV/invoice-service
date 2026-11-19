@@ -118,16 +118,19 @@ export class ReceiptService {
     | null
   > {
     const context = await this.getReceiptForInvoice(invoiceId, actor);
-    if (!context?.receipt) {
+    if (!context?.receipt || context.invoice.status !== 'PAID' || context.receipt.status !== 'ISSUED') {
       return null;
     }
 
     const receipt = context.receipt;
     const selectedWidth = width ?? '80mm';
-    let job = await thermalPdfWorker.getReceiptStatus(receipt.id, selectedWidth);
+    const job = await thermalPdfWorker.getReceiptStatus(receipt.id, selectedWidth);
     if (!job) {
       await thermalPdfWorker.enqueueReceipt(receipt.id);
-      job = await thermalPdfWorker.getReceiptStatus(receipt.id, selectedWidth);
+      return {
+        receipt, processing: true, status: 'PENDING', attempts: 0,
+        error: null, retryAt: new Date(),
+      };
     }
     if (!job || job.status !== 'READY' || !job.artifactRef) {
       return {

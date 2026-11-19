@@ -23,6 +23,7 @@ const envSchema = z.object({
   PRODUCT_SERVICE_URL: z.string().url('PRODUCT_SERVICE_URL must be a valid URL')
     .default('http://host.docker.internal:5001/api/v1'),
   RABBITMQ_URL: z.string().default('amqp://localhost:5672'),
+  RABBITMQ_CONSUMERS_START_PAUSED: z.string().transform((value) => value === 'true').default('false'),
   RABBITMQ_EXCHANGE: z.string().default('order_events'),
   RABBITMQ_PAYMENT_COMPLETED_KEY: z.string().default('payment.completed'),
   RABBITMQ_PAYMENT_COLLECTED_KEY: z.string().default('payment.collected'),

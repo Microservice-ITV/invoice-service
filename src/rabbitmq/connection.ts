@@ -1,10 +1,10 @@
-import { Channel, ChannelModel, connect } from 'amqplib';
+import { Channel, ChannelModel, ConfirmChannel, connect } from 'amqplib';
 import logger from '@/utils/logger';
 import { rabbitConfig } from '@/rabbitmq/config';
 
 let connection: ChannelModel | null = null;
-let channel: Channel | null = null;
-let connecting: Promise<Channel> | null = null;
+let channel: ConfirmChannel | null = null;
+let connecting: Promise<ConfirmChannel> | null = null;
 let reconnecting: Promise<void> | null = null;
 let consumerInitializer: (() => Promise<void>) | null = null;
 let shuttingDown = false;
@@ -85,13 +85,13 @@ const watchConnection = (conn: ChannelModel, ch: Channel): void => {
   ch.on('close', () => handleFailure(undefined));
 };
 
-const connectWithRetries = async (): Promise<Channel> => {
+const connectWithRetries = async (): Promise<ConfirmChannel> => {
   for (let attempt = 1; attempt <= rabbitRetryCount; attempt += 1) {
     let conn: ChannelModel | null = null;
-    let ch: Channel | null = null;
+    let ch: ConfirmChannel | null = null;
     try {
       conn = await connect(rabbitConfig.url);
-      ch = await conn.createChannel();
+      ch = await conn.createConfirmChannel();
       await setupChannel(ch);
 
       connection = conn;
@@ -119,7 +119,7 @@ const connectWithRetries = async (): Promise<Channel> => {
   throw new Error('RabbitMQ connection attempts exhausted');
 };
 
-export const getRabbitChannel = async (): Promise<Channel> => {
+export const getRabbitChannel = async (): Promise<ConfirmChannel> => {
   if (channel) return channel;
   if (connecting) return connecting;
 
