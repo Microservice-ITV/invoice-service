@@ -82,6 +82,7 @@ CURRENT_CONTAINER=""
 NEW_CONTAINER=""
 PREVIOUS_PRODUCTION_IMAGE=""
 PRODUCTION_SWITCHED=0
+PREVIOUS_CONTAINER_STOPPED=0
 DEPLOYMENT_SUCCESS=0
 FAILURE_CLEANUP_RUNNING=0
 
@@ -241,12 +242,17 @@ remove_container() {
 
 stop_container_gracefully() {
     local container="$1"
+    local preserve="${2:-false}"
 
     if ! container_exists "$container"; then
         return 0
     fi
 
     if ! container_running "$container"; then
+        if [[ "$preserve" == "true" ]]; then
+            success "$container is already stopped; retaining it for rollback."
+            return 0
+        fi
         docker rm "$container" >/dev/null 2>&1 || true
         return 0
     fi
@@ -254,9 +260,20 @@ stop_container_gracefully() {
     echo "⏳ Gracefully stopping $container (${OLD_CONTAINER_STOP_TIMEOUT}s)..."
 
     if docker stop --time "$OLD_CONTAINER_STOP_TIMEOUT" "$container" >/dev/null 2>&1; then
-        docker rm "$container" >/dev/null 2>&1 || true
+        if [[ "$preserve" != "true" ]]; then
+            docker rm "$container" >/dev/null 2>&1 || true
+        fi
         success "$container stopped gracefully."
         return 0
+    fi
+
+    if [[ "$preserve" == "true" ]]; then
+        if ! container_running "$container"; then
+            success "$container stopped; retaining it for rollback."
+            return 0
+        fi
+        error "Could not stop $container gracefully; keeping it available for rollback."
+        return 1
     fi
 
     warning "Graceful stop timed out."
@@ -727,6 +744,22 @@ production_failure_cleanup() {
     echo "⚠️ PRODUCTION DEPLOYMENT FAILED"
     echo "========================================="
 
+    if [[ -n "$NEW_CONTAINER" ]] && [[ "$NEW_CONTAINER" != "$CURRENT_CONTAINER" ]]; then
+        remove_container "$NEW_CONTAINER"
+    fi
+
+    if [[ "$PREVIOUS_CONTAINER_STOPPED" -eq 1 ]] && [[ -n "$CURRENT_CONTAINER" ]]; then
+        echo "🔄 Restarting previous production container:"
+        echo "   $CURRENT_CONTAINER"
+        if docker start "$CURRENT_CONTAINER" >/dev/null && \
+            wait_for_container_health "$CURRENT_CONTAINER" "Previous production application"; then
+            PREVIOUS_CONTAINER_STOPPED=0
+            success "Previous production container is healthy."
+        else
+            error "CRITICAL: Previous production container could not be restored."
+        fi
+    fi
+
     if [[ "$PRODUCTION_SWITCHED" -eq 1 ]]; then
         if [[ -n "$CURRENT_CONTAINER" ]]; then
             if container_running "$CURRENT_CONTAINER"; then
@@ -751,10 +784,6 @@ production_failure_cleanup() {
         else
             echo "ℹ️ No previous production container; there is nothing to roll back to."
         fi
-    fi
-
-    if [[ -n "$NEW_CONTAINER" ]] && [[ "$NEW_CONTAINER" != "$CURRENT_CONTAINER" ]]; then
-        remove_container "$NEW_CONTAINER"
     fi
 
     cleanup_staging
@@ -925,6 +954,7 @@ start_production_application() {
         --restart=unless-stopped \
         --init \
         --env-file "$ENV_FILE" \
+        -e RABBITMQ_CONSUMERS_START_PAUSED=true \
         --network "$NETWORK_NAME" \
         --tmpfs "/tmp:rw,nosuid,nodev,size=256m" \
         --tmpfs "/dev/shm:rw,nosuid,nodev,size=256m" \
@@ -937,6 +967,47 @@ start_production_application() {
         --health-retries=3 \
         --health-start-period=40s \
         "$IMAGE"
+}
+
+wait_for_consumer_activation() {
+    local container="$1"
+
+    echo "⏳ Waiting for RabbitMQ consumers to activate..."
+    for i in $(seq 1 "$HEALTH_RETRIES"); do
+        if ! container_running "$container"; then
+            error "New production container exited before RabbitMQ consumers activated."
+            docker logs --tail 200 "$container" || true
+            return 1
+        fi
+
+        if docker logs "$container" 2>&1 | grep -Fq "RabbitMQ consumers activated"; then
+            success "RabbitMQ consumers activated in $container."
+            return 0
+        fi
+        sleep "$HEALTH_INTERVAL"
+    done
+
+    error "RabbitMQ consumer activation timed out."
+    docker logs --tail 200 "$container" || true
+    return 1
+}
+
+perform_production_consumer_handoff() {
+    if [[ -n "$CURRENT_CONTAINER" ]]; then
+        log "Stopping the previous consumer before activating the new consumer"
+        if ! stop_container_gracefully "$CURRENT_CONTAINER" true; then
+            return 1
+        fi
+        PREVIOUS_CONTAINER_STOPPED=1
+    fi
+
+    log "Activating RabbitMQ consumers in the new production container"
+    if ! docker kill --signal=USR2 "$NEW_CONTAINER" >/dev/null; then
+        error "Could not signal the new production container to activate RabbitMQ consumers."
+        return 1
+    fi
+
+    wait_for_consumer_activation "$NEW_CONTAINER"
 }
 
 # ============================================================
@@ -1093,11 +1164,18 @@ deploy_production() {
         echo "⏳ Waiting ${DRAIN_SECONDS}s for active connections..."
         sleep "$DRAIN_SECONDS"
 
-        log "Gracefully removing previous production container"
-        stop_container_gracefully "$CURRENT_CONTAINER"
-    else
-        echo "ℹ️ No previous production container."
     fi
+
+    if ! perform_production_consumer_handoff; then
+        error "Production RabbitMQ consumer handoff failed."
+        return 1
+    fi
+
+    if [[ -n "$CURRENT_CONTAINER" ]] && container_exists "$CURRENT_CONTAINER"; then
+        docker rm "$CURRENT_CONTAINER" >/dev/null 2>&1 || \
+            warning "Previous stopped container could not be removed; it remains available for manual cleanup."
+    fi
+    PREVIOUS_CONTAINER_STOPPED=0
 
     DEPLOYMENT_SUCCESS=1
 
@@ -1145,4 +1223,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

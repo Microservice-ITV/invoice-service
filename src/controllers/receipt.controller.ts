@@ -83,10 +83,10 @@ export class ReceiptController {
         return;
       }
       if (result.processing) {
-        res.status(202).json({
+        res.status(503).json({
           success: false,
           status: result.status,
-          message: 'Thermal receipt PDF is processing',
+          message: 'The prepared receipt PDF is temporarily unavailable. Regeneration is queued; please retry shortly.',
           attempts: result.attempts,
           error: result.error,
           retryAt: result.retryAt,

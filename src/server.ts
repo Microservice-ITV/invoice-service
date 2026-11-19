@@ -9,6 +9,7 @@ import {
 import { startPaymentCompletedConsumer } from '@/rabbitmq/consumers/payment-completed.consumer';
 import { startPaymentCollectedConsumer } from '@/rabbitmq/consumers/payment-collected.consumer';
 import { startOrderPaidConsumer } from '@/rabbitmq/consumers/order-paid.consumer';
+import { RabbitConsumerLifecycle } from '@/rabbitmq/consumer-lifecycle';
 import logger from '@/utils/logger';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 
@@ -22,12 +23,25 @@ const startServer = async (): Promise<void> => {
       await startOrderPaidConsumer();
       await startPaymentCollectedConsumer();
     };
-    setRabbitConsumerInitializer(initializeConsumers);
+    const consumerLifecycle = new RabbitConsumerLifecycle(initializeConsumers);
+    setRabbitConsumerInitializer(() => consumerLifecycle.start());
 
-    await getRabbitChannel();
-    await initializeConsumers();
+    if (env.RABBITMQ_CONSUMERS_START_PAUSED) {
+      process.on('SIGUSR2', () => {
+        void consumerLifecycle.start()
+          .then(() => logger.info('RabbitMQ consumers activated'))
+          .catch((error) => {
+            logger.error('Failed to activate RabbitMQ consumers', error as Error);
+            process.exit(1);
+          });
+      });
+      logger.info('RabbitMQ consumer startup paused; awaiting SIGUSR2');
+    } else {
+      await getRabbitChannel();
+      await consumerLifecycle.start();
+      logger.info('RabbitMQ consumer initialized');
+    }
     thermalPdfWorker.start();
-    logger.info('RabbitMQ consumer initialized');
 
     const server = app.listen(env.PORT, () => {
       logger.info(`Invoice service running on port ${env.PORT}`);

@@ -1,6 +1,7 @@
 import env from '@/config/env';
 
 export const rabbitConfig = {
+  orderPaidRetryDelaysMs: [1_000, 2_000, 4_000, 8_000],
   url: env.RABBITMQ_URL,
   exchange: env.RABBITMQ_EXCHANGE,
   exchangeType: 'topic' as const,

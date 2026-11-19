@@ -414,7 +414,7 @@ export class InvoiceRepository {
         },
       });
       await tx.thermalPdfJob.createMany({
-        data: ['58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
+        data: ['A4', '58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
         skipDuplicates: true,
       });
       return invoice;
@@ -622,7 +622,7 @@ export class InvoiceRepository {
       });
 
       await tx.thermalPdfJob.createMany({
-        data: ['58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
+        data: ['A4', '58mm', '80mm'].map((width) => ({ invoiceId: invoice.id, width })),
         skipDuplicates: true,
       });
 

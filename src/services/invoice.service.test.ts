@@ -36,7 +36,7 @@ import invoiceRepository, { InvoiceRepository } from '@/repositories/invoice.rep
 import receiptService from '@/services/receipt.service';
 import orderSnapshotService, { OrderInvoiceSnapshot } from '@/services/order-snapshot.service';
 import shopLookupService from '@/services/shop-lookup.service';
-import pdfGeneratorService from '@/services/pdf-generator.service';
+import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
 import storageService from '@/services/storage.service';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 import invoiceNotificationPublisher, {
@@ -292,19 +292,12 @@ test('only PDFs made by the current React print renderer are reusable', () => {
   assert.equal(hasCurrentInvoicePdf(null), false);
 });
 
-test('invoice download regenerates a stale PDF before returning it', async () => {
+test('invoice download serves the prepared current A4 artifact without rendering', async () => {
   const originalFindById = invoiceRepository.findById;
-  const originalClaimPdfGeneration = invoiceRepository.claimPdfGeneration;
-  const originalMarkPdfReady = invoiceRepository.markPdfReady;
-  const originalBuildAndUploadInvoicePdf = pdfGeneratorService.buildAndUploadInvoicePdf;
   const originalDownloadPdf = storageService.downloadPdf;
-  const stalePdf = Buffer.from('stale-pdf');
-  const currentPdf = Buffer.from('current-pdf: Updated Customer: Updated Product');
-  const stalePdfUrl = 'invoice-pdfs/shop-1/react-print-v20/invoice.pdf';
-  const currentPdfUrl = 'invoice-pdfs/shop-1/react-print-v21/invoice.pdf';
-  const downloadedUrls: string[] = [];
-  const generatedPayloads: Parameters<typeof pdfGeneratorService.buildAndUploadInvoicePdf>[0][] = [];
-  let savedPdfUrl = stalePdfUrl;
+  const originalA4Status = thermalPdfWorker.getA4Status;
+  const originalEnqueue = thermalPdfWorker.enqueue;
+  const currentPdfUrl = `invoice-pdfs/shop-1/${REACT_PRINT_PDF_MARKER}/invoice.pdf`;
   const invoice = {
     id: 'invoice-1',
     invoiceNumber: 'INV-1',
@@ -333,7 +326,7 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     paymentGatewayRef: null,
     paymentSlipUrl: null,
     status: 'PAID' as const,
-    pdfUrl: stalePdfUrl,
+    pdfUrl: currentPdfUrl,
     pdfStatus: 'READY',
     pdfError: null,
     pdfAttemptCount: 1,
@@ -349,19 +342,14 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
     updatedAt: new Date('2026-10-08T00:00:00.000Z'),
   } as NonNullable<Awaited<ReturnType<typeof invoiceRepository.findById>>>;
 
-  invoiceRepository.findById = async () => ({ ...invoice, pdfUrl: savedPdfUrl });
-  invoiceRepository.claimPdfGeneration = async () => true;
-  invoiceRepository.markPdfReady = async (_id, pdfUrl) => {
-    savedPdfUrl = pdfUrl;
-    return { ...invoice, pdfUrl };
-  };
-  pdfGeneratorService.buildAndUploadInvoicePdf = async (payload) => {
-    generatedPayloads.push(payload);
-    return currentPdfUrl;
-  };
+  invoiceRepository.findById = async () => invoice;
+  thermalPdfWorker.getA4Status = async () => ({
+    id: 'a4-job', status: 'READY', artifactRef: currentPdfUrl,
+  } as never);
+  thermalPdfWorker.enqueue = async () => undefined;
   storageService.downloadPdf = async (url) => {
-    downloadedUrls.push(url);
-    return url === currentPdfUrl ? currentPdf : stalePdf;
+    assert.equal(url, invoice.pdfUrl);
+    return Buffer.from('stored-pdf');
   };
 
   try {
@@ -370,17 +358,38 @@ test('invoice download regenerates a stale PDF before returning it', async () =>
       customerId: 'customer-1',
     });
 
-    assert.equal(result?.buffer, currentPdf);
-    assert.match(result?.buffer.toString() ?? '', /Updated Customer: Updated Product/);
-    assert.equal(generatedPayloads[0]?.customerName, 'Updated Customer');
-    assert.equal(generatedPayloads[0]?.lineItems?.[0]?.name, 'Updated Product');
-    assert.deepEqual(downloadedUrls, [currentPdfUrl]);
+    assert.ok(result);
+    assert.ok(result.buffer);
+    assert.equal(result.buffer.toString(), 'stored-pdf');
   } finally {
     invoiceRepository.findById = originalFindById;
-    invoiceRepository.claimPdfGeneration = originalClaimPdfGeneration;
-    invoiceRepository.markPdfReady = originalMarkPdfReady;
-    pdfGeneratorService.buildAndUploadInvoicePdf = originalBuildAndUploadInvoicePdf;
     storageService.downloadPdf = originalDownloadPdf;
+    thermalPdfWorker.getA4Status = originalA4Status;
+    thermalPdfWorker.enqueue = originalEnqueue;
+  }
+});
+
+test('missing A4 artifacts are queued and reported without synchronous rendering', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalA4Status = thermalPdfWorker.getA4Status;
+  const originalEnqueue = thermalPdfWorker.enqueue;
+  let queued = 0;
+  invoiceRepository.findById = async () => ({
+    id: 'invoice-missing', invoiceNumber: 'INV-MISSING', shopId: 'shop-1', customerId: 'customer-1',
+    pdfUrl: null, pdfStatus: 'PENDING', pdfAttemptCount: 0, pdfError: null, pdfUpdatedAt: null,
+  } as never);
+  thermalPdfWorker.getA4Status = async () => null;
+  thermalPdfWorker.enqueue = async () => { queued += 1; };
+  try {
+    const result = await new InvoiceService().downloadInvoicePdf('invoice-missing', {
+      role: 'customer', customerId: 'customer-1',
+    });
+    assert.equal(result?.processing, true);
+    assert.equal(queued, 1);
+  } finally {
+    invoiceRepository.findById = originalFindById;
+    thermalPdfWorker.getA4Status = originalA4Status;
+    thermalPdfWorker.enqueue = originalEnqueue;
   }
 });
 
@@ -410,7 +419,7 @@ test('thermal invoice download returns processing while a durable artifact is pe
       if (result?.processing) assert.equal(result.status, 'PENDING');
     }
     assert.equal(await service.downloadThermalInvoicePdf('invoice-1', { role: 'seller', shopId: 'shop-2' }, '80mm'), null);
-    assert.deepEqual(widths, ['58mm', '58mm', '80mm', '80mm']);
+    assert.deepEqual(widths, ['58mm', '80mm']);
   } finally {
     invoiceRepository.findById = originalFindById;
     thermalPdfWorker.getStatus = originalStatus;

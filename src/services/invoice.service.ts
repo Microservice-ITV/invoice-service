@@ -575,6 +575,7 @@ export class InvoiceService {
           // markCollected only returns a row when the UNPAID → PAID transition
           // actually committed, so this is a confirmed PAID invoice.
           await receiptService.issueForInvoice(marked);
+          await thermalPdfWorker.requeueInvoice(marked.id);
           void this.generatePdfAndPublishNotification(marked.id, marked, 'invoice.paid', { force: true });
         }
       }
@@ -1226,7 +1227,7 @@ export class InvoiceService {
         // transitionVerification committed PENDING_VERIFICATION → PAID here.
         await receiptService.issueForInvoice(updatedInvoice);
       }
-      void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+      await thermalPdfWorker.requeueInvoice(updatedInvoice.id);
       return updatedInvoice;
     }
 
@@ -1234,7 +1235,7 @@ export class InvoiceService {
     if (!updatedInvoice) {
       throw new ConflictError('Invoice has already been verified');
     }
-    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+    await thermalPdfWorker.requeueInvoice(updatedInvoice.id);
     return updatedInvoice;
   }
 
@@ -1258,7 +1259,7 @@ export class InvoiceService {
     // Update (never delete/create) the existing receipt to mirror the invoice
     // transition; a missing receipt makes this a no-op.
     await receiptService.updateReceiptStatus(id, 'VOID');
-    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+    await thermalPdfWorker.requeueInvoice(updatedInvoice.id);
     return updatedInvoice;
   }
 
@@ -1294,7 +1295,7 @@ export class InvoiceService {
     // Mirror the refund on the existing receipt without deleting or
     // reissuing it; no-op when no receipt exists.
     await receiptService.updateReceiptStatus(id, 'REFUNDED');
-    void this.generatePdfAsync(updatedInvoice.id, updatedInvoice, { force: true });
+    await thermalPdfWorker.requeueInvoice(updatedInvoice.id);
     return updatedInvoice;
   }
 
@@ -1419,30 +1420,49 @@ export class InvoiceService {
       return null;
     }
 
-    let pdfUrl = invoice.pdfUrl;
-    if (pdfUrl && hasCurrentInvoicePdf(pdfUrl)) {
+    const job = await thermalPdfWorker.getA4Status(invoice.id);
+    const pdfUrl = invoice.pdfUrl;
+    if (
+      invoice.pdfStatus === 'READY'
+      && pdfUrl
+      && hasCurrentInvoicePdf(pdfUrl)
+    ) {
+      if (!job) await thermalPdfWorker.enqueue(invoice.id);
       try {
         return {
           invoice,
           buffer: await storageService.downloadPdf(pdfUrl),
         };
       } catch (error) {
-        logger.warn('Stored invoice PDF could not be downloaded; regenerating it', {
+        logger.warn('Ready invoice PDF artifact could not be retrieved; requeueing regeneration', {
           invoiceId: invoice.id,
           error: error instanceof Error ? error.message : String(error),
         });
+        await thermalPdfWorker.requeueInvoice(invoice.id);
+        return {
+          invoice,
+          processing: true as const,
+          status: 'PENDING',
+          attempts: job?.attempts ?? 0,
+          error: null,
+          retryAt: new Date(),
+        };
       }
     }
 
-    await this.generatePdfAsync(invoice.id, invoice, { force: Boolean(pdfUrl), throwOnFailure: true });
-    pdfUrl = (await invoiceRepository.findById(id))?.pdfUrl ?? null;
-    if (!pdfUrl) {
-      throw new Error('Invoice PDF generation completed without a downloadable PDF');
+    if (job?.status === 'READY') {
+      await thermalPdfWorker.requeueInvoice(invoice.id);
+    } else if (!job) {
+      await thermalPdfWorker.enqueue(invoice.id);
     }
 
     return {
       invoice,
-      buffer: await storageService.downloadPdf(pdfUrl),
+      processing: true as const,
+      status: job?.status === 'READY' ? 'PENDING' : job?.status ?? 'PENDING',
+      attempts: job?.attempts ?? 0,
+      error: job?.lastError ?? null,
+      retryAt: job?.nextAttemptAt ?? new Date(),
     };
   }
 
@@ -1452,7 +1472,7 @@ export class InvoiceService {
     let job = await thermalPdfWorker.getStatus(invoice.id, width);
     if (!job) {
       await thermalPdfWorker.enqueue(invoice.id);
-      job = await thermalPdfWorker.getStatus(invoice.id, width);
+      return { invoice, processing: true as const, status: 'PENDING', attempts: 0, error: null, retryAt: new Date() };
     }
     if (!job || job.status !== 'READY' || !job.artifactRef) {
       return { invoice, processing: true as const, status: job?.status ?? 'PENDING', attempts: job?.attempts ?? 0, error: job?.lastError ?? null, retryAt: job?.nextAttemptAt ?? null };
@@ -1527,18 +1547,24 @@ export class InvoiceService {
         throw new ForbiddenError('Invoice does not belong to the active shop');
       }
 
-      let pdfUrl = invoice.pdfUrl;
-      if (!hasCurrentInvoicePdf(pdfUrl)) {
-        await this.generatePdfAsync(invoice.id, invoice, { force: true });
-        const refreshedInvoice = await invoiceRepository.findById(invoice.id);
-        pdfUrl = refreshedInvoice?.pdfUrl ?? null;
+      const job = await thermalPdfWorker.getA4Status(invoice.id);
+      const pdfUrl = invoice.pdfUrl;
+      if (invoice.pdfStatus !== 'READY' || !pdfUrl || !hasCurrentInvoicePdf(pdfUrl) || job?.status !== 'READY') {
+        await thermalPdfWorker.enqueue(invoice.id);
+        throw new AppError('One or more invoice PDFs are not ready. Background regeneration has been queued; retry the batch download shortly.', 503);
       }
 
-      if (!pdfUrl) {
-        continue;
+      let pdfBuffer: Buffer;
+      try {
+        pdfBuffer = await storageService.downloadPdf(pdfUrl);
+      } catch (error) {
+        logger.warn('Batch invoice PDF artifact could not be retrieved; requeueing regeneration', {
+          invoiceId: invoice.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await thermalPdfWorker.requeueInvoice(invoice.id);
+        throw new AppError('One or more invoice PDFs are temporarily unavailable. Background regeneration has been queued; retry the batch download shortly.', 503);
       }
-
-      const pdfBuffer = await storageService.downloadPdf(pdfUrl);
       entries.push({
         name: `${invoice.invoiceNumber || invoice.id}.pdf`,
         buffer: pdfBuffer,
