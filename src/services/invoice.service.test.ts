@@ -437,6 +437,7 @@ const withSnapshotDependencies = async <T>(
   const originalIssueReceipt = receiptService.issueForInvoice;
   const originalUpdateReceiptStatus = receiptService.updateReceiptStatus;
   const originalEnqueueThermalPdf = thermalPdfWorker.enqueue;
+  const originalRequeueThermalPdf = thermalPdfWorker.requeueInvoice;
   orderSnapshotService.getInvoiceSnapshot = async () => snapshot;
   shopLookupService.getShopInvoiceSnapshot = async () => ({
     name: 'Shop One',
@@ -446,11 +447,12 @@ const withSnapshotDependencies = async <T>(
     address: 'Shop address',
   });
   invoiceRepository.claimPdfGeneration = async () => false;
-  // Receipt issuance writes to the database; tests exercise receipt behavior
-  // in receipt.service.test.ts, so here it defaults to a no-op.
+  // Receipt issuance and PDF job persistence are tested separately, so they
+  // default to no-ops here.
   receiptService.issueForInvoice = async () => null;
   receiptService.updateReceiptStatus = async () => null;
   thermalPdfWorker.enqueue = async () => undefined;
+  thermalPdfWorker.requeueInvoice = async () => undefined;
 
   try {
     return await run();
@@ -461,6 +463,7 @@ const withSnapshotDependencies = async <T>(
     receiptService.issueForInvoice = originalIssueReceipt;
     receiptService.updateReceiptStatus = originalUpdateReceiptStatus;
     thermalPdfWorker.enqueue = originalEnqueueThermalPdf;
+    thermalPdfWorker.requeueInvoice = originalRequeueThermalPdf;
   }
 };
 
@@ -1766,6 +1769,7 @@ test('approved slip verification issues a receipt; rejection does not', async ()
   const originalFindById = invoiceRepository.findById;
   const originalTransition = invoiceRepository.transitionVerification;
   const originalIssue = receiptService.issueForInvoice;
+  const originalRequeueThermalPdf = thermalPdfWorker.requeueInvoice;
   const service = new InvoiceService();
   Object.defineProperty(service, 'generatePdfAsync', { value: async () => false });
   const calls: Array<{ id: string; status?: string }> = [];
@@ -1773,6 +1777,7 @@ test('approved slip verification issues a receipt; rejection does not', async ()
     calls.push({ id: invoice.id, status: invoice.status });
     return null;
   };
+  thermalPdfWorker.requeueInvoice = async () => undefined;
 
   try {
     // Approved: PENDING_VERIFICATION → PAID.
@@ -1798,6 +1803,7 @@ test('approved slip verification issues a receipt; rejection does not', async ()
     assert.deepEqual(calls, [], 'rejected verification must not issue a receipt');
   } finally {
     receiptService.issueForInvoice = originalIssue;
+    thermalPdfWorker.requeueInvoice = originalRequeueThermalPdf;
     invoiceRepository.findById = originalFindById;
     invoiceRepository.transitionVerification = originalTransition;
   }
@@ -1860,11 +1866,13 @@ test('voiding and refunding an invoice updates the existing receipt status', asy
   const originalFindById = invoiceRepository.findById;
   const originalUpdateStatus = invoiceRepository.updateStatus;
   const originalUpdate = receiptService.updateReceiptStatus;
+  const originalRequeueThermalPdf = thermalPdfWorker.requeueInvoice;
   const updates: Array<{ invoiceId: string; status: string }> = [];
   receiptService.updateReceiptStatus = async (invoiceId, status) => {
     updates.push({ invoiceId, status });
     return null;
   };
+  thermalPdfWorker.requeueInvoice = async () => undefined;
   const service = new InvoiceService();
   Object.defineProperty(service, 'generatePdfAsync', { value: async () => false });
 
@@ -1888,6 +1896,7 @@ test('voiding and refunding an invoice updates the existing receipt status', asy
     ]);
   } finally {
     receiptService.updateReceiptStatus = originalUpdate;
+    thermalPdfWorker.requeueInvoice = originalRequeueThermalPdf;
     invoiceRepository.findById = originalFindById;
     invoiceRepository.updateStatus = originalUpdateStatus;
   }
