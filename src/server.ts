@@ -12,6 +12,7 @@ import { startOrderPaidConsumer } from '@/rabbitmq/consumers/order-paid.consumer
 import { RabbitConsumerLifecycle } from '@/rabbitmq/consumer-lifecycle';
 import logger from '@/utils/logger';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
+import { invoiceCacheService } from '@/services/invoice-cache.service';
 
 const startServer = async (): Promise<void> => {
   try {
@@ -52,6 +53,7 @@ const startServer = async (): Promise<void> => {
       server.close(async () => {
         try {
           await thermalPdfWorker.stop();
+          await invoiceCacheService.close();
           await prisma.$disconnect();
           await closeRabbitConnection();
           logger.info('Invoice service shut down gracefully');

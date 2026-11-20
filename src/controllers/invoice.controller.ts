@@ -203,7 +203,7 @@ export class InvoiceController {
 
       const invoice = actor.role === 'customer'
         ? await invoiceService.getCustomerInvoiceByNumber(req.params.invoiceNumber, actor.customerId ?? '')
-        : await invoiceService.getInvoiceByNumber(req.params.invoiceNumber);
+        : await invoiceService.getInvoiceByNumber(req.params.invoiceNumber, actor);
       if (!invoice || !canAccessInvoice(invoice, actor)) {
         res.status(404).json({ success: false, message: 'Invoice not found' });
         return;
@@ -218,6 +218,7 @@ export class InvoiceController {
   async getShopInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const shopId = req.user?.shopId;
+      const status = normalizeStatus(req.query.status as string | undefined);
       const shopIds = [...new Set(req.user?.shopIds ?? [])];
 
       if (shopIds.length === 0 && !shopId) {
@@ -229,8 +230,8 @@ export class InvoiceController {
       }
 
       const invoices = shopIds.length > 0
-        ? await invoiceService.getInvoicesByShops(shopIds)
-        : await invoiceService.getInvoicesByShop(shopId as string);
+        ? await invoiceService.getInvoicesByShops(shopIds, status, req.user)
+        : await invoiceService.getInvoicesByShop(shopId as string, status, req.user);
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch shop invoices'));
@@ -239,7 +240,7 @@ export class InvoiceController {
 
   async getInvoice(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const invoice = await invoiceService.getInvoiceById(req.params.id);
+      const invoice = await invoiceService.getInvoiceById(req.params.id, req.user);
       if (!invoice || !req.user || !canAccessInvoice(invoice, req.user)) {
         res.status(404).json({ success: false, message: 'Invoice not found' });
         return;
@@ -271,7 +272,12 @@ export class InvoiceController {
 
       // The token carries the invoice id, so no extra lookup by number is needed;
       // the number is still re-checked so a token cannot be replayed elsewhere.
-      const invoice = await invoiceService.getInvoiceById(claims.invoiceId);
+      const invoice = await invoiceService.getInvoiceById(claims.invoiceId, {
+        id: claims.sub,
+        customerId: claims.sub,
+        role: claims.role,
+        shopId: claims.shopId,
+      });
       if (!invoice || invoice.invoiceNumber !== invoiceNumber) {
         res.status(404).json({ success: false, message: 'Invoice not found' });
         return;
@@ -392,7 +398,7 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = await invoiceService.getInvoicesByShop(shopId, status);
+      const invoices = await invoiceService.getInvoicesByShop(shopId, status, req.user);
       res.json({ success: true, data: invoices });
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch managed invoices'));
@@ -402,7 +408,7 @@ export class InvoiceController {
   async getAdminInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const status = normalizeStatus(req.query.status as string | undefined);
-      const invoices = await invoiceService.getAllInvoices(status);
+      const invoices = await invoiceService.getAllInvoices(status, req.user);
 
       res.json({ success: true, data: invoices });
     } catch (error) {

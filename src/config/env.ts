@@ -7,6 +7,7 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform(Number).pipe(z.number().int().positive()).default('5005'),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+  REDIS_URL: z.string().url('REDIS_URL must be a valid URL').optional(),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
   /**
    * Reachable frontend base URL used by Puppeteer to render the shared React

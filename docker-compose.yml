@@ -33,6 +33,16 @@ services:
     networks:
       - itv-network
 
+  invoice-redis:
+    image: redis:7-alpine
+    container_name: invoice-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   minio:
     # Image source is pinned because MinIO's own registries no longer serve the
     # community server anonymously:
@@ -80,6 +90,8 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
+      invoice-redis:
+        condition: service_healthy
     env_file:
       - .env
     environment:
@@ -87,6 +99,7 @@ services:
       AUTO_MIGRATE: 'true'
       DATABASE_HOST: invoice-db
       DATABASE_PORT: '3306'
+      REDIS_URL: redis://invoice-redis:6379
       ORDER_SERVICE_URL: ${ORDER_SERVICE_URL}
       ORDER_SERVICE_API_KEY: ${ORDER_SERVICE_API_KEY}
       # Inside the compose network MinIO is reached by service name on its

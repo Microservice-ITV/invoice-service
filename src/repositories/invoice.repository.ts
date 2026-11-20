@@ -2,6 +2,7 @@ import prisma from '@/config/database';
 import { Prisma } from '@prisma/client';
 import { InvoiceFilters, InvoiceLineItem, InvoiceStatus } from '@/types/invoice';
 import { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
+import { invoiceCacheService } from '@/services/invoice-cache.service';
 
 type InvoiceTransactionRunner = <T>(
   operation: (tx: Prisma.TransactionClient) => Promise<T>,
@@ -158,8 +159,23 @@ export class InvoiceRepository {
   async findAllByOrderId(orderId: string) {
     return prisma.invoice.findMany({
       where: { orderId },
-      include: { items: true },
       orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async findDocumentsByIds(ids: string[]) {
+    if (ids.length === 0) return [];
+    const invoices = await prisma.invoice.findMany({
+      where: { id: { in: [...new Set(ids)] } },
+      include: { items: true },
+    });
+    return invoices.map((invoice) => {
+      const { items, lineItems, ...document } = invoice;
+      return {
+        ...document,
+        pdfUrl: document.pdfUrl ? `/invoices/${document.id}/pdf` : null,
+        lineItems: this.normalizeLineItems(lineItems, items),
+      };
     });
   }
 
@@ -195,6 +211,7 @@ export class InvoiceRepository {
       return null;
     }
 
+    await invoiceCacheService.invalidate();
     return this.findById(id);
   }
 
@@ -220,12 +237,16 @@ export class InvoiceRepository {
   }
 
   async findDocumentByInvoiceNumber(invoiceNumber: string) {
-    const invoice = await prisma.invoice.findFirst({
-      where: {
-        OR: [{ invoiceNumber }, { id: invoiceNumber }],
-      },
+    let invoice = await prisma.invoice.findUnique({
+      where: { invoiceNumber },
       include: { items: true },
     });
+    if (!invoice) {
+      invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceNumber },
+        include: { items: true },
+      });
+    }
     if (!invoice) return null;
 
     const { items, lineItems, ...document } = invoice;
@@ -273,7 +294,7 @@ export class InvoiceRepository {
     status?: InvoiceStatus;
   }) {
     try {
-      return await this.runTransaction(async (tx) => {
+      const invoice = await this.runTransaction(async (tx) => {
       const existing = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
@@ -419,6 +440,8 @@ export class InvoiceRepository {
       });
       return invoice;
       }, { timeout: 15_000 });
+      await invoiceCacheService.invalidate();
+      return invoice;
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {
         const existing = await this.findIdempotency(data.idempotencyKey);
@@ -453,7 +476,7 @@ export class InvoiceRepository {
     requestHash: string;
   }) {
     try {
-      return await this.runTransaction(async (tx) => {
+      const invoice = await this.runTransaction(async (tx) => {
       const existingIdempotency = await tx.invoiceIdempotency.findUnique({
         where: { idempotencyKey: data.idempotencyKey },
         include: { invoice: { include: { items: true } } },
@@ -628,6 +651,8 @@ export class InvoiceRepository {
 
       return invoice;
       });
+      await invoiceCacheService.invalidate();
+      return invoice;
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {
         const existing = await this.findIdempotency(data.idempotencyKey);
@@ -648,7 +673,7 @@ export class InvoiceRepository {
   }
 
   async updatePaymentSlip(id: string, paymentSlipUrl: string) {
-    return prisma.invoice.update({
+    const invoice = await prisma.invoice.update({
       where: { id },
       data: {
         paymentSlipUrl,
@@ -656,6 +681,8 @@ export class InvoiceRepository {
         rejectionReason: null,
       },
     });
+    await invoiceCacheService.invalidate();
+    return invoice;
   }
 
   async updateStatus(
@@ -672,10 +699,12 @@ export class InvoiceRepository {
       refundReason?: string | null;
     },
   ) {
-    return prisma.invoice.update({
+    const invoice = await prisma.invoice.update({
       where: { id },
       data,
     });
+    await invoiceCacheService.invalidate();
+    return invoice;
   }
 
   async transitionVerification(
@@ -709,6 +738,7 @@ export class InvoiceRepository {
       return null;
     }
 
+    await invoiceCacheService.invalidate();
     return this.findById(id);
   }
 
@@ -741,11 +771,12 @@ export class InvoiceRepository {
       },
     });
 
+    if (result.count === 1) await invoiceCacheService.invalidate();
     return result.count === 1;
   }
 
   async markPdfReady(id: string, pdfUrl: string) {
-    return prisma.invoice.update({
+    const invoice = await prisma.invoice.update({
       where: { id },
       data: {
         pdfUrl,
@@ -754,10 +785,12 @@ export class InvoiceRepository {
         pdfUpdatedAt: new Date(),
       },
     });
+    await invoiceCacheService.invalidate();
+    return invoice;
   }
 
   async markPdfFailed(id: string, error: string) {
-    return prisma.invoice.update({
+    const invoice = await prisma.invoice.update({
       where: { id },
       data: {
         pdfStatus: 'FAILED',
@@ -765,6 +798,8 @@ export class InvoiceRepository {
         pdfUpdatedAt: new Date(),
       },
     });
+    await invoiceCacheService.invalidate();
+    return invoice;
   }
 
   async listInvoices(
