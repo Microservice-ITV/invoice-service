@@ -21,6 +21,7 @@ import { getFinalInvoicePaymentStatus } from '@/services/invoice-event-policy';
 import receiptService from '@/services/receipt.service';
 import logger from '@/utils/logger';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
+import { invoiceCacheService } from '@/services/invoice-cache.service';
 
 export class AppError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -123,6 +124,37 @@ export type MissingInvoiceReplaySummary = {
 const MISSING_INVOICE_PAGE_SIZE = 50;
 const MAX_MISSING_INVOICE_REPLAYS_PER_REQUEST = 50;
 const MAX_CANDIDATES_PER_REPLAY_REQUEST = 500;
+const INVOICE_LIST_CACHE_TTL_SECONDS = 30;
+const INVOICE_DETAIL_CACHE_TTL_SECONDS = 60;
+
+const invoiceCacheScope = (actor: InvoiceAccessActor): string | null => {
+  if (!actor.id && !actor.customerId) return null;
+  const shopIds = [...new Set(actor.shopIds ?? [])].sort();
+  return crypto.createHash('sha256').update(JSON.stringify([
+    actor.id ?? '',
+    actor.customerId ?? '',
+    actor.role ?? '',
+    actor.shopId ?? '',
+    shopIds,
+  ])).digest('hex');
+};
+
+const invoiceListCacheKey = (
+  actor: InvoiceAccessActor,
+  filters: { customerId?: string; shopId?: string; shopIds?: string[]; status?: InvoiceStatus },
+): string | null => {
+  const scope = invoiceCacheScope(actor);
+  if (!scope) return null;
+  const shopIds = filters.shopIds ? [...new Set(filters.shopIds)].sort() : [];
+  return `list:${scope}:${JSON.stringify({
+    customerId: filters.customerId ?? null,
+    shopId: filters.shopId ?? null,
+    shopIds,
+    status: filters.status ?? null,
+    page: 0,
+    limit: 50,
+  })}`;
+};
 
 type SnapshotInvoiceCreation = {
   paymentStatus: 'PAID' | 'UNPAID';
@@ -1300,7 +1332,13 @@ export class InvoiceService {
   }
 
   async getInvoicesByCustomer(customerId: string) {
-    return invoiceRepository.listInvoices({ customerId });
+    const scope = invoiceCacheScope({ customerId, role: 'customer' });
+    const key = `list:${scope}:${JSON.stringify({ customerId, page: 0, limit: 50 })}`;
+    return invoiceCacheService.getOrLoad(
+      key,
+      INVOICE_LIST_CACHE_TTL_SECONDS,
+      () => invoiceRepository.listInvoices({ customerId }),
+    );
   }
 
   async getGuestInvoicesByOrder(orderId: string, phone: string) {
@@ -1330,40 +1368,86 @@ export class InvoiceService {
       normalizePhoneNumber(invoice.customerPhone) === normalizedPhone,
     );
 
-    return Promise.all(matchingInvoices.map((invoice) => this.getInvoiceById(invoice.id)))
-      .then((documents) => documents.filter((invoice) => invoice !== null));
+    const documents = await invoiceRepository.findDocumentsByIds(
+      matchingInvoices.map((invoice) => invoice.id),
+    );
+    return Promise.all(documents.map((invoice) => this.populateInvoiceSnapshotData(invoice)));
   }
 
-  async getInvoicesByShop(shopId: string, status?: InvoiceStatus) {
-    return invoiceRepository.listInvoices({ shopId, status });
+  async getInvoicesByShop(shopId: string, status?: InvoiceStatus, actor?: InvoiceAccessActor) {
+    if (!actor) return invoiceRepository.listInvoices({ shopId, status });
+    const key = invoiceListCacheKey(actor, { shopId, status });
+    if (!key) return invoiceRepository.listInvoices({ shopId, status });
+    return invoiceCacheService.getOrLoad(
+      key,
+      INVOICE_LIST_CACHE_TTL_SECONDS,
+      () => invoiceRepository.listInvoices({ shopId, status }),
+    );
   }
 
-  async getInvoicesByShops(shopIds: string[]) {
-    return invoiceRepository.listInvoices({ shopIds });
+  async getInvoicesByShops(shopIds: string[], status?: InvoiceStatus, actor?: InvoiceAccessActor) {
+    if (!actor) return invoiceRepository.listInvoices({ shopIds, status });
+    const key = invoiceListCacheKey(actor, { shopIds, status });
+    if (!key) return invoiceRepository.listInvoices({ shopIds, status });
+    return invoiceCacheService.getOrLoad(
+      key,
+      INVOICE_LIST_CACHE_TTL_SECONDS,
+      () => invoiceRepository.listInvoices({ shopIds, status }),
+    );
   }
 
-  async getAllInvoices(status?: InvoiceStatus) {
-    const invoices = await invoiceRepository.listInvoices({ status });
-    return populateMissingInvoiceShopNames(invoices);
+  async getAllInvoices(status?: InvoiceStatus, actor?: InvoiceAccessActor) {
+    const load = async () => {
+      const invoices = await invoiceRepository.listInvoices({ status });
+      return populateMissingInvoiceShopNames(invoices);
+    };
+    if (!actor) return load();
+    const key = invoiceListCacheKey(actor, { status });
+    if (!key) return load();
+    return invoiceCacheService.getOrLoad(key, INVOICE_LIST_CACHE_TTL_SECONDS, load);
   }
 
-  async getInvoiceById(id: string) {
-    const invoice = await invoiceRepository.findDocumentById(id);
-    return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
+  async getInvoiceById(id: string, actor?: InvoiceAccessActor) {
+    const load = async () => {
+      const invoice = await invoiceRepository.findDocumentById(id);
+      return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
+    };
+    if (!actor) return load();
+    const scope = invoiceCacheScope(actor);
+    if (!scope) return load();
+    return invoiceCacheService.getOrLoad(
+      `detail:${scope}:${id}`,
+      INVOICE_DETAIL_CACHE_TTL_SECONDS,
+      load,
+    );
   }
 
   async getCustomerInvoiceByNumber(invoiceNumber: string, customerId: string) {
-    const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
-    if (!invoice || invoice.customerId !== customerId) {
-      return null;
-    }
-
-    return this.populateInvoiceSnapshotData(invoice);
+    const scope = invoiceCacheScope({ customerId, role: 'customer' });
+    return invoiceCacheService.getOrLoad(
+      `detail:${scope}:${customerId}:${invoiceNumber}`,
+      INVOICE_DETAIL_CACHE_TTL_SECONDS,
+      async () => {
+        const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
+        if (!invoice || invoice.customerId !== customerId) return null;
+        return this.populateInvoiceSnapshotData(invoice);
+      },
+    );
   }
 
-  async getInvoiceByNumber(invoiceNumber: string) {
-    const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
-    return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
+  async getInvoiceByNumber(invoiceNumber: string, actor?: InvoiceAccessActor) {
+    const load = async () => {
+      const invoice = await invoiceRepository.findDocumentByInvoiceNumber(invoiceNumber);
+      return invoice ? this.populateInvoiceSnapshotData(invoice) : null;
+    };
+    if (!actor) return load();
+    const scope = invoiceCacheScope(actor);
+    if (!scope) return load();
+    return invoiceCacheService.getOrLoad(
+      `detail:${scope}:${invoiceNumber}`,
+      INVOICE_DETAIL_CACHE_TTL_SECONDS,
+      load,
+    );
   }
 
   private async populateInvoiceSnapshotData<T extends {

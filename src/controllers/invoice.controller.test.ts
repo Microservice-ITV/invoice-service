@@ -41,8 +41,10 @@ test('shop invoice listing queries every shop resolved by authorization middlewa
   const originalListByShops = invoiceService.getInvoicesByShops;
   const originalListByShop = invoiceService.getInvoicesByShop;
   let requestedShopIds: string[] = [];
-  invoiceService.getInvoicesByShops = async (shopIds) => {
+  let requestedStatus: unknown;
+  invoiceService.getInvoicesByShops = async (shopIds, status) => {
     requestedShopIds = shopIds;
+    requestedStatus = status;
     return [];
   };
   invoiceService.getInvoicesByShop = async () => {
@@ -50,7 +52,10 @@ test('shop invoice listing queries every shop resolved by authorization middlewa
   };
 
   let responseData: unknown;
-  const req = { user: { role: 'shopAdmin', shopId: 'shop-a', shopIds: ['shop-a', 'shop-b'] } } as Request;
+  const req = {
+    user: { role: 'shopAdmin', shopId: 'shop-a', shopIds: ['shop-a', 'shop-b'] },
+    query: { status: 'paid' },
+  } as unknown as Request;
   const res = {
     json(payload: unknown) { responseData = payload; return this; },
   } as Response;
@@ -63,5 +68,6 @@ test('shop invoice listing queries every shop resolved by authorization middlewa
   }
 
   assert.deepEqual(requestedShopIds, ['shop-a', 'shop-b']);
+  assert.equal(requestedStatus, 'PAID');
   assert.deepEqual(responseData, { success: true, data: [] });
 });

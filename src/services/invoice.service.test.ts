@@ -1054,7 +1054,7 @@ test('repeated paid events use one stable idempotency key and return one invoice
 
 test('guest invoice lookup requires the order phone and returns only matching invoices', async () => {
   const originalFindAllByOrderId = invoiceRepository.findAllByOrderId;
-  const originalFindDocumentById = invoiceRepository.findDocumentById;
+  const originalFindDocumentsByIds = invoiceRepository.findDocumentsByIds;
   const invoice = {
     id: 'guest-invoice',
     invoiceNumber: 'INV-GUEST',
@@ -1067,9 +1067,11 @@ test('guest invoice lookup requires the order phone and returns only matching in
     invoice,
     { ...invoice, id: 'other-invoice', invoiceNumber: 'INV-OTHER', customerPhone: '+959987654321' },
   ] as unknown as Awaited<ReturnType<typeof originalFindAllByOrderId>>;
-  invoiceRepository.findDocumentById = async (id) => (
-    id === invoice.id ? invoice : null
-  ) as Awaited<ReturnType<typeof originalFindDocumentById>>;
+  invoiceRepository.findDocumentsByIds = async (ids) => (
+    ids.includes(invoice.id)
+      ? [invoice as unknown as (Awaited<ReturnType<typeof originalFindDocumentsByIds>>)[number]]
+      : []
+  ) as Awaited<ReturnType<typeof originalFindDocumentsByIds>>;
 
   try {
     const results = await new InvoiceService().getGuestInvoicesByOrder(
@@ -1083,13 +1085,13 @@ test('guest invoice lookup requires the order phone and returns only matching in
     );
   } finally {
     invoiceRepository.findAllByOrderId = originalFindAllByOrderId;
-    invoiceRepository.findDocumentById = originalFindDocumentById;
+    invoiceRepository.findDocumentsByIds = originalFindDocumentsByIds;
   }
 });
 
 test('guest invoice lookup resolves a checkout ID to its order ID', async () => {
   const originalFindAllByOrderId = invoiceRepository.findAllByOrderId;
-  const originalFindDocumentById = invoiceRepository.findDocumentById;
+  const originalFindDocumentsByIds = invoiceRepository.findDocumentsByIds;
   const originalGetInvoiceSnapshotByCheckoutId = orderSnapshotService.getInvoiceSnapshotByCheckoutId;
   const invoice = {
     id: 'guest-invoice',
@@ -1104,8 +1106,8 @@ test('guest invoice lookup resolves a checkout ID to its order ID', async () => 
     queriedOrderIds.push(orderId);
     return [invoice] as unknown as Awaited<ReturnType<typeof originalFindAllByOrderId>>;
   };
-  invoiceRepository.findDocumentById = async () => (
-    invoice as unknown as Awaited<ReturnType<typeof originalFindDocumentById>>
+  invoiceRepository.findDocumentsByIds = async () => (
+    [invoice] as unknown as Awaited<ReturnType<typeof originalFindDocumentsByIds>>
   );
   orderSnapshotService.getInvoiceSnapshotByCheckoutId = async (checkoutId) => ({
     ...makeOrderSnapshot('MMK'),
@@ -1123,7 +1125,7 @@ test('guest invoice lookup resolves a checkout ID to its order ID', async () => 
     assert.deepEqual(queriedOrderIds, ['actual-order-id']);
   } finally {
     invoiceRepository.findAllByOrderId = originalFindAllByOrderId;
-    invoiceRepository.findDocumentById = originalFindDocumentById;
+    invoiceRepository.findDocumentsByIds = originalFindDocumentsByIds;
     orderSnapshotService.getInvoiceSnapshotByCheckoutId = originalGetInvoiceSnapshotByCheckoutId;
   }
 });

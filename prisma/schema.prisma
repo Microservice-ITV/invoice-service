@@ -84,12 +84,13 @@ model Invoice {
   receipt            Receipt?
   thermalPdfJobs     ThermalPdfJob[]
 
-  @@index([orderId])
   @@index([orderId, shopId])
-  @@index([customerId])
-  @@index([shopId, status])
-  @@index([status])
-  @@index([shopId], map: "invoices_shopId_idx")
+  @@index([orderId, createdAt])
+  @@index([customerId, createdAt])
+  @@index([shopId, createdAt])
+  @@index([shopId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
 
   @@map("invoices")
 }

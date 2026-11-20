@@ -18,7 +18,11 @@ export class ReceiptController {
         res.status(403).json({ success: false, message: 'Print token is not scoped to a receipt' });
         return;
       }
-      const invoice = await invoiceService.getInvoiceById(claims.invoiceId);
+      const invoice = await invoiceService.getInvoiceById(claims.invoiceId, {
+        id: claims.sub,
+        customerId: claims.sub,
+        role: 'customer',
+      });
       if (!invoice || invoice.invoiceNumber !== invoiceNumber || invoice.status !== 'PAID' || invoice.customerId !== claims.sub) {
         res.status(404).json({ success: false, message: 'Receipt not found' });
         return;

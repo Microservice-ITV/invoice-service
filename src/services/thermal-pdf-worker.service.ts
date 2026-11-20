@@ -8,6 +8,7 @@ import orderSnapshotService from '@/services/order-snapshot.service';
 import productVariantLookupService from '@/services/product-variant-lookup.service';
 import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
+import { invoiceCacheService } from '@/services/invoice-cache.service';
 
 const WIDTHS = ['58mm', '80mm'] as const;
 const INVOICE_WIDTHS = ['A4', ...WIDTHS] as const;
@@ -70,10 +71,11 @@ export class ThermalPdfWorker {
   }
 
   async requeueInvoice(invoiceId: string): Promise<void> {
-    await prisma.invoice.updateMany({
+    const updated = await prisma.invoice.updateMany({
       where: { id: invoiceId },
       data: { pdfStatus: 'PENDING', pdfUpdatedAt: new Date() },
     });
+    if (updated.count > 0) await invoiceCacheService.invalidate();
 
     await prisma.thermalPdfJob.updateMany({
       where: { invoiceId },
@@ -138,10 +140,11 @@ export class ThermalPdfWorker {
         },
       });
       if (job.width === 'A4' && job.invoiceId) {
-        await prisma.invoice.updateMany({
+        const updated = await prisma.invoice.updateMany({
           where: { id: job.invoiceId, pdfStatus: 'READY' },
           data: { pdfStatus: 'PENDING', pdfUpdatedAt: new Date() },
         });
+        if (updated.count > 0) await invoiceCacheService.invalidate();
       }
 
       return prisma.thermalPdfJob.findUnique({ where: { id: job.id } });
@@ -313,17 +316,20 @@ export class ThermalPdfWorker {
               data: { pdfStatus: 'GENERATING', pdfError: null, pdfAttemptCount: { increment: 1 }, pdfUpdatedAt: new Date() },
             });
             if (claimed.count !== 1) throw new Error('A4 invoice PDF generation is already in progress');
+            await invoiceCacheService.invalidate();
             try {
               destination = await pdfGeneratorService.buildAndUploadInvoicePdf(payload);
               await prisma.invoice.update({
                 where: { id: job.invoice.id },
                 data: { pdfUrl: destination, pdfStatus: 'READY', pdfError: null, pdfUpdatedAt: new Date() },
               });
+              await invoiceCacheService.invalidate();
             } catch (error) {
               await prisma.invoice.update({
                 where: { id: job.invoice.id },
                 data: { pdfStatus: 'FAILED', pdfError: error instanceof Error ? error.message.slice(0, 4000) : 'PDF generation failed', pdfUpdatedAt: new Date() },
               });
+              await invoiceCacheService.invalidate();
               throw error;
             }
           }

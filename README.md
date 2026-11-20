@@ -97,6 +97,8 @@ Cross-service facts verified in the neighbouring repositories:
 * PDF lifecycle state (`pdfStatus`, `pdfError`, `pdfAttemptCount`, `pdfUpdatedAt`) and the generated
   invoice PDF / payment-slip objects in the MinIO `invoices` bucket.
 * The RabbitMQ queues `invoice.payment.completed` and `invoice.order.paid`.
+* Optional Redis-backed read-through caches for invoice lists and details; database reads remain the
+  fallback when Redis is unavailable.
 
 ### What this service does NOT own
 
@@ -112,8 +114,8 @@ Cross-service facts verified in the neighbouring repositories:
 
 ### Main technologies used
 
-Express 4 (HTTP), TypeScript 5, Prisma 7 with the MariaDB driver adapter, MySQL 8, RabbitMQ
-(`amqplib`), MinIO (`minio` client, S3-compatible), Puppeteer (HTML → PDF), `archiver` (ZIP batch
+Express 4 (HTTP), TypeScript 5, Prisma 7 with the MariaDB driver adapter, MySQL 8, Redis (`redis`),
+RabbitMQ (`amqplib`), MinIO (`minio` client, S3-compatible), Puppeteer (HTML → PDF), `archiver` (ZIP batch
 download), `jsonwebtoken` (HS256 verification), `zod` (environment validation), `winston` + `morgan`
 (logging).
 
@@ -131,6 +133,7 @@ Everything below is declared in `package.json`, used by `src/`, or defined in `d
 | Prisma Client | ^7.0.0 | ORM / data access (`prisma/schema.prisma`, `src/config/database.ts`) |
 | `@prisma/adapter-mariadb` | ^7.10.0 | Driver adapter used to connect Prisma to MySQL |
 | `mariadb` | ^3.5.4 | Underlying MySQL/MariaDB driver for the adapter |
+| `redis` | ^5.12.4 | Optional read-through cache for invoice lists and details |
 | MySQL | `mysql:8.0` (Docker) | Database (`invoice_service` schema) |
 | RabbitMQ | `rabbitmq:3.13-management` (Docker) | Event consumption (`amqplib` ^0.10.4) |
 | MinIO | `bitnamilegacy/minio:2025.7.23-debian-12-r5` (Docker) | S3-compatible storage for PDFs and payment slips (`minio` ^8.0.1 client). MinIO's own registries no longer serve the community server anonymously — see §11 |
@@ -518,8 +521,19 @@ Error envelope (all handlers and the error middleware):
 * `GET /invoices/manage?status=<status>` and `GET /invoices/admin/all?status=<status>`: the value is
   uppercased and must be one of `UNPAID, PENDING_VERIFICATION, PAID, REJECTED, VOID, REFUNDED`;
   anything else throws a plain `Error` → **500** (not 400) via the error middleware.
-* `GET /invoices/shop-invoices` ignores any `?status=` query parameter even though the frontend client
-  sends one (`frontend-react/src/lib/api/invoiceClient.ts` passes `params: { status }`).
+* `GET /invoices/shop-invoices?status=<status>` uses the same status filter.
+
+### Invoice response cache
+
+When `REDIS_URL` is configured, list responses use a 30-second TTL and detail responses a 60-second
+TTL. Keys include the authenticated user/role and applicable customer/shop scope, normalized shop
+sets, status filters and the current list window. A Redis generation counter makes all prior invoice
+entries unreachable after a database write; invoice creation, payment/status changes, slip updates,
+PDF lifecycle writes and thermal-worker updates advance it. Redis connection/read/write failures are
+logged and fall back to the database, and cache entries have bounded TTLs as a consistency backstop.
+Requests with the same cache key also share an in-flight database load within one service process.
+The browser filters and paginates the returned list locally, so it does not issue separate API requests
+for each visible page.
 
 ---
 
@@ -796,6 +810,8 @@ All variables are validated by `zod` in `src/config/env.ts` at import time; inva
 | `NODE_ENV` | no | `development` \| `production` \| `test`, default `development` | yes | server, Prisma query logging, morgan format |
 | `PORT` | no | positive integer, default `5005` | yes | `server.ts` |
 | `DATABASE_URL` | **yes** | non-empty string (also read directly by `config/database.ts` and `prisma.config.ts`) | yes | Prisma / MariaDB adapter |
+| `REDIS_URL` | no | valid URL; unset disables Redis caching | yes | invoice read cache; database fallback is used on Redis errors |
+| `REDIS_URL` | no | valid URL; unset disables Redis caching | yes | invoice read cache; database fallback is used on Redis errors |
 | `CORS_ORIGIN` | no | string, default `http://localhost:5173` | yes | `app.ts` |
 | `LOG_LEVEL` | no | `error` \| `warn` \| `info` \| `debug`, default `info` | yes | winston |
 | `SERVICE_API_KEY` | **yes** | string, min 8 chars | yes | `serviceAuth` |
@@ -822,6 +838,7 @@ Variables read outside the zod schema:
 | --- | --- | --- |
 | `DATABASE_HOST`, `DATABASE_PORT` | `docker-entrypoint.sh` | Host/port polled until MySQL accepts TCP connections (fallback: parsed from `DATABASE_URL`) |
 | `AUTO_MIGRATE` | `docker-entrypoint.sh` | When `true` (set by compose) `prisma migrate deploy` runs before the app starts |
+| `REDIS_URL` | `docker-compose.yml` | Points the local invoice service at its private Redis container; production deployments can provide an external Redis URL |
 | `SEED_EVENT_ID`, `SEED_PAYMENT_ID`, `SEED_ORDER_ID`, `SEED_TRANSACTION_ID`, `SEED_CHECKOUT_ID`, `SEED_AMOUNT`, `SEED_CURRENCY`, `SEED_SHOP_NAME`, `SEED_CUSTOMER_NAME`, `SEED_CUSTOMER_EMAIL`, `SEED_CORRELATION_ID` | `src/scripts/seed-payment-completed.ts` | Overrides for the seed event |
 | `SHADOW_DATABASE_URL` | `prisma.config.ts` | Optional shadow database URL for the Prisma CLI |
 | `PUPPETEER_SKIP_DOWNLOAD`, `PUPPETEER_CACHE_DIR` | `docker/node/Dockerfile` | Chrome download/cache behaviour |
@@ -1462,7 +1479,7 @@ npx tsx src/scripts/seed-payment-completed.ts
 | Item | Detail |
 | --- | --- |
 | Docker image | `docker/node/Dockerfile` — `node:22-bookworm-slim`, Chromium runtime libraries, `npm ci --ignore-scripts`, Chrome installed via `npx puppeteer browsers install chrome`, `npx prisma generate`, global `nodemon`/`ts-node`, entrypoint `docker-entrypoint.sh`, `EXPOSE 5005`, `CMD ["npm","run","dev"]` |
-| Compose stack | `docker-compose.yml` — `invoice-db` (mysql:8.0, host port 3310, volume `invoice_mysql_data`), `rabbitmq` (3.13-management, host ports 5673/15675, healthcheck, volume), `minio` (`bitnamilegacy/minio:2025.7.23-debian-12-r5`, host ports 9010/9011, volume `minio_data:/bitnami/minio/data`), `invoice-service` (built from this repo, `env_file: .env`, `AUTO_MIGRATE=true`, `DATABASE_HOST=invoice-db`, `DATABASE_PORT=3306`, `MINIO_ENDPOINT=minio`, `MINIO_PORT=9000`, `extra_hosts: host.docker.internal:host-gateway`, host port 5005, network `itv-network`) |
+| Compose stack | `docker-compose.yml` — `invoice-db` (mysql:8.0, host port 3310, volume `invoice_mysql_data`), `invoice-redis` (Redis 7, private container network), `rabbitmq` (3.13-management, host ports 5673/15675, healthcheck, volume), `minio` (`bitnamilegacy/minio:2025.7.23-debian-12-r5`, host ports 9010/9011, volume `minio_data:/bitnami/minio/data`), `invoice-service` (built from this repo, `env_file: .env`, `AUTO_MIGRATE=true`, `DATABASE_HOST=invoice-db`, `DATABASE_PORT=3306`, `REDIS_URL=redis://invoice-redis:6379`, `MINIO_ENDPOINT=minio`, `MINIO_PORT=9000`, `extra_hosts: host.docker.internal:host-gateway`, host port 5005, network `itv-network`) |
 | Build process | `npm ci` → `npm run build` (`tsc` + `tsc-alias` → `dist/`) → `npm start` / `npm run start:prod`. The Dockerfile's default command is the **dev** server, so a production image/run must override `CMD` (for example `docker run … npm start`); no production Dockerfile exists here |
 | Database migrations | `prisma/migrations/*`; applied by the entrypoint when `NODE_ENV=production` or `AUTO_MIGRATE=true` (`npx prisma migrate deploy`) |
 | Startup readiness | The entrypoint polls MySQL over TCP (`DATABASE_HOST`/`DATABASE_PORT`, otherwise parsed from `DATABASE_URL`) before starting the app |

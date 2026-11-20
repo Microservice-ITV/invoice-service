@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Prisma } from '@prisma/client';
+import prisma from '@/config/database';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'mysql://invoice:invoice@localhost:3306/invoice_test';
@@ -270,4 +271,71 @@ test('invoice and order-reference sequences restart independently when the UTC d
     assert.equal(afterMidnight.invoiceNumber, 'INV-20261113-000001');
     assert.equal(afterMidnight.orderReference, 'ORD-20261113-000001');
   }, () => now);
+});
+
+test('invoice lookup uses unique invoice-number and id keys instead of an OR scan', async () => {
+  const originalFindUnique = prisma.invoice.findUnique;
+  const lookups: Array<{ invoiceNumber?: string; id?: string }> = [];
+  prisma.invoice.findUnique = (async (args: { where: { invoiceNumber?: string; id?: string } }) => {
+    lookups.push(args.where);
+    if (args.where.invoiceNumber === 'INV-LOOKUP') {
+      return {
+        id: 'invoice-lookup',
+        invoiceNumber: 'INV-LOOKUP',
+        items: [],
+        lineItems: null,
+        pdfUrl: null,
+      };
+    }
+    if (args.where.id === 'invoice-id') {
+      return {
+        id: 'invoice-id',
+        invoiceNumber: 'INV-BY-ID',
+        items: [],
+        lineItems: null,
+        pdfUrl: null,
+      };
+    }
+    return null;
+  }) as unknown as typeof prisma.invoice.findUnique;
+
+  try {
+    const repository = new InvoiceRepository();
+    assert.equal((await repository.findDocumentByInvoiceNumber('INV-LOOKUP'))?.id, 'invoice-lookup');
+    assert.equal((await repository.findDocumentByInvoiceNumber('invoice-id'))?.id, 'invoice-id');
+    assert.deepEqual(lookups, [
+      { invoiceNumber: 'INV-LOOKUP' },
+      { invoiceNumber: 'invoice-id' },
+      { id: 'invoice-id' },
+    ]);
+  } finally {
+    prisma.invoice.findUnique = originalFindUnique;
+  }
+});
+
+test('bulk invoice document lookup and order lookup avoid item joins where unnecessary', async () => {
+  const originalFindMany = prisma.invoice.findMany;
+  let orderQuery: unknown;
+  let bulkQuery: unknown;
+  prisma.invoice.findMany = (async (args: Record<string, unknown>) => {
+    if (args.where && typeof args.where === 'object' && 'orderId' in args.where) {
+      orderQuery = args;
+      return [];
+    }
+    bulkQuery = args;
+    return [];
+  }) as unknown as typeof prisma.invoice.findMany;
+
+  try {
+    const repository = new InvoiceRepository();
+    await repository.findAllByOrderId('order-1');
+    await repository.findDocumentsByIds(['invoice-1', 'invoice-2']);
+    assert.equal(Boolean((orderQuery as { include?: unknown }).include), false);
+    assert.equal(
+      ((bulkQuery as { where: { id: { in: string[] } } }).where.id.in.join(',')),
+      'invoice-1,invoice-2',
+    );
+  } finally {
+    prisma.invoice.findMany = originalFindMany;
+  }
 });
