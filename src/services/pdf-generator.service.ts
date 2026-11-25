@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import storageService from "@/services/storage.service";
+import { PdfArtifactKind } from '@prisma/client';
+import pdfRetentionService from '@/services/pdf-retention.service';
 import logger from "@/utils/logger";
 import env from "@/config/env";
 import invoicePrintTokenService from "@/services/invoice-print-token.service";
@@ -19,6 +20,13 @@ const INTER_FONT_FILES = [
   { filename: "Inter-SemiBold.woff2", weight: 600 },
   { filename: "Inter-Bold.woff2", weight: 700 },
 ] as const;
+
+const getSafeErrorName = (error: unknown): string => {
+  if (typeof error !== 'object' || error === null || !('name' in error) || typeof error.name !== 'string') {
+    return 'UnknownError';
+  }
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(error.name) ? error.name : 'UnknownError';
+};
 
 export interface InvoicePdfPayload {
   invoiceId: string;
@@ -73,9 +81,15 @@ export class PdfGeneratorService {
     const pdfBuffer = await this.renderInvoicePdf(payload);
     const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const destination = `${payload.shopId}/${REACT_PRINT_PDF_MARKER}/${payload.invoiceNumber}-${uniqueSuffix}.pdf`;
-    const pdfUrl = await storageService.uploadPdf(destination, pdfBuffer);
+    const pdfUrl = await pdfRetentionService.uploadTrackedPdf({
+      kind: PdfArtifactKind.INVOICE_A4,
+      sourceId: payload.invoiceId,
+      width: 'A4',
+      fileName: destination,
+      buffer: pdfBuffer,
+    });
 
-    logger.info(`Invoice PDF uploaded for ${payload.invoiceNumber}`);
+    logger.info('Invoice PDF uploaded');
     return pdfUrl;
   }
 
@@ -85,32 +99,25 @@ export class PdfGeneratorService {
       const page = await context.newPage();
 
       page.on("console", (msg) => {
-        logger.error(
-          `[invoice-pdf:browser-console] ${msg.type()}: ${msg.text()}`,
-        );
+        logger.error('[invoice-pdf:browser-console]', { type: msg.type() });
       });
 
       page.on("pageerror", (error) => {
-        logger.error(
-          `[invoice-pdf:page-error] ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
+        logger.error('[invoice-pdf:page-error]', { errorName: getSafeErrorName(error) });
       });
 
       page.on("requestfailed", (request) => {
-        logger.error(
-          `[invoice-pdf:request-failed] ${request.method()} ${request.url()} :: ${
-            request.failure()?.errorText ?? "unknown"
-          }`,
-        );
+        const errorText = request.failure()?.errorText ?? '';
+        const failureCode = /^net::ERR_[A-Z_]+$/.test(errorText) ? errorText : 'unknown';
+        logger.error('[invoice-pdf:request-failed]', {
+          method: request.method(),
+          failureCode,
+        });
       });
 
       page.on("response", (response) => {
         if (response.url().includes("/invoices/print/")) {
-          logger.info(
-            `[invoice-pdf:print-response] ${response.status()} ${response.url()}`,
-          );
+          logger.info('[invoice-pdf:print-response]', { status: response.status() });
         }
       });
 
@@ -122,13 +129,13 @@ export class PdfGeneratorService {
         deviceScaleFactor: 1,
       });
       const response = await page.goto(printUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 45000,
-      });
+          waitUntil: "domcontentloaded",
+          timeout: 45000,
+        }).catch((error: unknown) => {
+          throw new Error(`Invoice print navigation failed (${getSafeErrorName(error)})`);
+        });
       if (!response || !response.ok()) {
-        throw new Error(
-          `Invoice print page returned HTTP ${response?.status() ?? "no response"} at ${printUrl}`,
-        );
+        throw new Error(`Invoice print page returned HTTP ${response?.status() ?? "no response"}`);
       }
       await page.waitForFunction("window.__INVOICE_READY__ === true", {
         timeout: 30000,
@@ -138,9 +145,7 @@ export class PdfGeneratorService {
         'window.__INVOICE_ERROR__ || ""',
       )) as string;
       if (renderError) {
-        throw new Error(
-          `Invoice print route failed to load the invoice: ${renderError}`,
-        );
+        throw new Error('Invoice print route failed to load the invoice');
       }
 
       await page.addStyleTag({

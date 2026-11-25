@@ -8,6 +8,13 @@ import { canAccessInvoice, InvoiceAccessActor } from '@/services/invoice-access-
 import logger from '@/utils/logger';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 
+const getSafePdfErrorCode = (error: unknown): string | undefined => {
+  if (typeof error !== 'object' || error === null || !('code' in error) || typeof error.code !== 'string') {
+    return undefined;
+  }
+  return /^[A-Za-z0-9_-]{1,64}$/.test(error.code) ? error.code : undefined;
+};
+
 /** Marker directory embedded in every receipt PDF object key. */
 export const RECEIPT_PDF_PATH_MARKER = `/${RECEIPT_PDF_MARKER}/`;
 
@@ -132,6 +139,12 @@ export class ReceiptService {
         error: null, retryAt: new Date(),
       };
     }
+    if (job.status === 'CLEANING' && await thermalPdfWorker.requeueExpiredCleanupJob(job.id)) {
+      return {
+        receipt, processing: true, status: 'PENDING', attempts: job.attempts,
+        error: null, retryAt: new Date(),
+      };
+    }
     if (!job || job.status !== 'READY' || !job.artifactRef) {
       return {
         receipt, processing: true, status: job?.status ?? 'PENDING',
@@ -144,8 +157,8 @@ export class ReceiptService {
       return { receipt, processing: false, buffer: await storageService.downloadPdf(job.artifactRef) };
     } catch (error) {
       logger.warn('Prepared thermal receipt artifact could not be downloaded', {
-        receiptId: receipt.id, width: selectedWidth,
-        error: error instanceof Error ? error.message : String(error),
+        width: selectedWidth,
+        errorCode: getSafePdfErrorCode(error),
       });
       await prisma.thermalPdfJob.updateMany({
         where: { id: job.id, status: 'READY' },
@@ -168,7 +181,7 @@ export class ReceiptService {
     receipt: Receipt,
     options: { force?: boolean; throwOnFailure?: boolean } = {},
   ): Promise<boolean> {
-    if (!options.force && hasCurrentReceiptPdf(receipt.pdfUrl)) {
+    if (!options.force && receipt.pdfStatus !== 'CLEANING' && hasCurrentReceiptPdf(receipt.pdfUrl)) {
       return true;
     }
 
@@ -185,11 +198,12 @@ export class ReceiptService {
       await receiptRepository.markPdfReady(receipt.id, pdfUrl);
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Receipt PDF generation failed';
+      const errorCode = getSafePdfErrorCode(error);
+      const message = errorCode ? `Receipt PDF generation failed (${errorCode})` : 'Receipt PDF generation failed';
       await receiptRepository.markPdfFailed(receipt.id, message);
-      logger.error(`Failed to generate receipt PDF for ${receipt.receiptNumber}`, error as Error);
+      logger.error('Failed to generate receipt PDF', { errorCode });
       if (options.throwOnFailure) {
-        throw error instanceof Error ? error : new Error(message);
+        throw new Error(message);
       }
       return false;
     }

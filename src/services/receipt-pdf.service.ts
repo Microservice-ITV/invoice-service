@@ -1,4 +1,5 @@
-import storageService from '@/services/storage.service';
+import { PdfArtifactKind } from '@prisma/client';
+import pdfRetentionService from '@/services/pdf-retention.service';
 import logger from '@/utils/logger';
 import thermalReactPdfRenderer from '@/services/thermal-react-pdf-renderer.service';
 import { buildThermalReceiptHtml, type ThermalInvoiceData } from '@/services/thermal-document-template';
@@ -49,9 +50,15 @@ export class ReceiptPdfService {
     const pdfBuffer = await this.renderReceiptPdf(payload);
     const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const destination = `receipts/${payload.shopId}/${RECEIPT_PDF_MARKER}/${payload.receiptNumber}-${uniqueSuffix}.pdf`;
-    const pdfUrl = await storageService.uploadPdf(destination, pdfBuffer);
+    const pdfUrl = await pdfRetentionService.uploadTrackedPdf({
+      kind: PdfArtifactKind.RECEIPT_PDF,
+      sourceId: payload.receiptId,
+      width: '80mm',
+      fileName: destination,
+      buffer: pdfBuffer,
+    });
 
-    logger.info(`Receipt PDF uploaded for ${payload.receiptNumber}`);
+    logger.info('Receipt PDF uploaded');
     return pdfUrl;
   }
 

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Prisma } from '@prisma/client';
+import prisma from '@/config/database';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'mysql://invoice:invoice@localhost:3306/invoice_test';
@@ -74,6 +75,71 @@ test('notification PDF retrieval returns the exact stored invoice PDF and reject
   } finally {
     invoiceRepository.findById = originalFindById;
     storageService.downloadPdf = originalDownloadPdf;
+  }
+});
+
+test('invoice page summary covers all filtered rows while items remain database-paginated', async () => {
+  const originalListInvoicePage = invoiceRepository.listInvoicePage;
+  let receivedQuery: unknown;
+  invoiceRepository.listInvoicePage = async (query) => {
+    receivedQuery = query;
+    return {
+      items: [],
+      totals: [
+        {
+          status: 'PAID',
+          refundAmount: null,
+          _count: { _all: 62 },
+          _sum: { grandTotal: new Prisma.Decimal('620'), refundAmount: null },
+        },
+        {
+          status: 'REFUNDED',
+          refundAmount: null,
+          _count: { _all: 3 },
+          _sum: { grandTotal: new Prisma.Decimal('30'), refundAmount: null },
+        },
+      ],
+      paymentMethods: ['COD'],
+      shops: [],
+    } as Awaited<ReturnType<typeof invoiceRepository.listInvoicePage>>;
+  };
+
+  try {
+    const service = new InvoiceService();
+    const result = await service.getInvoicePage({
+      customerId: 'customer-1',
+      page: 4,
+      limit: 20,
+      sortOrder: 'desc',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+    }, { id: 'customer-1', customerId: 'customer-1', role: 'customer' }, { includePaymentMethods: true });
+
+    assert.deepEqual(receivedQuery, {
+      customerId: 'customer-1',
+      page: 4,
+      limit: 20,
+      sortOrder: 'desc',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      shopIds: undefined,
+      search: undefined,
+      statuses: undefined,
+    });
+    assert.deepEqual(result.pagination, {
+      page: 4, limit: 20, totalItems: 65, totalPages: 4, hasNextPage: false, hasPreviousPage: true,
+    });
+    assert.deepEqual(result.summary, {
+      totalItems: 65,
+      totalBilled: '650',
+      paidCount: 62,
+      pendingCount: 0,
+      voidRefundedCount: 3,
+      netRevenue: '590',
+      revenueCurrency: 'MMK',
+      statusCounts: { PAID: 62, REFUNDED: 3 },
+    });
+    assert.deepEqual(result.facets.paymentMethods, ['COD']);
+  } finally {
+    invoiceRepository.listInvoicePage = originalListInvoicePage;
   }
 });
 test('invoice notification events include the real payment status and use stable logical IDs', () => {
@@ -328,6 +394,8 @@ test('invoice download serves the prepared current A4 artifact without rendering
     status: 'PAID' as const,
     pdfUrl: currentPdfUrl,
     pdfStatus: 'READY',
+    pdfCleanupToken: null,
+    pdfCleanupLeaseUntil: null,
     pdfError: null,
     pdfAttemptCount: 1,
     pdfUpdatedAt: null,
@@ -390,6 +458,35 @@ test('missing A4 artifacts are queued and reported without synchronous rendering
     invoiceRepository.findById = originalFindById;
     thermalPdfWorker.getA4Status = originalA4Status;
     thermalPdfWorker.enqueue = originalEnqueue;
+  }
+});
+
+test('an expired A4 cleanup lease is requeued through the authorized download flow', async () => {
+  const originalFindById = invoiceRepository.findById;
+  const originalA4Status = thermalPdfWorker.getA4Status;
+  const originalRequeue = thermalPdfWorker.requeueInvoice;
+  let requeueCalls = 0;
+  invoiceRepository.findById = async () => ({
+    id: 'invoice-cleaning',
+    customerId: 'customer-1',
+    pdfUrl: 'invoice-pdfs/shop-1/react-print-v21/INV-1-123456789-123abc.pdf',
+    pdfStatus: 'CLEANING',
+    pdfCleanupLeaseUntil: new Date(Date.now() - 1),
+  } as never);
+  thermalPdfWorker.getA4Status = async () => ({ id: 'a4-job', status: 'CLEANING', attempts: 2 } as never);
+  thermalPdfWorker.requeueInvoice = async () => { requeueCalls += 1; };
+  try {
+    const result = await new InvoiceService().downloadInvoicePdf('invoice-cleaning', {
+      role: 'customer',
+      customerId: 'customer-1',
+    });
+    assert.equal(result?.processing, true);
+    assert.equal(result?.status, 'PENDING');
+    assert.equal(requeueCalls, 1);
+  } finally {
+    invoiceRepository.findById = originalFindById;
+    thermalPdfWorker.getA4Status = originalA4Status;
+    thermalPdfWorker.requeueInvoice = originalRequeue;
   }
 });
 
@@ -1485,6 +1582,31 @@ test('partial invoice creation stores MMK even when the snapshot currency is not
   } finally {
     invoiceRepository.findIdempotency = originalFindIdempotency;
     invoiceRepository.createPartialInvoice = originalCreatePartialInvoice;
+  }
+});
+
+test('invoice summary queries select list fields without loading invoice line items or addresses', async () => {
+  const invoiceDelegate = prisma.invoice as unknown as {
+    findMany: (args: unknown) => Promise<unknown[]>;
+  };
+  const originalFindMany = invoiceDelegate.findMany;
+  let query: unknown;
+  invoiceDelegate.findMany = async (args) => {
+    query = args;
+    return [];
+  };
+
+  try {
+    await invoiceRepository.listInvoiceSummaries({ shopId: 'shop-1' });
+    const selection = (query as { select: Record<string, boolean> }).select;
+    assert.equal(selection.id, true);
+    assert.equal(selection.grandTotal, true);
+    assert.equal(selection.lineItems, undefined);
+    assert.equal(selection.items, undefined);
+    assert.equal(selection.billingAddress, undefined);
+    assert.equal(selection.shippingAddress, undefined);
+  } finally {
+    invoiceDelegate.findMany = originalFindMany;
   }
 });
 

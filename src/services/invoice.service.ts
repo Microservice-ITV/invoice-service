@@ -1,7 +1,13 @@
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import prisma from '@/config/database';
-import { InvoiceLineItem, InvoiceStatus, PartialInvoiceRequest, RefundMethod } from '@/types/invoice';
+import {
+  InvoiceLineItem,
+  InvoiceListQuery,
+  InvoiceStatus,
+  PartialInvoiceRequest,
+  RefundMethod,
+} from '@/types/invoice';
 import invoiceRepository from '@/repositories/invoice.repository';
 import orderSnapshotService, {
   OrderInvoiceSnapshot,
@@ -22,6 +28,13 @@ import receiptService from '@/services/receipt.service';
 import logger from '@/utils/logger';
 import thermalPdfWorker from '@/services/thermal-pdf-worker.service';
 import { invoiceCacheService } from '@/services/invoice-cache.service';
+
+const getSafePdfErrorCode = (error: unknown): string | undefined => {
+  if (typeof error !== 'object' || error === null || !('code' in error) || typeof error.code !== 'string') {
+    return undefined;
+  }
+  return /^[A-Za-z0-9_-]{1,64}$/.test(error.code) ? error.code : undefined;
+};
 
 export class AppError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -141,7 +154,7 @@ const invoiceCacheScope = (actor: InvoiceAccessActor): string | null => {
 
 const invoiceListCacheKey = (
   actor: InvoiceAccessActor,
-  filters: { customerId?: string; shopId?: string; shopIds?: string[]; status?: InvoiceStatus },
+  filters: { customerId?: string; shopId?: string; shopIds?: string[]; status?: InvoiceStatus; summary?: boolean },
 ): string | null => {
   const scope = invoiceCacheScope(actor);
   if (!scope) return null;
@@ -153,6 +166,28 @@ const invoiceListCacheKey = (
     status: filters.status ?? null,
     page: 0,
     limit: 50,
+    ...(filters.summary ? { projection: 'summary' } : {}),
+  })}`;
+};
+
+const invoicePageCacheKey = (
+  actor: InvoiceAccessActor,
+  filters: InvoiceListQuery & {
+    shopIds?: string[];
+    includePaymentMethods?: boolean;
+    includeShops?: boolean;
+    includeCustomerEmail?: boolean;
+  },
+): string | null => {
+  const scope = invoiceCacheScope(actor);
+  if (!scope) return null;
+  const shopIds = filters.shopIds ? [...new Set(filters.shopIds)].sort() : [];
+  return `list:${scope}:${JSON.stringify({
+    ...filters,
+    shopIds,
+    from: filters.from?.toISOString() ?? null,
+    to: filters.to?.toISOString() ?? null,
+    projection: 'list-v1',
   })}`;
 };
 
@@ -1331,14 +1366,114 @@ export class InvoiceService {
     return updatedInvoice;
   }
 
-  async getInvoicesByCustomer(customerId: string) {
+  async getInvoicesByCustomer(customerId: string, summary = false) {
     const scope = invoiceCacheScope({ customerId, role: 'customer' });
-    const key = `list:${scope}:${JSON.stringify({ customerId, page: 0, limit: 50 })}`;
+    const key = `list:${scope}:${JSON.stringify({
+      customerId,
+      page: 0,
+      limit: 50,
+      ...(summary ? { projection: 'summary' } : {}),
+    })}`;
     return invoiceCacheService.getOrLoad(
       key,
       INVOICE_LIST_CACHE_TTL_SECONDS,
-      () => invoiceRepository.listInvoices({ customerId }),
+      () => summary
+        ? invoiceRepository.listInvoiceSummaries({ customerId })
+        : invoiceRepository.listInvoices({ customerId }),
     );
+  }
+
+  async getInvoicePage(
+    query: InvoiceListQuery,
+    actor: InvoiceAccessActor,
+    options: {
+      includePaymentMethods?: boolean;
+      includeShops?: boolean;
+      includeCustomerEmail?: boolean;
+    } = {},
+  ) {
+    const normalizedQuery = {
+      ...query,
+      statuses: query.statuses ? [...new Set(query.statuses)].sort() : undefined,
+      shopIds: query.shopIds ? [...new Set(query.shopIds)].sort() : undefined,
+      search: query.search?.trim() || undefined,
+    };
+    const cacheFilters = {
+      ...normalizedQuery,
+      includePaymentMethods: options.includePaymentMethods ?? false,
+      includeShops: options.includeShops ?? false,
+      includeCustomerEmail: options.includeCustomerEmail ?? false,
+    };
+    const load = () => invoiceRepository.listInvoicePage(
+      normalizedQuery,
+      options.includePaymentMethods,
+      options.includeShops,
+      options.includeCustomerEmail,
+    );
+    const cacheKey = invoicePageCacheKey(actor, cacheFilters);
+    const pageData = cacheKey
+      ? await invoiceCacheService.getOrLoad(cacheKey, INVOICE_LIST_CACHE_TTL_SECONDS, load)
+      : await load();
+
+    const statusCounts = new Map<string, number>();
+    let totalItems = 0;
+    let totalBilled = new Prisma.Decimal(0);
+    let paidCount = 0;
+    let pendingCount = 0;
+    let voidRefundedCount = 0;
+    let paidRevenue = new Prisma.Decimal(0);
+    let refundedRevenue = new Prisma.Decimal(0);
+
+    for (const group of pageData.totals) {
+      const count = group._count._all;
+      totalItems += count;
+      statusCounts.set(group.status, (statusCounts.get(group.status) ?? 0) + count);
+      totalBilled = totalBilled.plus(group._sum.grandTotal ?? 0);
+      if (group.status === 'PAID') {
+        paidCount += count;
+        paidRevenue = paidRevenue.plus(group._sum.grandTotal ?? 0);
+      }
+      if (group.status === 'UNPAID' || group.status === 'PENDING_VERIFICATION') {
+        pendingCount += count;
+      }
+      if (group.status === 'VOID' || group.status === 'REFUNDED') {
+        voidRefundedCount += count;
+      }
+      if (group.status === 'REFUNDED') {
+        refundedRevenue = refundedRevenue.plus(
+          group.refundAmount === null
+            ? group._sum.grandTotal ?? 0
+            : group._sum.refundAmount ?? 0,
+        );
+      }
+    }
+
+    const totalPages = Math.ceil(totalItems / normalizedQuery.limit);
+    return {
+      items: pageData.items,
+      pagination: {
+        page: normalizedQuery.page,
+        limit: normalizedQuery.limit,
+        totalItems,
+        totalPages,
+        hasNextPage: normalizedQuery.page < totalPages,
+        hasPreviousPage: normalizedQuery.page > 1,
+      },
+      summary: {
+        totalItems,
+        totalBilled: totalBilled.toString(),
+        paidCount,
+        pendingCount,
+        voidRefundedCount,
+        netRevenue: paidRevenue.minus(refundedRevenue).toString(),
+        revenueCurrency: pageData.items[0]?.currency ?? 'MMK',
+        statusCounts: Object.fromEntries(statusCounts),
+      },
+      facets: {
+        paymentMethods: pageData.paymentMethods,
+        shops: pageData.shops,
+      },
+    };
   }
 
   async getGuestInvoicesByOrder(orderId: string, phone: string) {
@@ -1374,35 +1509,57 @@ export class InvoiceService {
     return Promise.all(documents.map((invoice) => this.populateInvoiceSnapshotData(invoice)));
   }
 
-  async getInvoicesByShop(shopId: string, status?: InvoiceStatus, actor?: InvoiceAccessActor) {
-    if (!actor) return invoiceRepository.listInvoices({ shopId, status });
-    const key = invoiceListCacheKey(actor, { shopId, status });
-    if (!key) return invoiceRepository.listInvoices({ shopId, status });
+  async getInvoicesByShop(shopId: string, status?: InvoiceStatus, actor?: InvoiceAccessActor, summary = false) {
+    if (!actor) {
+      return summary
+        ? invoiceRepository.listInvoiceSummaries({ shopId, status })
+        : invoiceRepository.listInvoices({ shopId, status });
+    }
+    const key = invoiceListCacheKey(actor, { shopId, status, summary });
+    if (!key) {
+      return summary
+        ? invoiceRepository.listInvoiceSummaries({ shopId, status })
+        : invoiceRepository.listInvoices({ shopId, status });
+    }
     return invoiceCacheService.getOrLoad(
       key,
       INVOICE_LIST_CACHE_TTL_SECONDS,
-      () => invoiceRepository.listInvoices({ shopId, status }),
+      () => summary
+        ? invoiceRepository.listInvoiceSummaries({ shopId, status })
+        : invoiceRepository.listInvoices({ shopId, status }),
     );
   }
 
-  async getInvoicesByShops(shopIds: string[], status?: InvoiceStatus, actor?: InvoiceAccessActor) {
-    if (!actor) return invoiceRepository.listInvoices({ shopIds, status });
-    const key = invoiceListCacheKey(actor, { shopIds, status });
-    if (!key) return invoiceRepository.listInvoices({ shopIds, status });
+  async getInvoicesByShops(shopIds: string[], status?: InvoiceStatus, actor?: InvoiceAccessActor, summary = false) {
+    if (!actor) {
+      return summary
+        ? invoiceRepository.listInvoiceSummaries({ shopIds, status })
+        : invoiceRepository.listInvoices({ shopIds, status });
+    }
+    const key = invoiceListCacheKey(actor, { shopIds, status, summary });
+    if (!key) {
+      return summary
+        ? invoiceRepository.listInvoiceSummaries({ shopIds, status })
+        : invoiceRepository.listInvoices({ shopIds, status });
+    }
     return invoiceCacheService.getOrLoad(
       key,
       INVOICE_LIST_CACHE_TTL_SECONDS,
-      () => invoiceRepository.listInvoices({ shopIds, status }),
+      () => summary
+        ? invoiceRepository.listInvoiceSummaries({ shopIds, status })
+        : invoiceRepository.listInvoices({ shopIds, status }),
     );
   }
 
-  async getAllInvoices(status?: InvoiceStatus, actor?: InvoiceAccessActor) {
+  async getAllInvoices(status?: InvoiceStatus, actor?: InvoiceAccessActor, summary = false) {
     const load = async () => {
-      const invoices = await invoiceRepository.listInvoices({ status });
+      const invoices = summary
+        ? await invoiceRepository.listInvoiceSummaries({ status })
+        : await invoiceRepository.listInvoices({ status });
       return populateMissingInvoiceShopNames(invoices);
     };
     if (!actor) return load();
-    const key = invoiceListCacheKey(actor, { status });
+    const key = invoiceListCacheKey(actor, { status, summary });
     if (!key) return load();
     return invoiceCacheService.getOrLoad(key, INVOICE_LIST_CACHE_TTL_SECONDS, load);
   }
@@ -1506,6 +1663,27 @@ export class InvoiceService {
 
     const job = await thermalPdfWorker.getA4Status(invoice.id);
     const pdfUrl = invoice.pdfUrl;
+    if (invoice.pdfStatus === 'CLEANING') {
+      if (!invoice.pdfCleanupLeaseUntil || invoice.pdfCleanupLeaseUntil.getTime() <= Date.now()) {
+        await thermalPdfWorker.requeueInvoice(invoice.id);
+        return {
+          invoice,
+          processing: true as const,
+          status: 'PENDING',
+          attempts: job?.attempts ?? 0,
+          error: null,
+          retryAt: new Date(),
+        };
+      }
+      return {
+        invoice,
+        processing: true as const,
+        status: 'CLEANING',
+        attempts: job?.attempts ?? 0,
+        error: null,
+        retryAt: job?.nextAttemptAt ?? new Date(),
+      };
+    }
     if (
       invoice.pdfStatus === 'READY'
       && pdfUrl
@@ -1519,8 +1697,7 @@ export class InvoiceService {
         };
       } catch (error) {
         logger.warn('Ready invoice PDF artifact could not be retrieved; requeueing regeneration', {
-          invoiceId: invoice.id,
-          error: error instanceof Error ? error.message : String(error),
+          errorCode: getSafePdfErrorCode(error),
         });
         await thermalPdfWorker.requeueInvoice(invoice.id);
         return {
@@ -1558,13 +1735,19 @@ export class InvoiceService {
       await thermalPdfWorker.enqueue(invoice.id);
       return { invoice, processing: true as const, status: 'PENDING', attempts: 0, error: null, retryAt: new Date() };
     }
+    if (job.status === 'CLEANING' && await thermalPdfWorker.requeueExpiredCleanupJob(job.id)) {
+      return { invoice, processing: true as const, status: 'PENDING', attempts: job.attempts, error: null, retryAt: new Date() };
+    }
     if (!job || job.status !== 'READY' || !job.artifactRef) {
       return { invoice, processing: true as const, status: job?.status ?? 'PENDING', attempts: job?.attempts ?? 0, error: job?.lastError ?? null, retryAt: job?.nextAttemptAt ?? null };
     }
     try {
       return { invoice, processing: false as const, buffer: await storageService.downloadPdf(job.artifactRef) };
     } catch (error) {
-      logger.warn('Prepared thermal PDF artifact could not be downloaded', { invoiceId: invoice.id, width, error: error instanceof Error ? error.message : String(error) });
+      logger.warn('Prepared thermal PDF artifact could not be downloaded', {
+        width,
+        errorCode: getSafePdfErrorCode(error),
+      });
       await prisma.thermalPdfJob.updateMany({ where: { id: job.id, status: 'READY' }, data: { status: 'PENDING', artifactRef: null, nextAttemptAt: new Date(), lastError: 'Stored artifact unavailable' } });
       return { invoice, processing: true as const, status: 'PENDING', attempts: job.attempts, error: null, retryAt: new Date() };
     }
@@ -1643,8 +1826,7 @@ export class InvoiceService {
         pdfBuffer = await storageService.downloadPdf(pdfUrl);
       } catch (error) {
         logger.warn('Batch invoice PDF artifact could not be retrieved; requeueing regeneration', {
-          invoiceId: invoice.id,
-          error: error instanceof Error ? error.message : String(error),
+          errorCode: getSafePdfErrorCode(error),
         });
         await thermalPdfWorker.requeueInvoice(invoice.id);
         throw new AppError('One or more invoice PDFs are temporarily unavailable. Background regeneration has been queued; retry the batch download shortly.', 503);
@@ -1688,12 +1870,13 @@ export class InvoiceService {
       createdAt: Date;
       lineItems?: unknown;
       pdfUrl?: string | null;
+      pdfStatus?: string;
       pdfUpdatedAt?: Date | null;
       updatedAt?: Date;
     },
     options: { force?: boolean; throwOnFailure?: boolean } = {},
   ): Promise<boolean> {
-    if (!options.force && hasCurrentInvoicePdf(invoice.pdfUrl)) {
+    if (!options.force && invoice.pdfStatus !== 'CLEANING' && hasCurrentInvoicePdf(invoice.pdfUrl)) {
       return true;
     }
 
@@ -1738,10 +1921,12 @@ export class InvoiceService {
       await invoiceRepository.markPdfReady(invoiceId, pdfUrl);
       return true;
     } catch (error) {
-      await invoiceRepository.markPdfFailed(invoiceId, error instanceof Error ? error.message : 'PDF generation failed');
-      logger.error(`Failed to generate invoice PDF for ${invoiceId}`, error as Error);
+      const errorCode = getSafePdfErrorCode(error);
+      const safeMessage = errorCode ? `PDF generation failed (${errorCode})` : 'PDF generation failed';
+      await invoiceRepository.markPdfFailed(invoiceId, safeMessage);
+      logger.error('Failed to generate invoice PDF', { errorCode });
       if (options.throwOnFailure) {
-        throw error instanceof Error ? error : new Error('Invoice PDF generation failed');
+        throw new Error(safeMessage);
       }
       return false;
     }

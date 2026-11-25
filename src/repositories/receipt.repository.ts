@@ -151,23 +151,27 @@ export class ReceiptRepository {
    * still respecting the in-progress lock (with a 15-minute stale escape).
    */
   async claimPdfGeneration(id: string, options: { force?: boolean } = {}): Promise<boolean> {
+    const now = new Date();
     const result = await prisma.receipt.updateMany({
       where: {
         id,
         ...(options.force ? {} : { pdfUrl: null }),
         OR: [
-          { pdfStatus: { not: 'GENERATING' } },
+          { pdfStatus: { notIn: ['GENERATING', 'CLEANING'] } },
           {
             pdfStatus: 'GENERATING',
-            pdfUpdatedAt: { lt: new Date(Date.now() - 15 * 60 * 1000) },
+            pdfUpdatedAt: { lt: new Date(now.getTime() - 15 * 60 * 1000) },
           },
+          { pdfStatus: 'CLEANING', OR: [{ pdfCleanupLeaseUntil: null }, { pdfCleanupLeaseUntil: { lte: now } }] },
         ],
       },
       data: {
         pdfStatus: 'GENERATING',
         pdfError: null,
         pdfAttemptCount: { increment: 1 },
-        pdfUpdatedAt: new Date(),
+        pdfUpdatedAt: now,
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
 
@@ -182,6 +186,8 @@ export class ReceiptRepository {
         pdfStatus: 'READY',
         pdfError: null,
         pdfUpdatedAt: new Date(),
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
   }
@@ -193,6 +199,8 @@ export class ReceiptRepository {
         pdfStatus: 'FAILED',
         pdfError: error.slice(0, 4000),
         pdfUpdatedAt: new Date(),
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
   }

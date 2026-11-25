@@ -15,8 +15,8 @@ process.env.PUBLIC_BASE_URL = 'http://localhost:9000';
 
 import prisma from '@/config/database';
 import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
+import pdfRetentionService from '@/services/pdf-retention.service';
 import receiptPdfService from '@/services/receipt-pdf.service';
-import storageService from '@/services/storage.service';
 import { ThermalPdfWorker } from '@/services/thermal-pdf-worker.service';
 import { THERMAL_RENDER_CACHE_VERSION } from '@/services/thermal-react-pdf-renderer.service';
 import orderSnapshotService from '@/services/order-snapshot.service';
@@ -76,11 +76,11 @@ test('worker prepares both invoice widths and writes storage references', async 
   const origFind = prisma.thermalPdfJob.findFirst;
   const origUpdate = prisma.thermalPdfJob.updateMany;
   const origRender = pdfGeneratorService.renderThermalInvoicePdf;
-  const origUpload = storageService.uploadPdf;
+  const origUpload = pdfRetentionService.uploadTrackedPdf;
   restore.push(() => { prisma.thermalPdfJob.findFirst = origFind; });
   restore.push(() => { prisma.thermalPdfJob.updateMany = origUpdate; });
   restore.push(() => { pdfGeneratorService.renderThermalInvoicePdf = origRender; });
-  restore.push(() => { storageService.uploadPdf = origUpload; });
+  restore.push(() => { pdfRetentionService.uploadTrackedPdf = origUpload; });
   (prisma.thermalPdfJob as any).findFirst = async () => currentJob;
   (prisma.thermalPdfJob as any).updateMany = async (args: never) => {
     const { where, data } = args as unknown as { where: { status?: string; leaseToken?: string }; data: Record<string, unknown> };
@@ -89,7 +89,10 @@ test('worker prepares both invoice widths and writes storage references', async 
     return { count: 1 } as never;
   };
   pdfGeneratorService.renderThermalInvoicePdf = async (_data, width) => { rendered.push(width ?? '80mm'); return Buffer.from('%PDF'); };
-  storageService.uploadPdf = async (ref) => { stored.push(ref); return ref; };
+  pdfRetentionService.uploadTrackedPdf = async ({ fileName }) => {
+    stored.push(fileName);
+    return `invoice-pdfs/${fileName}`;
+  };
   try {
     const worker = new ThermalPdfWorker();
     for (const width of ['58mm', '80mm'] as const) {
@@ -156,7 +159,7 @@ test('worker recovers expired leases and backs off after storage failures', asyn
   const origFind = prisma.thermalPdfJob.findFirst;
   const origUpdate = prisma.thermalPdfJob.updateMany;
   const origRender = pdfGeneratorService.renderThermalInvoicePdf;
-  const origUpload = storageService.uploadPdf;
+  const origUpload = pdfRetentionService.uploadTrackedPdf;
   let query: unknown;
   let failureUpdate: Record<string, unknown> | undefined;
   (prisma.thermalPdfJob as any).findFirst = async (args: unknown) => {
@@ -169,7 +172,7 @@ test('worker recovers expired leases and backs off after storage failures', asyn
     return { count: 1 } as never;
   };
   pdfGeneratorService.renderThermalInvoicePdf = async () => Buffer.from('%PDF');
-  storageService.uploadPdf = async () => { throw new Error('storage unavailable'); };
+  pdfRetentionService.uploadTrackedPdf = async () => { throw new Error('storage unavailable'); };
   try {
     const worker = new ThermalPdfWorker();
     assert.equal(await worker.processNextJob(), true);
@@ -183,7 +186,7 @@ test('worker recovers expired leases and backs off after storage failures', asyn
     prisma.thermalPdfJob.findFirst = origFind;
     prisma.thermalPdfJob.updateMany = origUpdate;
     pdfGeneratorService.renderThermalInvoicePdf = origRender;
-    storageService.uploadPdf = origUpload;
+    pdfRetentionService.uploadTrackedPdf = origUpload;
   }
 });
 
@@ -191,7 +194,7 @@ test('atomic claim prevents concurrent workers from rendering the same job', asy
   const origFind = prisma.thermalPdfJob.findFirst;
   const origUpdate = prisma.thermalPdfJob.updateMany;
   const origRender = pdfGeneratorService.renderThermalInvoicePdf;
-  const origUpload = storageService.uploadPdf;
+  const origUpload = pdfRetentionService.uploadTrackedPdf;
   let claims = 0;
   let renders = 0;
   (prisma.thermalPdfJob as any).findFirst = async () => invoiceJob('80mm');
@@ -201,7 +204,7 @@ test('atomic claim prevents concurrent workers from rendering the same job', asy
     return { count: 1 } as never;
   };
   pdfGeneratorService.renderThermalInvoicePdf = async () => { renders += 1; return Buffer.from('%PDF'); };
-  storageService.uploadPdf = async (ref) => ref;
+  pdfRetentionService.uploadTrackedPdf = async ({ fileName }) => `invoice-pdfs/${fileName}`;
   try {
     const worker = new ThermalPdfWorker();
     const results = await Promise.all([worker.processNextJob(), worker.processNextJob()]);
@@ -211,7 +214,7 @@ test('atomic claim prevents concurrent workers from rendering the same job', asy
     prisma.thermalPdfJob.findFirst = origFind;
     prisma.thermalPdfJob.updateMany = origUpdate;
     pdfGeneratorService.renderThermalInvoicePdf = origRender;
-    storageService.uploadPdf = origUpload;
+    pdfRetentionService.uploadTrackedPdf = origUpload;
   }
 });
 
@@ -219,7 +222,7 @@ test('receipt jobs render from the persisted receipt and invoice snapshots', asy
   const origFind = prisma.thermalPdfJob.findFirst;
   const origUpdate = prisma.thermalPdfJob.updateMany;
   const origRender = receiptPdfService.renderReceiptPdf;
-  const origUpload = storageService.uploadPdf;
+  const origUpload = pdfRetentionService.uploadTrackedPdf;
   let widthSeen = '';
   const receipt = {
     id: 'receipt-1', receiptNumber: 'RCP-1', invoiceId: 'invoice-1', invoiceNumber: 'INV-1',
@@ -237,7 +240,7 @@ test('receipt jobs render from the persisted receipt and invoice snapshots', asy
   };
   (prisma.thermalPdfJob as any).updateMany = async () => ({ count: 1 });
   receiptPdfService.renderReceiptPdf = async (_payload, width) => { widthSeen = width ?? '80mm'; renderedWidths.push(widthSeen); return Buffer.from('%PDF'); };
-  storageService.uploadPdf = async (ref) => ref;
+  pdfRetentionService.uploadTrackedPdf = async ({ fileName }) => `invoice-pdfs/${fileName}`;
   try {
     const worker = new ThermalPdfWorker();
     assert.equal(await worker.processNextJob(), true);
@@ -247,6 +250,40 @@ test('receipt jobs render from the persisted receipt and invoice snapshots', asy
     prisma.thermalPdfJob.findFirst = origFind;
     prisma.thermalPdfJob.updateMany = origUpdate;
     receiptPdfService.renderReceiptPdf = origRender;
-    storageService.uploadPdf = origUpload;
+    pdfRetentionService.uploadTrackedPdf = origUpload;
+  }
+});
+
+test('expired cleanup leases requeue thermal PDF jobs for regeneration', async () => {
+  const thermalPdfJobDelegate = prisma.thermalPdfJob as unknown as {
+    updateMany: (args: Record<string, unknown>) => Promise<{ count: number }>;
+  };
+  const originalUpdate = thermalPdfJobDelegate.updateMany;
+  let updateArgs: Record<string, unknown> | undefined;
+  thermalPdfJobDelegate.updateMany = async (args) => {
+    updateArgs = args;
+    return { count: 1 };
+  };
+  try {
+    const queued = await new ThermalPdfWorker().requeueExpiredCleanupJob('job-58mm');
+    assert.equal(queued, true);
+    const where = updateArgs?.where as {
+      id: string;
+      status: string;
+      OR: Array<{ cleanupLeaseUntil: null | { lte: Date } }>;
+    };
+    const data = updateArgs?.data as Record<string, unknown>;
+    assert.equal(where.id, 'job-58mm');
+    assert.equal(where.status, 'CLEANING');
+    assert.equal(where.OR[0].cleanupLeaseUntil, null);
+    assert.ok(where.OR[1].cleanupLeaseUntil !== null);
+    assert.ok(where.OR[1].cleanupLeaseUntil.lte instanceof Date);
+    assert.equal(data.status, 'PENDING');
+    assert.equal(data.artifactRef, null);
+    assert.equal(data.cleanupToken, null);
+    assert.equal(data.cleanupLeaseUntil, null);
+    assert.ok(data.nextAttemptAt instanceof Date);
+  } finally {
+    thermalPdfJobDelegate.updateMany = originalUpdate;
   }
 });

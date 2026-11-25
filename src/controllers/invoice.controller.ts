@@ -1,6 +1,6 @@
 import { NextFunction, Request, Response } from 'express';
 import invoiceService, { MAX_INVOICE_REPLAY_ORDER_IDS } from '@/services/invoice.service';
-import { InvoiceStatus, RefundMethod } from '@/types/invoice';
+import { InvoiceListQuery, InvoiceStatus, RefundMethod } from '@/types/invoice';
 import { canAccessInvoice } from '@/services/invoice-access-policy';
 import invoicePrintTokenService from '@/services/invoice-print-token.service';
 
@@ -30,6 +30,91 @@ const normalizeStatus = (value: string | undefined): InvoiceStatus | undefined =
   }
 
   return upperValue;
+};
+
+const parseInvoiceListQuery = (query: Request['query']): { value?: InvoiceListQuery; error?: string } => {
+  const stringKeys = ['status', 'search', 'paymentMethod', 'from', 'to', 'sortOrder', 'order'];
+  if (stringKeys.some((key) => query[key] !== undefined && typeof query[key] !== 'string')) {
+    return { error: 'Invoice filters must be single string values' };
+  }
+  if (
+    (query.page !== undefined && typeof query.page !== 'string')
+    || (query.limit !== undefined && typeof query.limit !== 'string')
+  ) {
+    return { error: 'page and limit must be integer values' };
+  }
+  const readString = (key: string): string | undefined => {
+    const value = query[key];
+    return typeof value === 'string' ? value : undefined;
+  };
+  const page = query.page === undefined ? 1 : Number(query.page);
+  const limit = query.limit === undefined ? 20 : Number(query.limit);
+  const fromValue = readString('from');
+  const toValue = readString('to');
+  const search = readString('search')?.trim();
+  const paymentMethod = readString('paymentMethod')?.trim();
+  const sortOrder = readString('sortOrder') ?? readString('order') ?? 'desc';
+
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return { error: 'page must be a positive integer and limit must be between 1 and 100' };
+  }
+  if ((search && search.length > 120) || (paymentMethod && paymentMethod.length > 80)) {
+    return { error: 'Search and payment method filters are too long' };
+  }
+  if (sortOrder !== 'asc' && sortOrder !== 'desc') {
+    return { error: 'sortOrder must be asc or desc' };
+  }
+  const parseDate = (value: string | undefined, endOfDay: boolean): Date | undefined => {
+    if (!value) return undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return new Date(Number.NaN);
+    const date = new Date(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+      ? date
+      : new Date(Number.NaN);
+  };
+  const from = parseDate(fromValue, false);
+  const to = parseDate(toValue, true);
+  if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+    return { error: 'from and to must be valid YYYY-MM-DD dates' };
+  }
+  if (from && to && from > to) return { error: 'from cannot be later than to' };
+
+  try {
+    const statusValue = readString('status');
+    const statuses = statusValue
+      ? [...new Set(statusValue.split(',').map((value) => normalizeStatus(value.trim())))].filter(
+        (value): value is InvoiceStatus => Boolean(value),
+      )
+      : undefined;
+    return {
+      value: {
+        page,
+        limit,
+        sortOrder,
+        ...(statuses?.length === 1 ? { status: statuses[0] } : {}),
+        ...(statuses && statuses.length > 1 ? { statuses } : {}),
+        ...(search ? { search } : {}),
+        ...(paymentMethod ? { paymentMethod } : {}),
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
+      },
+    };
+  } catch {
+    return { error: 'Invalid invoice status' };
+  }
+};
+
+const respondWithInvoicePage = (
+  res: Response,
+  page: Awaited<ReturnType<typeof invoiceService.getInvoicePage>>,
+): void => {
+  res.json({
+    success: true,
+    data: page.items,
+    pagination: page.pagination,
+    summary: page.summary,
+    facets: page.facets,
+  });
 };
 
 export class InvoiceController {
@@ -186,8 +271,18 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = await invoiceService.getInvoicesByCustomer(customerId);
-      res.json({ success: true, data: invoices });
+      const parsed = parseInvoiceListQuery(req.query);
+      if (!parsed.value) {
+        res.status(400).json({ success: false, message: parsed.error });
+        return;
+      }
+
+      const page = await invoiceService.getInvoicePage(
+        { ...parsed.value, customerId },
+        { ...req.user, customerId, role: 'customer' },
+        { includePaymentMethods: true },
+      );
+      respondWithInvoicePage(res, page);
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch customer invoices'));
     }
@@ -218,7 +313,6 @@ export class InvoiceController {
   async getShopInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const shopId = req.user?.shopId;
-      const status = normalizeStatus(req.query.status as string | undefined);
       const shopIds = [...new Set(req.user?.shopIds ?? [])];
 
       if (shopIds.length === 0 && !shopId) {
@@ -229,10 +323,18 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = shopIds.length > 0
-        ? await invoiceService.getInvoicesByShops(shopIds, status, req.user)
-        : await invoiceService.getInvoicesByShop(shopId as string, status, req.user);
-      res.json({ success: true, data: invoices });
+      const parsed = parseInvoiceListQuery(req.query);
+      if (!parsed.value) {
+        res.status(400).json({ success: false, message: parsed.error });
+        return;
+      }
+
+      const page = await invoiceService.getInvoicePage(
+        { ...parsed.value, ...(shopIds.length > 0 ? { shopIds } : { shopId }) },
+        req.user!,
+        { includePaymentMethods: true },
+      );
+      respondWithInvoicePage(res, page);
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch shop invoices'));
     }
@@ -388,7 +490,6 @@ export class InvoiceController {
   async getManageInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const shopId = req.user?.shopId;
-      const status = normalizeStatus(req.query.status as string | undefined);
 
       if (!shopId) {
         res.status(400).json({
@@ -398,8 +499,17 @@ export class InvoiceController {
         return;
       }
 
-      const invoices = await invoiceService.getInvoicesByShop(shopId, status, req.user);
-      res.json({ success: true, data: invoices });
+      const parsed = parseInvoiceListQuery(req.query);
+      if (!parsed.value) {
+        res.status(400).json({ success: false, message: parsed.error });
+        return;
+      }
+      const page = await invoiceService.getInvoicePage(
+        { ...parsed.value, shopId },
+        req.user!,
+        { includePaymentMethods: true },
+      );
+      respondWithInvoicePage(res, page);
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch managed invoices'));
     }
@@ -407,10 +517,22 @@ export class InvoiceController {
 
   async getAdminInvoices(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const status = normalizeStatus(req.query.status as string | undefined);
-      const invoices = await invoiceService.getAllInvoices(status, req.user);
-
-      res.json({ success: true, data: invoices });
+      const parsed = parseInvoiceListQuery(req.query);
+      if (!parsed.value) {
+        res.status(400).json({ success: false, message: parsed.error });
+        return;
+      }
+      const shopId = req.query.shopId;
+      if (shopId !== undefined && typeof shopId !== 'string') {
+        res.status(400).json({ success: false, message: 'shopId must be a string' });
+        return;
+      }
+      const page = await invoiceService.getInvoicePage(
+        { ...parsed.value, ...(typeof shopId === 'string' && shopId ? { shopId } : {}) },
+        req.user!,
+        { includeShops: true, includeCustomerEmail: true },
+      );
+      respondWithInvoicePage(res, page);
     } catch (error) {
       next(error instanceof Error ? error : new Error('Failed to fetch admin invoices'));
     }

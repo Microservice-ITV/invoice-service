@@ -1,6 +1,6 @@
 import prisma from '@/config/database';
 import { Prisma } from '@prisma/client';
-import { InvoiceFilters, InvoiceLineItem, InvoiceStatus } from '@/types/invoice';
+import { InvoiceFilters, InvoiceLineItem, InvoiceListQuery, InvoiceStatus } from '@/types/invoice';
 import { OrderInvoiceSnapshotItem } from '@/services/order-snapshot.service';
 import { invoiceCacheService } from '@/services/invoice-cache.service';
 
@@ -751,23 +751,27 @@ export class InvoiceRepository {
    * while still respecting the in-progress lock.
    */
   async claimPdfGeneration(id: string, options: { force?: boolean } = {}): Promise<boolean> {
+    const now = new Date();
     const result = await prisma.invoice.updateMany({
       where: {
         id,
         ...(options.force ? {} : { pdfUrl: null }),
         OR: [
-          { pdfStatus: { not: 'GENERATING' } },
+          { pdfStatus: { notIn: ['GENERATING', 'CLEANING'] } },
           {
             pdfStatus: 'GENERATING',
-            pdfUpdatedAt: { lt: new Date(Date.now() - 15 * 60 * 1000) },
+            pdfUpdatedAt: { lt: new Date(now.getTime() - 15 * 60 * 1000) },
           },
+          { pdfStatus: 'CLEANING', OR: [{ pdfCleanupLeaseUntil: null }, { pdfCleanupLeaseUntil: { lte: now } }] },
         ],
       },
       data: {
         pdfStatus: 'GENERATING',
         pdfError: null,
         pdfAttemptCount: { increment: 1 },
-        pdfUpdatedAt: new Date(),
+        pdfUpdatedAt: now,
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
 
@@ -783,6 +787,8 @@ export class InvoiceRepository {
         pdfStatus: 'READY',
         pdfError: null,
         pdfUpdatedAt: new Date(),
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
     await invoiceCacheService.invalidate();
@@ -796,6 +802,8 @@ export class InvoiceRepository {
         pdfStatus: 'FAILED',
         pdfError: error.slice(0, 4000),
         pdfUpdatedAt: new Date(),
+        pdfCleanupToken: null,
+        pdfCleanupLeaseUntil: null,
       },
     });
     await invoiceCacheService.invalidate();
@@ -878,6 +886,150 @@ export class InvoiceRepository {
       pdfUrl: invoice.pdfUrl ? `/invoices/${invoice.id}/pdf` : null,
       lineItems: this.normalizeLineItems(lineItems, items),
     }));
+  }
+
+  async listInvoiceSummaries(
+    filters: InvoiceFilters = {},
+    skip = 0,
+    take = 50,
+  ) {
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        ...(filters.shopIds ? { shopId: { in: filters.shopIds } } : filters.shopId ? { shopId: filters.shopId } : {}),
+        ...(filters.customerId ? { customerId: filters.customerId } : {}),
+        ...(filters.orderId ? { orderId: filters.orderId } : {}),
+        ...(filters.status ? { status: filters.status } : {}),
+      },
+      select: {
+        id: true,
+        invoiceNumber: true,
+        orderId: true,
+        orderReference: true,
+        shopId: true,
+        shopName: true,
+        customerName: true,
+        customerEmail: true,
+        grandTotal: true,
+        currency: true,
+        paymentMethod: true,
+        paymentGatewayRef: true,
+        paymentSlipUrl: true,
+        status: true,
+        pdfUrl: true,
+        verifiedBy: true,
+        verifiedAt: true,
+        rejectionReason: true,
+        verificationNote: true,
+        refundAmount: true,
+        refundMethod: true,
+        refundReason: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+    });
+
+    return invoices.map((invoice) => ({
+      ...invoice,
+      pdfUrl: invoice.pdfUrl ? `/invoices/${invoice.id}/pdf` : null,
+    }));
+  }
+
+  async listInvoicePage(
+    query: InvoiceListQuery,
+    includePaymentMethods = false,
+    includeShops = false,
+    includeCustomerEmail = false,
+  ) {
+    const where: Prisma.InvoiceWhereInput = {
+      ...(query.shopIds ? { shopId: { in: query.shopIds } } : query.shopId ? { shopId: query.shopId } : {}),
+      ...(query.customerId ? { customerId: query.customerId } : {}),
+      ...(query.statuses ? { status: { in: query.statuses } } : query.status ? { status: query.status } : {}),
+      ...(query.paymentMethod ? { paymentMethod: query.paymentMethod } : {}),
+      ...(query.from || query.to ? {
+        createdAt: {
+          ...(query.from ? { gte: query.from } : {}),
+          ...(query.to ? { lte: query.to } : {}),
+        },
+      } : {}),
+      ...(query.search ? {
+        OR: [
+          { invoiceNumber: { contains: query.search } },
+          { orderId: { contains: query.search } },
+          { orderReference: { contains: query.search } },
+          { customerName: { contains: query.search } },
+          { customerEmail: { contains: query.search } },
+          { shopName: { contains: query.search } },
+        ],
+      } : {}),
+    };
+    const whereWithoutPaymentMethod = Object.fromEntries(
+      Object.entries(where).filter(([key]) => key !== 'paymentMethod'),
+    ) as Prisma.InvoiceWhereInput;
+    const whereWithoutShopScope = Object.fromEntries(
+      Object.entries(where).filter(([key]) => key !== 'shopId'),
+    ) as Prisma.InvoiceWhereInput;
+
+    const [items, totals, paymentMethods, shops] = await Promise.all([
+      prisma.invoice.findMany({
+        where,
+        select: {
+          id: true,
+          invoiceNumber: true,
+          orderId: true,
+          orderReference: true,
+          shopId: true,
+          shopName: true,
+          customerName: true,
+          ...(includeCustomerEmail ? { customerEmail: true } : {}),
+          grandTotal: true,
+          currency: true,
+          paymentMethod: true,
+          status: true,
+          pdfUrl: true,
+          createdAt: true,
+        },
+        orderBy: [{ createdAt: query.sortOrder }, { id: query.sortOrder }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+      prisma.invoice.groupBy({
+        by: ['status', 'refundAmount'],
+        where,
+        _count: { _all: true },
+        _sum: { grandTotal: true, refundAmount: true },
+      }),
+      includePaymentMethods
+        ? prisma.invoice.findMany({
+          where: whereWithoutPaymentMethod,
+          select: { paymentMethod: true },
+          distinct: ['paymentMethod'],
+          orderBy: { paymentMethod: 'asc' },
+        })
+        : Promise.resolve([]),
+      includeShops
+        ? prisma.invoice.findMany({
+          where: whereWithoutShopScope,
+          select: { shopId: true, shopName: true },
+          distinct: ['shopId', 'shopName'],
+          orderBy: [{ shopName: 'asc' }, { shopId: 'asc' }],
+        })
+        : Promise.resolve([]),
+    ]);
+
+    return {
+      items: items.map((invoice) => ({
+        ...invoice,
+        pdfUrl: invoice.pdfUrl ? `/invoices/${invoice.id}/pdf` : null,
+      })),
+      totals,
+      paymentMethods: paymentMethods
+        .map((item) => item.paymentMethod)
+        .filter((method): method is string => Boolean(method)),
+      shops: shops.map((shop) => ({ id: shop.shopId, name: shop.shopName })),
+    };
   }
 }
 
