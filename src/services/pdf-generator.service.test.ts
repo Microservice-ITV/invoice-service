@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { BrowserContext } from 'puppeteer';
+import type { InvoicePdfPayload } from '@/services/pdf-generator.service';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'mysql://invoice:invoice@localhost:3306/invoice_test';
@@ -16,12 +18,16 @@ process.env.MINIO_USE_SSL = 'false';
 process.env.PUBLIC_BASE_URL = 'http://localhost:9000';
 process.env.FRONTEND_BASE_URL = 'http://localhost:5173';
 
-import type { BrowserContext } from 'puppeteer';
-import logger from '@/utils/logger';
-import pdfBrowserService from '@/services/pdf-browser.service';
-import { InvoicePdfPayload, PdfGeneratorService } from '@/services/pdf-generator.service';
-
 test('invoice PDF renderer never logs or returns its tokenized print URL', async () => {
+  const [
+    { default: logger },
+    { default: pdfBrowserService },
+    { PdfGeneratorService },
+  ] = await Promise.all([
+    import('@/utils/logger'),
+    import('@/services/pdf-browser.service'),
+    import('@/services/pdf-generator.service'),
+  ]);
   const originalCreateContext = pdfBrowserService.createContext;
   const originalReleaseContext = pdfBrowserService.releaseContext;
   const originalLoggerError = logger.error;
