@@ -1,12 +1,13 @@
 import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
+import { PdfArtifactKind } from '@prisma/client';
 import prisma from '@/config/database';
 import pdfGeneratorService, { REACT_PRINT_PDF_MARKER } from '@/services/pdf-generator.service';
+import pdfRetentionService from '@/services/pdf-retention.service';
 import receiptPdfService, { type ReceiptPdfPayload } from '@/services/receipt-pdf.service';
 import { THERMAL_RENDER_CACHE_VERSION } from '@/services/thermal-react-pdf-renderer.service';
 import orderSnapshotService from '@/services/order-snapshot.service';
 import productVariantLookupService from '@/services/product-variant-lookup.service';
-import storageService from '@/services/storage.service';
 import logger from '@/utils/logger';
 import { invoiceCacheService } from '@/services/invoice-cache.service';
 
@@ -24,6 +25,13 @@ type ThermalJob = Prisma.ThermalPdfJobGetPayload<{
 }>;
 type ThermalWidth = typeof WIDTHS[number];
 type InvoicePdfWidth = typeof INVOICE_WIDTHS[number];
+
+const getSafeErrorCode = (error: unknown): string | undefined => {
+  if (typeof error !== 'object' || error === null || !('code' in error) || typeof error.code !== 'string') {
+    return undefined;
+  }
+  return /^[A-Za-z0-9_-]{1,64}$/.test(error.code) ? error.code : undefined;
+};
 
 const asAddress = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -71,22 +79,38 @@ export class ThermalPdfWorker {
   }
 
   async requeueInvoice(invoiceId: string): Promise<void> {
+    const now = new Date();
     const updated = await prisma.invoice.updateMany({
-      where: { id: invoiceId },
-      data: { pdfStatus: 'PENDING', pdfUpdatedAt: new Date() },
+      where: {
+        id: invoiceId,
+        OR: [
+          { pdfStatus: { not: 'CLEANING' } },
+          { pdfStatus: 'CLEANING', OR: [{ pdfCleanupLeaseUntil: null }, { pdfCleanupLeaseUntil: { lte: now } }] },
+        ],
+      },
+      data: { pdfStatus: 'PENDING', pdfUpdatedAt: now, pdfCleanupToken: null, pdfCleanupLeaseUntil: null },
     });
-    if (updated.count > 0) await invoiceCacheService.invalidate();
+    if (updated.count === 0) return;
+    await invoiceCacheService.invalidate();
 
     await prisma.thermalPdfJob.updateMany({
-      where: { invoiceId },
+      where: {
+        invoiceId,
+        OR: [
+          { status: { not: 'CLEANING' } },
+          { status: 'CLEANING', OR: [{ cleanupLeaseUntil: null }, { cleanupLeaseUntil: { lte: now } }] },
+        ],
+      },
       data: {
         status: 'PENDING',
         artifactRef: null,
         templateVersion: null,
         lastError: null,
-        nextAttemptAt: new Date(),
+        nextAttemptAt: now,
         leaseToken: null,
         leaseUntil: null,
+        cleanupToken: null,
+        cleanupLeaseUntil: null,
       },
     });
 
@@ -94,6 +118,29 @@ export class ThermalPdfWorker {
       data: INVOICE_WIDTHS.map((width) => ({ invoiceId, width })),
       skipDuplicates: true,
     });
+  }
+
+  async requeueExpiredCleanupJob(jobId: string): Promise<boolean> {
+    const now = new Date();
+    const updated = await prisma.thermalPdfJob.updateMany({
+      where: {
+        id: jobId,
+        status: 'CLEANING',
+        OR: [{ cleanupLeaseUntil: null }, { cleanupLeaseUntil: { lte: now } }],
+      },
+      data: {
+        status: 'PENDING',
+        artifactRef: null,
+        templateVersion: null,
+        lastError: null,
+        nextAttemptAt: now,
+        leaseToken: null,
+        leaseUntil: null,
+        cleanupToken: null,
+        cleanupLeaseUntil: null,
+      },
+    });
+    return updated.count === 1;
   }
 
   async enqueueReceipt(receiptId: string): Promise<void> {
@@ -185,7 +232,7 @@ export class ThermalPdfWorker {
         if (!(await this.processNextJob())) break;
       }
     } catch (error) {
-      logger.error('Thermal PDF worker poll failed', error as Error);
+      logger.error('Thermal PDF worker poll failed', { errorCode: getSafeErrorCode(error) });
     } finally {
       this.running = false;
       this.idleWaiters.splice(0).forEach((resolve) => resolve());
@@ -309,11 +356,22 @@ export class ThermalPdfWorker {
               where: {
                 id: job.invoice.id,
                 OR: [
-                  { pdfStatus: { not: 'GENERATING' } },
-                  { pdfUpdatedAt: { lt: new Date(Date.now() - 15 * 60_000) } },
+                  { pdfStatus: { notIn: ['GENERATING', 'CLEANING'] } },
+                  { pdfStatus: 'GENERATING', pdfUpdatedAt: { lt: new Date(Date.now() - 15 * 60_000) } },
+                  {
+                    pdfStatus: 'CLEANING',
+                    OR: [
+                      { pdfCleanupLeaseUntil: null },
+                      { pdfCleanupLeaseUntil: { lte: new Date() } },
+                    ],
+                  },
                 ],
               },
-              data: { pdfStatus: 'GENERATING', pdfError: null, pdfAttemptCount: { increment: 1 }, pdfUpdatedAt: new Date() },
+              data: {
+                pdfStatus: 'GENERATING', pdfError: null,
+                pdfAttemptCount: { increment: 1 }, pdfUpdatedAt: new Date(),
+                pdfCleanupToken: null, pdfCleanupLeaseUntil: null,
+              },
             });
             if (claimed.count !== 1) throw new Error('A4 invoice PDF generation is already in progress');
             await invoiceCacheService.invalidate();
@@ -374,7 +432,15 @@ export class ThermalPdfWorker {
         artifactRef = destination;
       } else {
         if (!pdf) throw new Error('PDF renderer returned no document');
-        artifactRef = await storageService.uploadPdf(destination, pdf);
+        const sourceId = job.invoiceId ?? job.receiptId;
+        if (!sourceId) throw new Error('PDF job has no persisted source identifier');
+        artifactRef = await pdfRetentionService.uploadTrackedPdf({
+          kind: job.invoiceId ? PdfArtifactKind.INVOICE_THERMAL : PdfArtifactKind.RECEIPT_THERMAL,
+          sourceId,
+          width,
+          fileName: destination,
+          buffer: pdf,
+        });
       }
       const saved = await prisma.thermalPdfJob.updateMany({
         where: { id: job.id, status: 'PROCESSING', leaseToken: token },
@@ -386,11 +452,12 @@ export class ThermalPdfWorker {
       });
       if (saved.count !== 1) logger.warn('Thermal PDF worker lost lease after upload', { jobId: job.id, width, document });
       else logger.info('Thermal PDF artifact ready', {
-        jobId: job.id, invoiceId: job.invoiceId, receiptId: job.receiptId,
+        jobId: job.id,
         width, document, attempts: job.attempts + 1,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const errorCode = getSafeErrorCode(error);
+      const message = errorCode ? `Thermal PDF generation failed (${errorCode})` : 'Thermal PDF generation failed';
       const attempts = job.attempts + 1;
       const backoff = Math.min(MAX_BACKOFF_MS, 1000 * (2 ** Math.min(attempts - 1, 12)));
       await prisma.thermalPdfJob.updateMany({
@@ -400,10 +467,10 @@ export class ThermalPdfWorker {
           nextAttemptAt: new Date(Date.now() + backoff), leaseToken: null, leaseUntil: null,
         },
       });
-      logger.error('Thermal PDF generation failed', Object.assign(new Error(message), {
-        jobId: job.id, invoiceId: job.invoiceId, receiptId: job.receiptId,
-        width, attempts, retryInMs: backoff,
-      }));
+      logger.error('Thermal PDF generation failed', {
+        jobId: job.id,
+        width, attempts, retryInMs: backoff, errorCode,
+      });
     }
   }
 }

@@ -339,3 +339,77 @@ test('bulk invoice document lookup and order lookup avoid item joins where unnec
     prisma.invoice.findMany = originalFindMany;
   }
 });
+
+test('invoice list page selects only table fields and applies stable database pagination and filters', async () => {
+  const originalFindMany = prisma.invoice.findMany;
+  const originalGroupBy = prisma.invoice.groupBy;
+  let listQuery: Record<string, unknown> | undefined;
+  let totalsQuery: Record<string, unknown> | undefined;
+  const rows = Array.from({ length: 20 }, (_, index) => ({
+    id: `invoice-${index + 1}`,
+    invoiceNumber: `INV-${index + 1}`,
+    pdfUrl: null,
+  }));
+  prisma.invoice.findMany = (async (args: Record<string, unknown>) => {
+    if ('invoiceNumber' in ((args.select ?? {}) as Record<string, unknown>)) listQuery = args;
+    return rows;
+  }) as unknown as typeof prisma.invoice.findMany;
+  prisma.invoice.groupBy = (async (args: Record<string, unknown>) => {
+    totalsQuery = args;
+    return [];
+  }) as unknown as typeof prisma.invoice.groupBy;
+
+  try {
+    const repository = new InvoiceRepository();
+    const result = await repository.listInvoicePage({
+      page: 4,
+      limit: 20,
+      sortOrder: 'asc',
+      status: undefined,
+      statuses: ['UNPAID', 'PAID'],
+      shopIds: ['shop-b', 'shop-a'],
+      search: 'INV',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      to: new Date('2026-01-31T23:59:59.999Z'),
+    });
+
+    assert.equal(result.items.length, 20);
+    assert.equal((listQuery?.skip), 60);
+    assert.equal((listQuery?.take), 20);
+    assert.deepEqual(listQuery?.orderBy, [{ createdAt: 'asc' }, { id: 'asc' }]);
+    const select = listQuery?.select as Record<string, unknown>;
+    assert.deepEqual(Object.keys(select).sort(), [
+      'createdAt',
+      'currency',
+      'customerName',
+      'grandTotal',
+      'id',
+      'invoiceNumber',
+      'orderId',
+      'orderReference',
+      'paymentMethod',
+      'pdfUrl',
+      'shopId',
+      'shopName',
+      'status',
+    ].sort());
+    assert.equal('customerEmail' in select, false);
+    const where = listQuery?.where as Record<string, unknown>;
+    assert.deepEqual(where.shopId, { in: ['shop-b', 'shop-a'] });
+    assert.deepEqual(where.status, { in: ['UNPAID', 'PAID'] });
+    assert.ok(Array.isArray(where.OR));
+    assert.deepEqual(totalsQuery?.where, listQuery?.where);
+    assert.deepEqual(totalsQuery?.by, ['status', 'refundAmount']);
+
+    await repository.listInvoicePage({
+      page: 1,
+      limit: 20,
+      sortOrder: 'desc',
+    }, false, true, true);
+    const adminSelect = listQuery?.select as Record<string, unknown>;
+    assert.equal(adminSelect.customerEmail, true);
+  } finally {
+    prisma.invoice.findMany = originalFindMany;
+    prisma.invoice.groupBy = originalGroupBy;
+  }
+});

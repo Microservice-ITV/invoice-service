@@ -55,6 +55,17 @@ export interface InvoiceFilters {
   orderId?: string;
 }
 
+export interface InvoiceListQuery extends InvoiceFilters {
+  statuses?: InvoiceStatus[];
+  search?: string;
+  paymentMethod?: string;
+  from?: Date;
+  to?: Date;
+  page: number;
+  limit: number;
+  sortOrder: 'asc' | 'desc';
+}
+
 export interface PartialInvoiceItemRequest {
   orderItemId: string;
   quantity: number;

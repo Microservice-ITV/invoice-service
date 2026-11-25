@@ -312,7 +312,8 @@ All HTTP paths are prefixed with `/api/v1` (`app.use('/api/v1', routes)` in `src
 ### 5.1 `GET /api/v1/invoices/shop-invoices`
 
 ```text
-HTTP GET /api/v1/invoices/shop-invoices   (Authorization: Bearer <jwt>, x-shop-id: <shop>)
+HTTP GET /api/v1/invoices/shop-invoices?page=1&limit=20
+   (Authorization: Bearer <jwt>, x-shop-id: <shop>)
 → Route: router.get('/invoices/shop-invoices', auth, requireRoles('seller','shopAdmin','admin'),
                     invoiceController.getShopInvoices)
 → Middleware auth(): jwt.verify(token, env.JWT_SECRET, { algorithms:['HS256'] })
@@ -321,16 +322,16 @@ HTTP GET /api/v1/invoices/shop-invoices   (Authorization: Bearer <jwt>, x-shop-i
        – shopId = x-shop-id header || context.active_shop.shop_id
        – an active membership must exist → req.user.role = 'shopAdmin', req.user.shopId
 → Middleware requireRoles(): role must be one of seller|shopAdmin|admin
-→ Controller getShopInvoices(): requires req.user.shopId else 400 "Shop context is required"
-→ Service getInvoicesByShop(shopId) → invoiceRepository.listInvoices({ shopId })
-→ Prisma: invoice.findMany({ where:{ shopId }, select:{ …, items:{…} }, orderBy:{ createdAt:'desc' }, skip:0, take:50 })
-→ Repository maps normalized `items` into `lineItems` when the legacy JSON column is empty
-→ 200 { success: true, data: [ …at most 50 invoices… ] }
+→ Controller validates page (default 1), limit (default 20, max 100), status, date, search and sort filters
+→ Service applies middleware-resolved shop IDs and uses a scope/filter/page-specific cache key
+→ Repository selects invoice-list fields only, applies filters before `skip`/`take`, and sorts by
+  `createdAt DESC, id DESC`; no line-item/address/payment-slip relations or remote shop-name lookup
+→ 200 { success, data: [current-page list rows], pagination, summary, facets }
 ```
 
-Note: `listInvoices` defaults to `skip = 0, take = 50`; the controller exposes **no** pagination
-parameters (only `status` is read on `/invoices/manage` and `/invoices/admin/all`). An admin calling this
-route without an `x-shop-id` header gets `400 Shop context is required`.
+All three invoice-list scopes use server-side pagination and the same compact row shape. The response
+includes filtered aggregate summary and pagination metadata; invoice documents, line items, addresses,
+payment-slip data and audit details remain available only through the existing per-invoice detail route.
 
 ### 5.2 `POST /api/v1/invoices/:id/verify-slip`
 
@@ -443,10 +444,10 @@ the JWT middleware from §7; `serviceAuth` means the `x-service-key` header chec
 | Method | Endpoint | Middleware | Controller | Purpose | Authentication |
 | --- | --- | --- | --- | --- | --- |
 | GET | `/api/v1/health` | – | inline handler | Liveness probe → `{ success, message, timestamp }` | None |
-| GET | `/api/v1/invoices/my-invoices` | `auth`, `requireRoles('customer')` | `getMyInvoices` | Invoices of the authenticated customer | Bearer JWT (customer) |
-| GET | `/api/v1/invoices/shop-invoices` | `auth`, `requireRoles('seller','shopAdmin','admin')` | `getShopInvoices` | Invoices of the active shop | Bearer JWT (seller/shopAdmin/admin) |
-| GET | `/api/v1/invoices/manage` | `auth`, `requireRoles('shopAdmin','admin')` | `getManageInvoices` | Shop invoices, optional `?status=` | Bearer JWT (shopAdmin/admin) |
-| GET | `/api/v1/invoices/admin/all` | `auth`, `requireRoles('admin')` | `getAdminInvoices` | All invoices, optional `?status=` (shop names enriched) | Bearer JWT (admin) |
+| GET | `/api/v1/invoices/my-invoices` | `auth`, `requireRoles('customer')` | `getMyInvoices` | Customer invoice-list page; supports `page`, `limit`, `search`, `status`, `paymentMethod`, `from`, `to`, `sortOrder` | Bearer JWT (customer) |
+| GET | `/api/v1/invoices/shop-invoices` | `auth`, `requireRoles('seller','shopAdmin','admin')` | `getShopInvoices` | Authorized shop invoice-list page; supports the same filters and pagination | Bearer JWT (seller/shopAdmin/admin) |
+| GET | `/api/v1/invoices/manage` | `auth`, `requireRoles('shopAdmin','admin')` | `getManageInvoices` | Shop invoice-list page with server-side filters and pagination | Bearer JWT (shopAdmin/admin) |
+| GET | `/api/v1/invoices/admin/all` | `auth`, `requireRoles('admin')` | `getAdminInvoices` | Admin invoice-list page; also supports `shopId` filtering | Bearer JWT (admin) |
 | POST | `/api/v1/invoices/:id/verify-slip` | `auth`, `requireRoles('admin','shopAdmin','seller')` | `verifyInvoice` | Approve/reject a manual payment slip | Bearer JWT (admin/shopAdmin/seller) |
 | POST | `/api/v1/invoices/:id/upload-slip` | `auth`, `requireRoles('customer')` | `uploadPaymentSlip` | Customer uploads a slip image (data URL) → `PENDING_VERIFICATION` | Bearer JWT (customer) |
 | POST | `/api/v1/invoices/:id/void` | `auth`, `requireRoles('admin')` | `voidInvoice` | Void an invoice with a reason (≥ 10 chars) | Bearer JWT (admin) |
@@ -518,22 +519,23 @@ Error envelope (all handlers and the error middleware):
 
 ### List query notes
 
-* `GET /invoices/manage?status=<status>` and `GET /invoices/admin/all?status=<status>`: the value is
-  uppercased and must be one of `UNPAID, PENDING_VERIFICATION, PAID, REJECTED, VOID, REFUNDED`;
-  anything else throws a plain `Error` → **500** (not 400) via the error middleware.
-* `GET /invoices/shop-invoices?status=<status>` uses the same status filter.
+* `page` defaults to `1`; `limit` defaults to `20` and must be between `1` and `100`.
+* `status` accepts one or comma-separated values from `UNPAID, PENDING_VERIFICATION, PAID, REJECTED, VOID, REFUNDED`.
+* `search`, status, payment method, date range and sorting are applied before pagination. Invalid list
+  parameters return `400`; results are deterministically ordered by `createdAt` and `id`.
+* The response's `pagination.totalItems`, `pagination.totalPages`, `summary` and filter `facets` are
+  computed for the authorized, filtered dataset, not just the current page.
 
 ### Invoice response cache
 
 When `REDIS_URL` is configured, list responses use a 30-second TTL and detail responses a 60-second
-TTL. Keys include the authenticated user/role and applicable customer/shop scope, normalized shop
-sets, status filters and the current list window. A Redis generation counter makes all prior invoice
-entries unreachable after a database write; invoice creation, payment/status changes, slip updates,
-PDF lifecycle writes and thermal-worker updates advance it. Redis connection/read/write failures are
-logged and fall back to the database, and cache entries have bounded TTLs as a consistency backstop.
-Requests with the same cache key also share an in-flight database load within one service process.
-The browser filters and paginates the returned list locally, so it does not issue separate API requests
-for each visible page.
+TTL. List cache keys include authenticated identity/role, customer/shop scope, page size, page number,
+filters and sort order. A Redis generation counter invalidates prior entries after a database write.
+Redis connects asynchronously during startup; cache connection and writes do not block an uncached
+database response, reads have a bounded timeout, and cache failures use the database. If invalidation
+cannot reach Redis, cache reads are bypassed until prior short-lived entries expire. Requests with the
+same cache key share an in-flight database load. The browser requests one compact page at a time and
+loads a full invoice document only when an invoice detail or review action is opened.
 
 ---
 
@@ -831,6 +833,9 @@ All variables are validated by `zod` in `src/config/env.ts` at import time; inva
 | `MINIO_BUCKET` | no | string, default `invoices` | yes | bucket name |
 | `MINIO_USE_SSL` | no | `'true'` → `true`, default `false` | yes | MinIO client |
 | `PUBLIC_BASE_URL` | no | string, default `http://localhost:9000` | yes | public URL prefix for PDFs/slips |
+| `PDF_UPLOAD_TIMEOUT_MS` | no | positive integer, default `120000` (max 15 minutes) | yes | absolute deadline for the isolated PDF upload client |
+| `PDF_RETENTION_HEAD_TIMEOUT_MS` | no | positive integer, default `30000` (max 5 minutes) | yes | absolute deadline for PDF object-existence checks |
+| `PDF_RETENTION_DELETE_TIMEOUT_MS` | no | positive integer, default `30000` (max 5 minutes) | yes | absolute deadline for PDF object deletion |
 
 Variables read outside the zod schema:
 
@@ -1050,13 +1055,39 @@ create/verify invoice ──▶ generatePdfAsync()  (fire-and-forget, never bloc
 
 | Operation | Details |
 | --- | --- |
-| `uploadPdf(fileName, buffer)` | Ensures the bucket exists (`bucketExists` → `makeBucket(bucket, 'us-east-1')`), sets a bucket policy, `putObject` with `Content-Type: application/pdf` and `Cache-Control: public, max-age=31536000`, returns `<PUBLIC_BASE_URL>/<bucket>/<objectKey>`. |
+| `uploadPdf(fileName, buffer)` | Uses a dedicated zero-retry client, ensures the bucket exists (`bucketExists` → `makeBucket(bucket, 'us-east-1')`), and uploads with `Content-Type: application/pdf` and `Cache-Control: private, no-store`. The complete operation has an absolute deadline; timeout destroys its HTTP agent and the durable upload intent remains recoverable because a timed-out PUT can have an ambiguous remote outcome. |
+| `pdfExists(pdfUrl)` | Uses an isolated zero-retry client and a bounded HEAD/stat request. A deadline destroys its HTTP agent; only a definite missing-object response is treated as absent. |
+| `deletePdf(pdfUrl)` | Validates the generated key before an isolated, zero-retry DELETE with an absolute deadline. A timeout is a failed attempt, never a successful deletion; retention retries the idempotent delete under the database lease. |
 | `uploadImageDataUrl(fileName, dataUrl)` | Accepts only `data:image/<type>;base64,<payload>` (other input → `Invalid image data`), rejects payloads > **5 MB**, key `payment-slips/<invoiceId>.<ext>` (`jpeg` → `jpg`), same bucket policy, returns the public URL. |
 | `downloadPdf(pdfUrl)` | Parses the stored public URL, requires the `/<bucket>/` segment, decodes the key and streams the object back as a `Buffer` (used by the batch ZIP download). |
 | Bucket policy | `publicReadPolicy` grants `s3:GetObject` on `arn:aws:s3:::<bucket>/*` to `Principal: { AWS: ['*'] }` — i.e. **anonymous read of every object in the bucket** (see §25). |
 
 Note: objects live under the bucket root with an `invoices/` prefix added by `uploadPdf`
 (`invoices/<shopId>/…`) plus `payment-slips/…`; the bucket itself is created on demand.
+
+### Generated-PDF retention
+
+Generated invoice A4, legacy receipt, thermal invoice, and thermal receipt PDFs are registered by
+their exact object reference in `pdf_artifacts`. A daily scheduler processes expired records in
+bounded batches; the default retention is **7 days**. It uses lease-token claims before deleting an
+object and clears only matching database references after deletion, leaving the existing PDF flows
+to regenerate artifacts on demand. Upload intents are persisted before storage writes; abandoned
+`UPLOADING` intents are recovered after a one-hour grace period, including when compensating object
+deletion fails. Failed retention deletions remain retryable after the lease expires.
+
+`PDF_RETENTION_DRY_RUN` defaults to `true` and performs no claims, storage mutations, or database
+updates. Set it to `false` only after reviewing dry-run logs and testing storage behavior in an
+isolated bucket. Retention period, interval, batch size, concurrency, retry limit, lease, upload
+deadline, and per-HEAD/per-DELETE deadlines are configurable with the corresponding
+`PDF_*_TIMEOUT_MS` and `PDF_RETENTION_*` variables. Deadlines destroy the operation's isolated
+HTTP agent; a timeout remains an ambiguous storage outcome and is not recorded as successful.
+Cleanup summaries report observed stale-upload candidates and age, expired cleanup leases,
+missing objects detected during active runs, batch-at-limit state, retries, failures, and duration.
+Dry-run does not issue HEAD requests, so it cannot report missing-object counts. Heartbeat failures
+are logged with safe error codes; alert on repeated heartbeat/cleanup failures and sustained batch
+saturation using structured logs or database monitoring.
+Deletion accepts only known generated PDF key shapes under the managed `invoice-pdfs/` prefix; it
+never scans the bucket or derives keys from invoice data.
 
 ---
 
@@ -1611,7 +1642,7 @@ Things a newcomer will trip over — each item is confirmed against the code, no
 | 9 | **`npm run seed:payment-completed` needs a previous build** (`node dist/scripts/seed-payment-completed.js`) while the shipped image never creates `dist/`, so the command documented in `docs/SEED_PAYMENT_COMPLETED.md` fails inside the container. | `package.json:11`; `docker/node/Dockerfile:48-63`; `docs/SEED_PAYMENT_COMPLETED.md:14` |
 | 10 | **Error statuses are inconsistent**: invoice-not-found and invalid-status paths in `void`, `refund`, `upload-slip` and `generate-pdf` throw plain `Error` → HTTP 500 instead of 404/400. | `src/services/invoice.service.ts:501-603`; `src/middleware/errorHandler.ts:11` |
 | 11 | **Malformed JSON returns 500**, because body-parser errors are not `AppError` instances. | `src/app.ts:20-32`; `src/middleware/errorHandler.ts:11` |
-| 12 | **`GET /invoices/shop-invoices` ignores `?status=`** although the frontend client sends it, and no listing endpoint exposes pagination (`take: 50` is fixed). | `src/controllers/invoice.controller.ts:80-97`; `src/repositories/invoice.repository.ts:565-569`; `frontend-react/src/lib/api/invoiceClient.ts` |
+| 12 | **Resolved: invoice list routes now apply status filters and use server-side pagination.** They return a compact list projection and filtered aggregates; detail data remains on demand. | `src/controllers/invoice.controller.ts`; `src/repositories/invoice.repository.ts`; `frontend-react/src/lib/api/invoiceClient.ts` |
 | 13 | **No dead-letter queue and no retry**: failed events are `nack`ed without requeue, and after a RabbitMQ disconnect the consumers are never re-registered. | `src/rabbitmq/consumers/payment-completed.consumer.ts:53`; `src/rabbitmq/consumers/order-paid.consumer.ts:54`; `src/rabbitmq/connection.ts:31-39` |
 | 14 | **`src/routes/index.test.ts` is stale**: it stubs `x-user-role` headers that `auth()` no longer reads, and no npm script runs the suite. | `src/routes/index.test.ts:13-44`; `src/middleware/auth.ts`; `package.json` |
 | 15 | **`npm run lint` / `npm run format` have no config files** (no `.eslintrc*`, `eslint.config.*` or `.prettierrc*` anywhere), so only tool defaults apply. | `package.json:15-17`; repository root listing |

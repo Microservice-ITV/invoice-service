@@ -3,6 +3,13 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const positiveInteger = (defaultValue: number, maximum = Number.MAX_SAFE_INTEGER) =>
+  z.string()
+    .regex(/^[1-9]\d*$/, 'must be a positive integer')
+    .transform(Number)
+    .pipe(z.number().int().max(maximum))
+    .default(String(defaultValue));
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform(Number).pipe(z.number().int().positive()).default('5005'),
@@ -40,6 +47,30 @@ const envSchema = z.object({
   MINIO_PDF_BUCKET: z.string().default('invoice-documents'),
   MINIO_USE_SSL: z.string().transform((value) => value === 'true').default('false'),
   PUBLIC_BASE_URL: z.string().default('http://localhost:9000'),
+  PDF_RETENTION_DAYS: positiveInteger(7, 3650),
+  PDF_RETENTION_INTERVAL_MS: positiveInteger(24 * 60 * 60 * 1000),
+  PDF_RETENTION_BATCH_SIZE: positiveInteger(100, 1000),
+  PDF_RETENTION_CONCURRENCY: positiveInteger(4, 16),
+  PDF_RETENTION_RETRY_LIMIT: positiveInteger(3, 10),
+  PDF_RETENTION_LEASE_MS: positiveInteger(5 * 60 * 1000),
+  PDF_UPLOAD_TIMEOUT_MS: positiveInteger(2 * 60 * 1000, 15 * 60 * 1000),
+  PDF_RETENTION_HEAD_TIMEOUT_MS: positiveInteger(30 * 1000, 5 * 60 * 1000),
+  PDF_RETENTION_DELETE_TIMEOUT_MS: positiveInteger(30 * 1000, 5 * 60 * 1000),
+  PDF_RETENTION_DRY_RUN: z.enum(['true', 'false']).transform((value) => value === 'true').default('true'),
+}).superRefine((values, context) => {
+  let retryDelayMs = 0;
+  for (let retry = 1; retry < values.PDF_RETENTION_RETRY_LIMIT; retry += 1) {
+    retryDelayMs += Math.min(1000 * (2 ** (retry - 1)), 5000);
+  }
+  const maximumCleanupDurationMs =
+    values.PDF_RETENTION_RETRY_LIMIT * values.PDF_RETENTION_DELETE_TIMEOUT_MS + retryDelayMs;
+  if (values.PDF_RETENTION_LEASE_MS <= maximumCleanupDurationMs) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PDF_RETENTION_LEASE_MS'],
+      message: 'must exceed the maximum PDF deletion retry duration',
+    });
+  }
 });
 
 type Env = z.infer<typeof envSchema>;

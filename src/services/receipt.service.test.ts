@@ -73,6 +73,8 @@ const makeReceipt = (overrides: Partial<Receipt> = {}): Receipt => ({
   pdfError: null,
   pdfAttemptCount: 0,
   pdfUpdatedAt: null,
+  pdfCleanupToken: null,
+  pdfCleanupLeaseUntil: null,
   issuedAt: new Date('2026-10-08T00:00:00.000Z'),
   createdAt: new Date('2026-10-08T00:00:00.000Z'),
   updatedAt: new Date('2026-10-08T00:00:00.000Z'),
@@ -297,7 +299,7 @@ test('receipt PDF failure is recorded and a retry succeeds without creating anot
     const firstTry = await service.generateReceiptPdf(receipt);
     assert.equal(firstTry, false);
     assert.equal(stored.pdfStatus, 'FAILED');
-    assert.match(stored.pdfError ?? '', /puppeteer render failed/);
+    assert.equal(stored.pdfError, 'Receipt PDF generation failed');
     assert.equal(receiptIssueCalls, 0, 'PDF failure must never re-issue the receipt');
 
     // Retry succeeds without touching the receipt row.

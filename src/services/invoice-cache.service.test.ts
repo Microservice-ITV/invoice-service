@@ -71,3 +71,40 @@ test('Redis provider failures use the database loader', async () => {
   assert.deepEqual(result, { id: 'invoice' });
   assert.equal(loads, 1);
 });
+
+test('generation invalidation failures bypass cached invoice values and reload from the database', async () => {
+  const store = new MemoryCacheStore();
+  const cache = new InvoiceCacheService(async () => store);
+  let loads = 0;
+
+  await cache.getOrLoad('customer:one:detail:invoice-1', 60, async () => ({
+    value: `database-${++loads}`,
+  }));
+  store.incr = async () => {
+    throw new Error('Redis generation update failed');
+  };
+
+  await cache.invalidate();
+  const result = await cache.getOrLoad('customer:one:detail:invoice-1', 60, async () => ({
+    value: `database-${++loads}`,
+  }));
+
+  assert.deepEqual(result, { value: 'database-2' });
+  assert.equal(loads, 2);
+});
+
+test('slow cache writes do not delay the database response', async () => {
+  const store = new MemoryCacheStore();
+  store.set = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return 'OK';
+  };
+  const cache = new InvoiceCacheService(async () => store);
+
+  const result = await Promise.race([
+    cache.getOrLoad('customer:one:list:page=1', 30, async () => ({ items: ['invoice'] })),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cache write blocked response')), 75)),
+  ]);
+
+  assert.deepEqual(result, { items: ['invoice'] });
+});
